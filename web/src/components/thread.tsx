@@ -46,7 +46,7 @@ export function Thread({ data }: { data: ThreadView }) {
 
   return (
     <div
-      className="min-h-0 flex-1 overflow-y-auto"
+      className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto"
       onScroll={(event) => {
         const el = event.currentTarget;
         pinnedRef.current =
@@ -242,7 +242,7 @@ function UserMessage({ text }: { text: string }) {
   const shown = expanded || !overflows ? text : lines.slice(0, USER_COLLAPSE_LINES).join("\n");
   return (
     <div className="flex justify-end py-2">
-      <div className="chat-md prose prose-sm relative max-w-[85%] rounded-xl rounded-br-sm border border-bubble-border bg-bubble px-3.5 py-2">
+      <div className="chat-md prose prose-sm relative min-w-0 max-w-[85%] break-words rounded-xl rounded-br-sm border border-bubble-border bg-bubble px-3.5 py-2">
         <div className={cn(!expanded && overflows && "relative overflow-hidden")}>
           <ChatMarkdown text={shown} />
           {!expanded && overflows ? (
@@ -280,7 +280,7 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
       </div>
       {entry.thinking ? <ThinkingFold text={entry.thinking} /> : null}
       {entry.text ? (
-        <div className="chat-md prose prose-sm">
+        <div className="chat-md prose prose-sm break-words">
           <ChatMarkdown text={entry.text} />
         </div>
       ) : null}
@@ -297,7 +297,7 @@ function ThinkingFold({ text }: { text: string }) {
         thinking
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <div className="mt-1 mb-2 ml-1 max-h-64 overflow-y-auto border-l-2 pl-3 text-[13px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+        <div className="mt-1 mb-2 ml-1 max-h-64 overflow-y-auto border-l-2 pl-3 text-[13px] leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">
           {text}
         </div>
       </CollapsibleContent>
@@ -391,7 +391,7 @@ function ToolBody({ tool }: { tool: ToolCall }) {
   const lines = body.split("\n");
   const shown = lines.slice(0, 24).join("\n");
   return (
-    <pre className="mt-1 max-h-56 overflow-auto rounded-md bg-muted p-2.5 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap">
+    <pre className="mt-1 max-h-56 overflow-auto rounded-md bg-muted p-2.5 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
       {shown}
       {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
     </pre>

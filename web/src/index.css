@@ -248,6 +248,7 @@ body {
 /* Chat markdown: typography plugin structure with neutral ink overrides.
    Prose handles headings/lists/spacing; we pin colors to the ink ladder. */
 .chat-md {
+  overflow-wrap: break-word;
   --tw-prose-body: var(--foreground);
   --tw-prose-headings: var(--foreground);
   --tw-prose-lead: var(--foreground);
