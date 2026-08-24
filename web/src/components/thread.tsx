@@ -24,6 +24,7 @@ import { Input } from "~/components/ui/input";
 import { Spinner } from "~/components/ui/spinner";
 import { ChatMarkdown, DiffBlock } from "~/components/chat-markdown";
 import { useApp } from "~/store";
+import { syncPendingAsks } from "~/events";
 import { cn } from "~/lib/utils";
 
 const OPEN_TURNS = 3;
@@ -493,6 +494,14 @@ function AskUserCard({ entry }: { entry: AskUserEntry }) {
     try {
       await api.respond(sessionId, pendingAsk.id, answer);
       removePendingAsk(sessionId, pendingAsk.id);
+    } catch (error) {
+      window.dispatchEvent(
+        new CustomEvent("pecan:error", {
+          detail: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      // The ask may be stale (worker restarted); re-sync from the server.
+      void syncPendingAsks(sessionId);
     } finally {
       setBusyId(null);
     }

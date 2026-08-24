@@ -252,3 +252,13 @@ export const AgentSnapshot = Object({
   models: Optional(Union([Undefined(), Null(), Array(AgentModel)])),
 });
 export type AgentSnapshot = Static<typeof AgentSnapshot>;
+
+/** One live dialog request (ask_user / confirm / input) awaiting an answer. */
+export const PendingAsk = Object({
+  id: String(),
+  method: String(),
+  title: Optional(Union([String(), Null(), Undefined()])),
+  options: Optional(Union([Undefined(), Null(), Array(Unknown())])),
+  recordedAtMs: Number(),
+});
+export type PendingAskWire = Static<typeof PendingAsk>;

@@ -49,6 +49,7 @@ type AppState = {
   toggleSettledFold: () => void;
   addPendingAsk: (sessionId: string, ask: PendingAsk) => void;
   removePendingAsk: (sessionId: string, requestId: string) => void;
+  setPendingAsks: (sessionId: string, asks: PendingAsk[]) => void;
   setSubagentActivity: (sessionId: string, activity: SubagentActivity | null) => void;
 };
 
@@ -125,6 +126,10 @@ export const useApp = create<AppState>((set) => ({
           (ask) => ask.id !== requestId,
         ),
       },
+    })),
+  setPendingAsks: (sessionId, asks) =>
+    set((current) => ({
+      pendingAsks: { ...current.pendingAsks, [sessionId]: asks },
     })),
   setSubagentActivity: (sessionId, activity) =>
     set((current) => {

@@ -37,6 +37,26 @@ pub(crate) struct CachedThread {
 /// Session files are append-only, so `(mtime, size)` detects new entries.
 pub(crate) type ThreadCache = HashMap<std::path::PathBuf, CachedThread>;
 
+/// One live dialog request from a session's worker (ask_user, confirm,
+/// free input), kept so answers survive browser reloads and so stale
+/// answers can be rejected instead of silently dropped.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecordedAsk {
+    /// Dialog method: `select`, `confirm`, or `input`.
+    pub(crate) method: String,
+    /// Optional prompt title.
+    pub(crate) title: Option<String>,
+    /// Options for `select` dialogs.
+    pub(crate) options: Option<Vec<serde_json::Value>>,
+    /// When the request was observed (epoch millis).
+    pub(crate) recorded_at_ms: i64,
+}
+
+/// Live dialog requests per session, keyed by pi request id.
+pub(crate) type PendingAsks = HashMap<String, HashMap<String, RecordedAsk>>;
+
+/// Upper bound on cached transcripts; the cap bounds memory when a machine
 /// Upper bound on cached transcripts; the cap bounds memory when a machine
 /// accumulates thousands of sessions. Oversubscription clears the map and
 /// rebuilds it from the sessions actually being read.
@@ -307,6 +327,8 @@ pub(crate) struct App {
     pub(crate) scan_cache: Arc<std::sync::Mutex<ScanCache>>,
     /// Parsed transcripts shared across snapshot rebuilds and thread views.
     pub(crate) thread_cache: Arc<std::sync::Mutex<ThreadCache>>,
+    /// Live dialog requests per session awaiting an answer.
+    pub(crate) pending_asks: Arc<std::sync::Mutex<PendingAsks>>,
     /// Per-launch capability required for credential-bearing Ship mutations.
     pub(crate) ship_token: Arc<str>,
     /// Optional single-session boundary for embedded clients.

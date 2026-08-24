@@ -24,7 +24,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "~/components/ui/sidebar";
-import { connectEvents } from "~/events";
+import { connectEvents, syncPendingAsks } from "~/events";
 import { useApp } from "~/store";
 
 const DiffSidebar = lazy(() => import("~/components/diff-sidebar"));
@@ -349,6 +349,7 @@ async function openThread(id: string) {
     const data = await api.thread(id);
     if (parseSessionRoute(location.hash)?.sessionId !== id) return;
     useApp.getState().setThread(data);
+    void syncPendingAsks(id);
   } catch (error) {
     if (parseSessionRoute(location.hash)?.sessionId !== id) return;
     reportError(error instanceof Error ? error.message : String(error));

@@ -52,6 +52,9 @@ pub(crate) struct WorkerHandle {
     pub raw_events: broadcast::Sender<serde_json::Value>,
     child: Mutex<tokio::process::Child>,
     last_used_ms: AtomicI64,
+    /// Process start time (epoch millis); responses recorded before this
+    /// moment cannot belong to this process.
+    spawned_ms: i64,
     forward_started: AtomicBool,
 }
 
@@ -143,6 +146,11 @@ impl WorkerHandle {
 
     fn touch(&self) {
         self.last_used_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Process start time (epoch millis).
+    pub(crate) fn spawned_ms(&self) -> i64 {
+        self.spawned_ms
     }
 
     fn idle_for(&self) -> i64 {
@@ -277,6 +285,7 @@ async fn spawn_worker(
         raw_events: events_tx,
         child: Mutex::new(child),
         last_used_ms: AtomicI64::new(now_millis()),
+        spawned_ms: now_millis(),
         forward_started: AtomicBool::new(false),
     });
 

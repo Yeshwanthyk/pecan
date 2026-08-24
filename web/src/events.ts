@@ -201,4 +201,26 @@ async function refreshThread() {
   } catch {
     /* transient */
   }
+  await syncPendingAsks(id);
+}
+
+/** Replaces SSE-delivered asks with the server's authoritative live set. */
+export async function syncPendingAsks(id: string) {
+  try {
+    const { asks } = await api.asks(id);
+    if (currentThreadId() !== id) return;
+    useApp
+      .getState()
+      .setPendingAsks(
+        id,
+        asks.map((ask) => ({
+          id: ask.id,
+          method: ask.method as "select" | "confirm" | "input",
+          title: ask.title ?? undefined,
+          options: ask.options as Array<{ label?: string; value?: string }> | undefined,
+        })),
+      );
+  } catch {
+    /* transient; SSE events still deliver asks live */
+  }
 }

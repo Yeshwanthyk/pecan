@@ -42,6 +42,7 @@ pub(crate) fn router(app: App, workers: Workers) -> Router {
         .route("/session/{id}/ship", get(ship_plan).post(ship_execute))
         .route("/session/{id}/settle", post(settle).delete(reopen))
         .route("/session/{id}/pin", post(pin).delete(unpin))
+        .route("/session/{id}/asks", get(pending_asks))
         .route("/session/{id}/title/regenerate", post(regenerate_title))
         .route("/projects/settle-stale", post(settle_stale))
         .route("/projects", post(add_project).delete(remove_project))
@@ -417,6 +418,23 @@ async fn respond(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
     let worker = require_worker(&app, &workers, &id).await?;
+    // A request recorded before this worker process spawned belongs to a
+    // dead worker; answering it would silently vanish.
+    let recorded_before_spawn = {
+        let asks = app
+            .pending_asks
+            .lock()
+            .map_err(|_| ApiError::internal(pecan_core::CoreError::LockPoisoned))?;
+        match asks.get(&id).and_then(|per_session| per_session.get(&body.request_id)) {
+            Some(ask) => ask.recorded_at_ms < worker.spawned_ms(),
+            None => true,
+        }
+    };
+    if recorded_before_spawn {
+        return Err(ApiError::conflict(
+            "this question is no longer pending (the agent worker restarted); ask the agent to continue",
+        ));
+    }
     let mut frame = serde_json::json!({
         "type": "extension_ui_response",
         "id": body.request_id,
@@ -431,7 +449,31 @@ async fn respond(
         frame["cancelled"] = serde_json::Value::Bool(cancelled);
     }
     worker.send_raw(frame).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    remove_pending_ask(&app, &id, &body.request_id);
     Ok(Json(serde_json::json!({ "responded": true })))
+}
+
+/// Lists live dialog requests awaiting answers for one session.
+async fn pending_asks(
+    State(app): State<App>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let asks = app
+        .pending_asks
+        .lock()
+        .map_err(|_| ApiError::internal(pecan_core::CoreError::LockPoisoned))?;
+    let mut list: Vec<(&String, &super::snapshot::RecordedAsk)> =
+        asks.get(&id).map(|per_session| per_session.iter().collect()).unwrap_or_default();
+    list.sort_by_key(|(_, ask)| ask.recorded_at_ms);
+    let asks: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|(request_id, ask)| {
+            let mut value = serde_json::to_value(ask).unwrap_or(serde_json::Value::Null);
+            value["id"] = serde_json::Value::String(request_id.clone());
+            value
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "asks": asks })))
 }
 
 /// Lightweight git context for a session's working directory.
@@ -904,6 +946,11 @@ fn forward_worker_events(
                         event.get("type").and_then(serde_json::Value::as_str),
                         Some("agent_settled") | Some("message_end")
                     );
+                    if event.get("type").and_then(serde_json::Value::as_str)
+                        == Some("extension_ui_request")
+                    {
+                        record_pending_ask(&app, &session_id, &event);
+                    }
                     let _ =
                         app.events.send(ServerEvent::AgentEvent { id: session_id.clone(), event });
                     if settled {
@@ -928,6 +975,40 @@ fn forward_worker_events(
         });
         let _ = workers.remove(&session_id).await;
     });
+}
+
+/// Records a dialog request so answers survive browser reloads.
+fn record_pending_ask(app: &App, session_id: &str, event: &serde_json::Value) {
+    let Some(request_id) = event.get("id").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(method) = event.get("method").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let ask = super::snapshot::RecordedAsk {
+        method: method.to_owned(),
+        title: event.get("title").and_then(serde_json::Value::as_str).map(str::to_owned),
+        options: event.get("options").and_then(serde_json::Value::as_array).cloned(),
+        recorded_at_ms: jiff::Timestamp::now().as_second().saturating_mul(1_000),
+    };
+    match app.pending_asks.lock() {
+        Ok(mut asks) => {
+            asks.entry(session_id.to_owned()).or_default().insert(request_id.to_owned(), ask);
+        }
+        Err(error) => tracing::warn!(%error, "pending asks lock poisoned"),
+    }
+}
+
+/// Drops an answered dialog request from the live registry.
+fn remove_pending_ask(app: &App, session_id: &str, request_id: &str) {
+    if let Ok(mut asks) = app.pending_asks.lock() {
+        if let Some(per_session) = asks.get_mut(session_id) {
+            per_session.remove(request_id);
+            if per_session.is_empty() {
+                asks.remove(session_id);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]

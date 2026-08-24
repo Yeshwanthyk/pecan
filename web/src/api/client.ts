@@ -4,6 +4,7 @@
  * here instead of leaking `undefined` into components.
  */
 import {
+  Array,
   Boolean,
   Null,
   Object,
@@ -220,6 +221,8 @@ export const api = {
       Object({ responded: Boolean() }),
       { requestId, ...answer },
     ),
+  asks: (id: string) =>
+    request("GET", `/api/session/${id}/asks`, Object({ asks: Array(types.PendingAsk) })),
 };
 
 /** Complete boundary a standalone or hosted session transport must satisfy. */
