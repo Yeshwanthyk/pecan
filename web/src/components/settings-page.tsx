@@ -28,6 +28,17 @@ import {
 } from "~/components/ui/select";
 import { cn } from "~/lib/utils";
 import { useApp, type ThemeName } from "~/store";
+import {
+  CURATED_CODE_FONTS,
+  CURATED_UI_FONTS,
+  SYSTEM_CODE,
+  SYSTEM_UI,
+  loadInstalledFonts,
+  readCodeFont,
+  readUiFont,
+  saveCodeFont,
+  saveUiFont,
+} from "~/fonts";
 
 const EMPTY_PROJECTS: Array<{ cwd: string; name: string }> = [];
 const DEFAULT_TITLE_MODEL = {
@@ -67,6 +78,8 @@ export function SettingsPage() {
     readAiTitleGenerationEnabled,
   );
   const [titleModel, setTitleModel] = useState<TitleModelPreset>(readTitleModelPreset);
+  const [uiFont, setUiFont] = useState(readUiFont);
+  const [codeFont, setCodeFont] = useState(readCodeFont);
 
   async function removeProject(cwd: string) {
     setRemoving(cwd);
@@ -110,6 +123,8 @@ export function SettingsPage() {
             description="Stored in this browser and applied immediately."
             title="Theme"
           />
+          <FontControl code={codeFont} kind="code" onChange={setCodeFont} title="Code font" />
+          <FontControl code={uiFont} kind="ui" onChange={setUiFont} title="UI font" />
         </SettingsSection>
 
         <SettingsSection icon={<SparklesIcon />} title="Thread titles">
@@ -393,4 +408,95 @@ function reportError(message: string) {
 
 function sectionId(title: string) {
   return title.toLowerCase().replaceAll(" ", "-");
+}
+
+/** Font picker for UI or code text: curated stacks plus locally installed fonts. */
+function FontControl({
+  code,
+  kind,
+  onChange,
+  title,
+}: {
+  code: string;
+  kind: "ui" | "code";
+  onChange: (font: string) => void;
+  title: string;
+}) {
+  const [installed, setInstalled] = useState<string[]>([]);
+  const [scanning, setScanning] = useState(false);
+  const systemLabel = kind === "ui" ? "System default (SF Pro)" : "System default (SF Mono)";
+  const curated = kind === "ui" ? CURATED_UI_FONTS : CURATED_CODE_FONTS;
+  const options = [...curated, ...installed.filter((font) => !curated.includes(font))];
+  const canScan = typeof (globalThis as { queryLocalFonts?: unknown }).queryLocalFonts === "function";
+
+  async function scan() {
+    setScanning(true);
+    try {
+      setInstalled(await loadInstalledFonts());
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  return (
+    <SettingsRow
+      control={
+        <div className="flex flex-col items-stretch gap-1.5">
+          <Select
+            onValueChange={(next) => {
+              if (!next) return;
+              onChange(next);
+            }}
+            value={code}
+          >
+            <SelectTrigger
+              aria-label={title}
+              className="min-h-11 w-[min(17rem,calc(100vw-2.5rem))] sm:min-h-9 sm:w-64"
+            >
+              <SelectValue>
+                <span
+                  className="truncate"
+                  style={{
+                    fontFamily:
+                      code === SYSTEM_UI || code === SYSTEM_CODE
+                        ? undefined
+                        : `"${code}", sans-serif`,
+                  }}
+                >
+                  {code === SYSTEM_UI || code === SYSTEM_CODE ? systemLabel : code}
+                </span>
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={kind === "ui" ? SYSTEM_UI : SYSTEM_CODE}>
+                {systemLabel}
+              </SelectItem>
+              {options.map((font) => (
+                <SelectItem key={font} value={font}>
+                  <span style={{ fontFamily: `"${font}", sans-serif` }}>{font}</span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {canScan && installed.length === 0 ? (
+            <Button
+              className="self-start text-xs"
+              disabled={scanning}
+              onClick={() => void scan()}
+              size="xs"
+              variant="ghost"
+            >
+              {scanning ? "Scanning…" : "Scan installed fonts"}
+            </Button>
+          ) : null}
+        </div>
+      }
+      description={
+        kind === "ui"
+          ? "Applies to interface text. Falls back to the system stack if missing."
+          : "Applies to code blocks and inline code."
+      }
+      title={title}
+    />
+  );
 }
