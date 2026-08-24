@@ -199,6 +199,8 @@ async fn serve(
             workflows: std::collections::HashMap::new(),
         }))),
         events,
+        scan_cache: Arc::new(std::sync::Mutex::new(ScanCache::new())),
+        thread_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         title_generations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         ship_lock: Arc::new(tokio::sync::Mutex::new(())),
         ship_token: Arc::from(ship_token.as_str()),

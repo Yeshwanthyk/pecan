@@ -216,7 +216,7 @@ async fn thread_view(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snap = app.snapshot().await;
     let row = find_row(&snap, &id)?;
-    let view = thread::parse_thread(&row.summary.path).map_err(ApiError::internal)?;
+    let view = app.thread_view(row.summary.path.clone()).await.map_err(ApiError::internal)?;
     Ok(Json(serde_json::json!({
         "summary": row.summary,
         "settled": row.settled,

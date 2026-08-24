@@ -13,6 +13,7 @@ use pecan_core::session::{SessionKind, SessionSummary};
 use pecan_core::store::StateStore;
 use pecan_core::tasks::TaskList;
 use pecan_core::thread::ThreadEntry;
+use pecan_core::thread::{ThreadView, parse_thread};
 use pecan_core::workflows::WorkflowRun;
 use pecan_core::{CoreError, PiPaths};
 use tokio::sync::broadcast;
@@ -22,6 +23,24 @@ use tokio::sync::broadcast;
 const WAITING_SCAN_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 /// A conservative ceiling for heuristic child discovery in embedded mode.
 const MAX_SCOPED_SUBAGENTS: usize = 32;
+
+/// One cached parsed transcript keyed by file identity.
+#[derive(Debug)]
+pub(crate) struct CachedThread {
+    modified: std::time::SystemTime,
+    bytes: u64,
+    view: Arc<ThreadView>,
+}
+
+/// Parsed transcripts keyed by path, so repeated reads of one session
+/// (index waiting-checks, thread views, SSE refreshes) skip re-parsing.
+/// Session files are append-only, so `(mtime, size)` detects new entries.
+pub(crate) type ThreadCache = HashMap<std::path::PathBuf, CachedThread>;
+
+/// Upper bound on cached transcripts; the cap bounds memory when a machine
+/// accumulates thousands of sessions. Oversubscription clears the map and
+/// rebuilds it from the sessions actually being read.
+const THREAD_CACHE_CAP: usize = 1024;
 
 /// Restricts one server instance to a main session and its bounded child set.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -123,11 +142,9 @@ fn spawned_agents(path: &std::path::Path) -> HashMap<String, HashSet<String>> {
 }
 
 fn first_user_prompt(path: &std::path::Path) -> Option<String> {
-    pecan_core::thread::parse_thread(path).ok()?.entries.into_iter().find_map(|dated| {
-        match dated.entry {
-            ThreadEntry::User { text, .. } => Some(text.trim().to_owned()),
-            _ => None,
-        }
+    parse_thread(path).ok()?.entries.into_iter().find_map(|dated| match dated.entry {
+        ThreadEntry::User { text, .. } => Some(text.trim().to_owned()),
+        _ => None,
     })
 }
 
@@ -167,9 +184,10 @@ impl IndexSnapshot {
         paths: &PiPaths,
         store: &StateStore,
         scope: Option<&SessionScope>,
+        scans: &mut ScanCache,
+        threads: &mut ThreadCache,
     ) -> pecan_core::Result<Self> {
-        let mut cache = ScanCache::new();
-        let summaries = cache.refresh(&paths.sessions_dir())?;
+        let summaries = scans.refresh(&paths.sessions_dir())?;
         let settled = store.settled()?;
         let pinned = store.pinned()?;
         let titles = store.titles()?;
@@ -181,7 +199,7 @@ impl IndexSnapshot {
                 < WAITING_SCAN_WINDOW_MS;
             let waiting_askuser = recent
                 && s.kind == SessionKind::Normal
-                && pecan_core::thread::parse_thread(&s.path)
+                && cached_thread_view(&s.path, threads)
                     .map(|view| view.waiting_askuser)
                     .unwrap_or(false);
             let settled_flag = settled.contains_key(&s.id);
@@ -227,6 +245,29 @@ impl IndexSnapshot {
     }
 }
 
+/// Returns the cached transcript for `path`, parsing (and caching) on miss.
+///
+/// Unreadable files yield `None` rather than failing the whole index build.
+fn cached_thread_view(
+    path: &std::path::Path,
+    threads: &mut ThreadCache,
+) -> Option<Arc<ThreadView>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let bytes = meta.len();
+    if let Some(cached) = threads.get(path) {
+        if cached.modified == modified && cached.bytes == bytes {
+            return Some(cached.view.clone());
+        }
+    }
+    let view = Arc::new(parse_thread(path).ok()?);
+    if threads.len() >= THREAD_CACHE_CAP {
+        threads.clear();
+    }
+    threads.insert(path.to_path_buf(), CachedThread { modified, bytes, view: view.clone() });
+    Some(view)
+}
+
 /// Events pushed to browser clients over SSE.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -262,6 +303,10 @@ pub(crate) struct App {
     pub(crate) title_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// Serializes checkout-wide Ship mutations so two browser clients cannot race.
     pub(crate) ship_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Incremental session scanner shared across snapshot rebuilds.
+    pub(crate) scan_cache: Arc<std::sync::Mutex<ScanCache>>,
+    /// Parsed transcripts shared across snapshot rebuilds and thread views.
+    pub(crate) thread_cache: Arc<std::sync::Mutex<ThreadCache>>,
     /// Per-launch capability required for credential-bearing Ship mutations.
     pub(crate) ship_token: Arc<str>,
     /// Optional single-session boundary for embedded clients.
@@ -312,15 +357,56 @@ impl App {
         let paths = self.paths.clone();
         let store = self.store.clone();
         let scope = self.session_scope.clone();
+        let scans = self.scan_cache.clone();
+        let threads = self.thread_cache.clone();
         let built = tokio::task::spawn_blocking(move || {
             let store = store.lock().map_err(|_| CoreError::LockPoisoned)?;
-            IndexSnapshot::build(&paths, &store, scope.as_ref())
+            let mut scans = scans.lock().map_err(|_| CoreError::LockPoisoned)?;
+            let mut threads = threads.lock().map_err(|_| CoreError::LockPoisoned)?;
+            IndexSnapshot::build(&paths, &store, scope.as_ref(), &mut scans, &mut threads)
         })
         .await
         .map_err(|_| CoreError::Join)??;
         *self.snapshot.write().await = Arc::new(built);
         let _ = self.events.send(ServerEvent::IndexChanged);
         Ok(())
+    }
+
+    /// Returns the parsed transcript at `path`, reusing the cache when the
+    /// file is unchanged since the last parse.
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] when stat or parse fails or a lock is poisoned.
+    pub(crate) async fn thread_view(
+        &self,
+        path: std::path::PathBuf,
+    ) -> pecan_core::Result<Arc<ThreadView>> {
+        let meta = std::fs::metadata(&path)
+            .map_err(|source| CoreError::Io { path: path.clone(), source })?;
+        let modified =
+            meta.modified().map_err(|source| CoreError::Io { path: path.clone(), source })?;
+        let bytes = meta.len();
+        {
+            let cache = self.thread_cache.lock().map_err(|_| CoreError::LockPoisoned)?;
+            if let Some(cached) = cache.get(&path) {
+                if cached.modified == modified && cached.bytes == bytes {
+                    return Ok(cached.view.clone());
+                }
+            }
+        }
+        let parse_path = path.clone();
+        let view = tokio::task::spawn_blocking(move || parse_thread(&parse_path))
+            .await
+            .map_err(|_| CoreError::Join)??;
+        let view = Arc::new(view);
+        {
+            let mut cache = self.thread_cache.lock().map_err(|_| CoreError::LockPoisoned)?;
+            if cache.len() >= THREAD_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(path, CachedThread { modified, bytes, view: view.clone() });
+        }
+        Ok(view)
     }
 
     /// Current snapshot handle.
