@@ -14,6 +14,31 @@ export function listenErrors() {
 let source: EventSource | null = null;
 let retryMs = 500;
 
+/** Accumulated assistant text for the in-flight message (module-local so
+ * deltas do not re-render the app per token). */
+let draftId: string | null = null;
+let draftText = "";
+let draftFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function resetDraft(id: string | null) {
+  draftId = id;
+  draftText = "";
+  if (draftFlushTimer !== null) {
+    clearTimeout(draftFlushTimer);
+    draftFlushTimer = null;
+  }
+  useApp.getState().setStreamingDraft(null);
+}
+
+/** Pushes draft updates to the store at most every ~120ms. */
+function queueDraftFlush() {
+  if (draftFlushTimer !== null || draftId === null) return;
+  draftFlushTimer = setTimeout(() => {
+    draftFlushTimer = null;
+    useApp.getState().setStreamingDraft({ id: draftId ?? "", text: draftText });
+  }, 120);
+}
+
 export function connectEvents() {
   if (source) return; // StrictMode double-effect guard.
   const open = () => {
@@ -36,6 +61,34 @@ export function connectEvents() {
 
       // Worker events arrive wrapped: {type:"agent-event", id, event:{…}}.
       if (envelope.type === "agent-event") {
+        const eventType =
+          typeof envelope.event === "object" && envelope.event !== null
+            ? (envelope.event as { type?: string }).type
+            : undefined;
+        if (envelope.id) {
+          if (eventType === "message_start") {
+            resetDraft(envelope.id);
+          } else if (
+            eventType === "agent_start" ||
+            eventType === "turn_start" ||
+            eventType === "abort"
+          ) {
+            resetDraft(null);
+          } else if (eventType === "message_update") {
+            const delta =
+              typeof envelope.event === "object" && envelope.event !== null
+                ? (envelope.event as { assistantMessageEvent?: { type?: string; delta?: string } })
+                    .assistantMessageEvent
+                : undefined;
+            if (delta?.type === "text_delta" && typeof delta.delta === "string") {
+              if (draftId !== envelope.id) resetDraft(envelope.id);
+              draftText += delta.delta;
+              queueDraftFlush();
+            }
+          } else if (eventType === "message_end" || eventType === "agent_settled") {
+            resetDraft(null);
+          }
+        }
         const inner =
           typeof envelope.event === "object" && envelope.event !== null
             ? (envelope.event as {

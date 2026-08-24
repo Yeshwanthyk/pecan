@@ -60,8 +60,34 @@ export function Thread({ data }: { data: ThreadView }) {
         {openTurns.map((turn) => (
           <TurnBlock key={turn.key} turn={turn} />
         ))}
+        <StreamingDraft sessionId={data.summary.id} />
         <Panels data={data} />
         <div className="h-2" />
+      </div>
+    </div>
+  );
+}
+
+/** Live partial assistant message assembled from streaming deltas. */
+function StreamingDraft({ sessionId }: { sessionId: string }) {
+  const draft = useApp((state) =>
+    state.streamingDraft?.id === sessionId ? state.streamingDraft : null,
+  );
+  const model = useApp((state) =>
+    state.agent?.sessionId === sessionId
+      ? (state.agent.state.model?.displayName ?? state.agent.state.model?.id)
+      : null,
+  );
+  if (!draft || draft.text.length === 0) return null;
+  return (
+    <div className="py-2">
+      <div className="mb-1 flex h-5 items-center gap-2 text-[11px] font-medium text-muted-foreground/80">
+        pecan
+        {model ? <span className="font-normal">{shortModel(model)}</span> : null}
+        <Spinner className="size-3" />
+      </div>
+      <div className="chat-md prose prose-sm break-words">
+        <ChatMarkdown text={draft.text} />
       </div>
     </div>
   );

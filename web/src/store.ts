@@ -35,11 +35,14 @@ type AppState = {
   contextPercent: number | null;
   thread: ThreadView | null;
   settledFoldOpen: boolean;
+  /** Partial assistant text currently streaming for one session. */
+  streamingDraft: { id: string; text: string } | null;
   pendingAsks: Record<string, PendingAsk[]>;
   subagentActivity: Record<string, SubagentActivity>;
   setBootstrap: (data: Bootstrap) => void;
   setSessions: (rows: SessionRow[]) => void;
   setThread: (thread: ThreadView | null) => void;
+  setStreamingDraft: (draft: { id: string; text: string } | null) => void;
   setAgent: (agent: AgentSnapshot | null) => void;
   setStreaming: (streaming: boolean) => void;
   setConnected: (connected: boolean) => void;
@@ -83,6 +86,8 @@ export const useApp = create<AppState>((set) => ({
   contextPercent: null,
   thread: null,
   settledFoldOpen: false,
+  streamingDraft: null,
+  setStreamingDraft: (draft) => set({ streamingDraft: draft }),
   pendingAsks: {},
   subagentActivity: {},
   setBootstrap: (bootstrap) => set({ bootstrap }),
