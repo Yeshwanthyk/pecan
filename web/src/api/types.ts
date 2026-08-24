@@ -225,6 +225,7 @@ export const AgentSnapshot = Object({
           id: String(),
           provider: String(),
           displayName: Optional(Union([String(), Null(), Undefined()])),
+          thinkingLevelMap: Optional(Union([Undefined(), Null(), Unknown()])),
         }),
       ]),
     ),

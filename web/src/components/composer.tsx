@@ -17,7 +17,18 @@ import {
 import { useApp } from "~/store";
 import { cn } from "~/lib/utils";
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
+const BASE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
+const EXTENDED_THINKING_LEVELS = ["xhigh", "max"] as const;
+
+/** Extended levels are model-gated: pi exposes them in `thinkingLevelMap`. */
+function availableThinkingLevels(model: { thinkingLevelMap?: unknown } | undefined | null): string[] {
+  const supported = model?.thinkingLevelMap;
+  const extended =
+    supported !== null && typeof supported === "object"
+      ? EXTENDED_THINKING_LEVELS.filter((level) => level in (supported as object))
+      : [];
+  return [...BASE_THINKING_LEVELS, ...extended];
+}
 
 export function Composer({
   sessionId,
@@ -104,6 +115,7 @@ export function Composer({
 
   const model = agent?.state.model;
   const thinking = agent?.state.thinkingLevel ?? "medium";
+  const thinkingLevels = availableThinkingLevels(model);
   const pendingCount = agent?.state.pendingMessageCount ?? 0;
 
   return (
@@ -170,7 +182,7 @@ export function Composer({
                   <ChevronDownIcon className="size-3 opacity-60" />
                 </PopoverTrigger>
                 <PopoverContent align="start" className="w-44 p-1" side="top">
-                  {THINKING_LEVELS.map((level) => (
+                  {thinkingLevels.map((level) => (
                     <button
                       className="flex w-full items-baseline gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent"
                       key={level}
