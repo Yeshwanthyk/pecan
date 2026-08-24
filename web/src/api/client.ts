@@ -205,6 +205,18 @@ export const api = {
       Object({ accepted: Boolean(), wasStreaming: Boolean() }),
       { text, mode },
     ),
+  sendImages: (
+    id: string,
+    text: string,
+    mode: "send" | "steer" | "queue",
+    images: Array<{ data: string; mimeType: string }>,
+  ) =>
+    request(
+      "POST",
+      `/api/session/${id}/message`,
+      Object({ accepted: Boolean(), wasStreaming: Boolean() }),
+      images.length > 0 ? { text, mode, images } : { text, mode },
+    ),
   abort: async (id: string) => request("POST", `/api/session/${id}/abort`, Ack),
   setModel: async (id: string, provider: string, modelId: string) =>
     request("POST", `/api/session/${id}/set-model`, Ack, { provider, modelId }),

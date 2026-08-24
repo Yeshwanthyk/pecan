@@ -25,6 +25,8 @@ use crate::server::api_errors::ApiError;
 #[must_use]
 pub(crate) fn router(app: App, workers: Workers) -> Router {
     let with_workers = Router::new()
+        // Image attachments ride in the message JSON body.
+        .layer(axum::extract::DefaultBodyLimit::max(48 * 1024 * 1024))
         .route("/session/new", post(new_session))
         .route("/session/{id}/message", post(message))
         .route("/session/{id}/respond", post(respond))
@@ -805,6 +807,33 @@ struct NewSessionBody {
     cwd: String,
 }
 
+/// One client-supplied image attachment (base64 payload, no data: prefix).
+#[derive(Deserialize, Debug)]
+struct IncomingImage {
+    /// Base64-encoded image bytes.
+    data: String,
+    /// MIME type; must be an `image/*` type.
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+}
+
+/// Upper bound per base64 image payload (~7.5 MB decoded).
+const MAX_IMAGE_BASE64_CHARS: usize = 10 * 1024 * 1024;
+/// Maximum attachments per message.
+const MAX_IMAGES_PER_MESSAGE: usize = 4;
+
+impl IncomingImage {
+    fn validate(&self) -> Result<(), ApiError> {
+        if !self.mime_type.starts_with("image/") {
+            return Err(ApiError::bad_request("attachments must be images".into()));
+        }
+        if self.data.is_empty() || self.data.len() > MAX_IMAGE_BASE64_CHARS {
+            return Err(ApiError::bad_request("image payload too large or empty".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Spawns a fresh pi session rooted at `cwd` and returns its session id.
 async fn new_session(
     State((app, workers)): State<(App, Workers)>,
@@ -855,6 +884,9 @@ struct MessageBody {
     text: String,
     /// `send` when idle; `steer`/`queue` choose queueing behavior while streaming.
     mode: String,
+    /// Optional image attachments (base64, no data: prefix).
+    #[serde(default)]
+    images: Vec<IncomingImage>,
 }
 
 async fn message(
@@ -863,8 +895,14 @@ async fn message(
     body: Result<Json<MessageBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
-    if body.text.trim().is_empty() {
+    if body.text.trim().is_empty() && body.images.is_empty() {
         return Err(ApiError::bad_request("empty message".into()));
+    }
+    if body.images.len() > MAX_IMAGES_PER_MESSAGE {
+        return Err(ApiError::bad_request("too many image attachments".into()));
+    }
+    for image in &body.images {
+        image.validate()?;
     }
     let path = {
         let snap = app.snapshot().await;
@@ -878,12 +916,10 @@ async fn message(
     let streaming = state.get("isStreaming").and_then(serde_json::Value::as_bool) == Some(true);
     let cmd = match (streaming, body.mode.as_str()) {
         (true, "send") => return Err(ApiError::conflict("agent is streaming; use steer or queue")),
-        (false, m) if m == "steer" || m == "queue" => {
-            serde_json::json!({"type": "prompt", "message": body.text})
-        }
-        (_, "send") => serde_json::json!({"type": "prompt", "message": body.text}),
-        (_, "steer") => serde_json::json!({"type": "steer", "message": body.text}),
-        (_, "queue") => serde_json::json!({"type": "follow_up", "message": body.text}),
+        (false, m) if m == "steer" || m == "queue" => prompt_cmd("prompt", &body),
+        (_, "send") => prompt_cmd("prompt", &body),
+        (_, "steer") => prompt_cmd("steer", &body),
+        (_, "queue") => prompt_cmd("follow_up", &body),
         (_, other) => return Err(ApiError::bad_request(format!("unknown mode {other}"))),
     };
     // Fire-and-forget semantics for the client: pi streams results via SSE.
@@ -893,6 +929,26 @@ async fn message(
         }
     });
     Ok(Json(serde_json::json!({"accepted": true, "wasStreaming": streaming})))
+}
+
+/// Builds a prompt-family command with optional image attachments.
+fn prompt_cmd(kind: &str, body: &MessageBody) -> serde_json::Value {
+    let mut cmd = serde_json::json!({"type": kind, "message": body.text});
+    if !body.images.is_empty() {
+        cmd["images"] = serde_json::Value::Array(
+            body.images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": image.data,
+                        "mimeType": image.mime_type,
+                    })
+                })
+                .collect(),
+        );
+    }
+    cmd
 }
 
 async fn abort(

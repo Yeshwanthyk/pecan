@@ -3,7 +3,13 @@
  * context meter, and send modes. While streaming, offers steer/queue plus
  * abort. Agent state refreshes on mount and on SSE agent events — no polling.
  */
-import { ChevronDownIcon, CircleStopIcon, ArrowUpIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  CircleStopIcon,
+  ArrowUpIcon,
+  ImagePlusIcon,
+  XIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "~/api/client";
@@ -19,6 +25,57 @@ import { cn } from "~/lib/utils";
 
 const BASE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
 const EXTENDED_THINKING_LEVELS = ["xhigh", "max"] as const;
+
+/** One staged image attachment awaiting send. */
+type ComposerImage = {
+  id: string;
+  data: string;
+  mimeType: string;
+  previewUrl: string;
+};
+
+/// Maximum staged attachments; the server enforces the same cap.
+const MAX_ATTACHMENTS = 4;
+/// Reject files over ~8 MB before reading them.
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+/** Reads image files into staged attachments (base64 + object-URL preview). */
+function readImageFiles(
+  files: FileList | File[] | null,
+  onError: (message: string) => void,
+): Promise<ComposerImage[]> {
+  const incoming = Array.from(files ?? []).filter((file) => file.type.startsWith("image/"));
+  if (incoming.length === 0) return Promise.resolve([]);
+  return Promise.all(
+    incoming.slice(0, MAX_ATTACHMENTS).map(
+      (file) =>
+        new Promise<ComposerImage | null>((resolve) => {
+          if (file.size > MAX_FILE_BYTES) {
+            onError(`${file.name}: image too large (max 8 MB)`);
+            resolve(null);
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = typeof reader.result === "string" ? reader.result : "";
+            const comma = dataUrl.indexOf(",");
+            if (comma < 0) {
+              resolve(null);
+              return;
+            }
+            resolve({
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              data: dataUrl.slice(comma + 1),
+              mimeType: file.type || "image/png",
+              previewUrl: URL.createObjectURL(file),
+            });
+          };
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(file);
+        }),
+    ),
+  ).then((images) => images.filter((image): image is ComposerImage => image !== null));
+}
 
 /** Extended levels are model-gated: pi exposes them in `thinkingLevelMap`. */
 function availableThinkingLevels(model: { thinkingLevelMap?: unknown } | undefined | null): string[] {
@@ -48,7 +105,24 @@ export function Composer({
     state.agent?.sessionId === sessionId ? state.contextPercent : null,
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [expanded, setExpanded] = useState(false);
+  const [images, setImages] = useState<ComposerImage[]>([]);
+
+  const addFiles = useCallback((files: FileList | File[] | null) => {
+    void readImageFiles(files, reportError).then((staged) => {
+      if (staged.length === 0) return;
+      setImages((current) => [...current, ...staged].slice(0, MAX_ATTACHMENTS));
+    });
+  }, []);
+
+  function removeImage(id: string) {
+    setImages((current) => {
+      const target = current.find((image) => image.id === id);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return current.filter((image) => image.id !== id);
+    });
+  }
 
   const autogrow = useCallback(() => {
     const el = textareaRef.current;
@@ -92,12 +166,15 @@ export function Composer({
 
   function submit() {
     const el = textareaRef.current;
-    const text = el?.value.trim();
-    if (!el || !text) return;
+    const text = el?.value.trim() ?? "";
+    if (!el || (!text && images.length === 0)) return;
     el.value = "";
     autogrow();
+    const attachments = images.map(({ data, mimeType }) => ({ data, mimeType }));
+    for (const image of images) URL.revokeObjectURL(image.previewUrl);
+    setImages([]);
     void api
-      .send(sessionId, text, streaming ? sendMode : "send")
+      .sendImages(sessionId, text, streaming ? sendMode : "send", attachments)
       .then(() => {
         if (isCurrentSession(sessionId)) {
           useApp.getState().setStreaming(true);
@@ -139,6 +216,13 @@ export function Composer({
             className="block max-h-32 min-h-11 w-full resize-none bg-transparent px-3 py-2 text-base leading-6 outline-none placeholder:text-muted-foreground sm:max-h-[240px] sm:px-3.5 sm:pt-3 sm:pb-1 sm:text-[15px] sm:leading-relaxed"
             data-expanded={expanded}
             onChange={autogrow}
+            onPaste={(event) => {
+              const files = event.clipboardData?.files;
+              if (files && files.length > 0) {
+                event.preventDefault();
+                addFiles(files);
+              }
+            }}
             onKeyDown={(event) => {
               if (
                 event.key === "Enter" &&
@@ -159,6 +243,27 @@ export function Composer({
           />
           <div className="flex min-w-0 items-center gap-1 px-1.5 pt-0.5 pb-1.5 text-xs text-muted-foreground sm:px-2">
             <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden sm:gap-1">
+              <input
+                accept="image/*"
+                className="hidden"
+                multiple
+                onChange={(event) => {
+                  addFiles(event.target.files);
+                  event.target.value = "";
+                }}
+                ref={fileInputRef}
+                type="file"
+              />
+              <Button
+                aria-label="Attach image"
+                className="size-7 shrink-0 rounded-[var(--control-radius)]"
+                disabled={images.length >= MAX_ATTACHMENTS}
+                onClick={() => fileInputRef.current?.click()}
+                size="icon"
+                variant="ghost"
+              >
+                <ImagePlusIcon className="size-3.5" />
+              </Button>
               <ModelPicker
                 models={agent?.models ?? []}
                 sessionId={sessionId}
@@ -199,6 +304,7 @@ export function Composer({
                     </button>
                   ))}
                 </PopoverContent>
+
               </Popover>
 
               {contextPercent !== null ? <ContextMeter percent={contextPercent} /> : null}
@@ -259,6 +365,30 @@ export function Composer({
               )}
             </div>
           </div>
+          {images.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5 px-2 pb-2 sm:px-2.5">
+              {images.map((image) => (
+                <span
+                  className="relative overflow-hidden rounded-md border border-border"
+                  key={image.id}
+                >
+                  <img
+                    alt="attachment preview"
+                    className="size-12 object-cover"
+                    src={image.previewUrl}
+                  />
+                  <button
+                    aria-label="Remove attachment"
+                    className="absolute end-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-background/80 text-foreground"
+                    onClick={() => removeImage(image.id)}
+                    type="button"
+                  >
+                    <XIcon className="size-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
