@@ -778,7 +778,7 @@ async fn new_session(
     // pi answers early commands before its session is initialized; poll until
     // the id materializes rather than failing on the first boot-time reply.
     let mut id = None;
-    for attempt in 0..20_u32 {
+    for attempt in 0..120_u32 {
         match worker.get_state().await {
             Ok(state) => {
                 if let Some(found) = state
@@ -798,8 +798,9 @@ async fn new_session(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let Some(id) = id else {
+        tracing::warn!("new session: worker never reported a session id (30s window)");
         return Err(ApiError::bad_gateway(
-            "worker reported no session id within startup window".into(),
+            "worker reported no session id within startup window (30s)".into(),
         ));
     };
     workers.insert(id.clone(), worker.clone()).await;
