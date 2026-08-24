@@ -1,0 +1,1 @@
+var e=new Uint8Array;export{e as default};

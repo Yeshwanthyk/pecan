@@ -1,0 +1,16 @@
+msrv = "1.91"
+avoid-breaking-exported-api = false
+check-inconsistent-struct-field-initializers = true
+lint-commented-code = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+
+disallowed-methods = [
+  { path = "std::option::Option::unwrap", reason = "match, map, or propagate the None case explicitly" },
+  { path = "std::result::Result::unwrap", reason = "propagate or map the error instead of panicking" },
+  { path = "std::option::Option::expect", reason = "prefer explicit control flow over generic panic messages" },
+  { path = "std::result::Result::expect", reason = "prefer typed context or structured error mapping" },
+]

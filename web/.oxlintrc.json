@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["dist/**", "node_modules/**"],
+  "options": { "reportUnusedDisableDirectives": "error" },
+  "rules": {
+    "no-unused-vars": "error",
+    "eqeqeq": "error",
+    "no-implicit-coercion": "error",
+    "no-console": "error",
+    "no-alert": "error",
+    "react/jsx-no-comment-textnodes": "error",
+    "react/jsx-no-target-blank": "error",
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "error"
+  },
+  "categories": { "correctness": "error", "perf": "warn" }
+}

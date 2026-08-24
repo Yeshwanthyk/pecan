@@ -1,0 +1,63 @@
+{
+  "ignores": [
+    "**/.git/**",
+    "**/target/**",
+    "**/node_modules/**",
+    "**/coverage/**",
+    "**/*.generated.rs"
+  ],
+  "rules": {
+    "rust.allow-broad-lints": { "enabled": true, "weight": 2.0 },
+    "rust.allow-proliferation": { "enabled": true, "weight": 1.7 },
+    "rust.box-dyn-over-generics": { "enabled": true, "weight": 1.2 },
+    "rust.clone-before-consume": { "enabled": true, "weight": 1.5 },
+    "rust.clone-density": { "enabled": true, "weight": 1.7 },
+    "rust.derives-with-interior-mutability": { "enabled": true, "weight": 1.4 },
+    "rust.error-message-template-repetition": { "enabled": true, "weight": 1.4 },
+    "rust.expect-generic-message": { "enabled": true, "weight": 1.6 },
+    "rust.god-functions": { "enabled": true, "weight": 1.3 },
+    "rust.match-propagation-boilerplate": { "enabled": true, "weight": 1.2 },
+    "rust.over-derive": { "enabled": true, "weight": 1.0 },
+    "rust.panic-in-library": { "enabled": true, "weight": 2.0 },
+    "rust.pub-mod-glob-reexport": { "enabled": true, "weight": 1.5 },
+    "rust.public-anyhow-leak": { "enabled": true, "weight": 1.8 },
+    "rust.public-api-churn-shape": { "enabled": true, "weight": 1.4 },
+    "rust.public-missing-docs-cluster": { "enabled": true, "weight": 1.4 },
+    "rust.public-result-string-error": { "enabled": true, "weight": 1.8 },
+    "rust.question-mark-avoidance": { "enabled": true, "weight": 1.3 },
+    "rust.repetitive-panic-messages": { "enabled": true, "weight": 1.5 },
+    "rust.restating-comments": { "enabled": true, "weight": 1.1 },
+    "rust.silenced-result": { "enabled": true, "weight": 1.8 },
+    "rust.string-over-borrow": { "enabled": true, "weight": 1.4 },
+    "rust.todo-panic-in-match-default": { "enabled": true, "weight": 1.8 },
+    "rust.unit-error-type-overuse": { "enabled": true, "weight": 1.5 },
+    "rust.unreachable-macro-production": { "enabled": true, "weight": 1.5 },
+    "rust.unsafe-undocumented": { "enabled": true, "weight": 2.0 },
+    "rust.unsafe-without-safe-wrapper-boundary": { "enabled": true, "weight": 2.0 },
+    "rust.unwrap-density": { "enabled": true, "weight": 1.8, "options": { "threshold": 2 } },
+    "rust.visibility-discipline": { "enabled": true, "weight": 1.5 }
+  },
+  "overrides": [
+    {
+      "files": [
+        "tests/**",
+        "benches/**",
+        "examples/**",
+        "fuzz/**",
+        "src/bin/**"
+      ],
+      "rules": {
+        "rust.expect-generic-message": { "enabled": false },
+        "rust.panic-in-library": { "enabled": false },
+        "rust.public-anyhow-leak": { "enabled": false },
+        "rust.public-missing-docs-cluster": { "enabled": false },
+        "rust.public-result-string-error": { "enabled": false },
+        "rust.question-mark-avoidance": { "enabled": false },
+        "rust.todo-panic-in-match-default": { "enabled": false },
+        "rust.unreachable-macro-production": { "enabled": false },
+        "rust.unwrap-density": { "enabled": false },
+        "rust.visibility-discipline": { "enabled": false }
+      }
+    }
+  ]
+}

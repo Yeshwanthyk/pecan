@@ -1,0 +1,294 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Auto content detection needs a working git repo; declare sources explicitly. */
+@source "./**/*.{ts,tsx}";
+@source "../index.html";
+
+@custom-variant dark (&:is(.dark, .dark *));
+
+/* Safe-area inset utilities (mobile PWA-style edge-to-edge). */
+@utility pt-safe {
+  padding-top: max(env(safe-area-inset-top), 0px);
+}
+@utility pb-safe {
+  padding-bottom: max(env(safe-area-inset-bottom), 0px);
+}
+@utility pl-safe {
+  padding-left: max(env(safe-area-inset-left), 0px);
+}
+@utility pr-safe {
+  padding-right: max(env(safe-area-inset-right), 0px);
+}
+
+/* Grain texture utility kept as no-op so components can reference it safely. */
+@utility surface-grain {
+  background-image: none;
+}
+
+/* Popover/menu surfaces: solid neutral cards (glass recipe reduced to opaque
+   so floating UI never shows the transcript through it). */
+@utility surface-glass {
+  background: var(--background);
+}
+
+@utility dropdown-glass {
+  background: var(--popover);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 8px 24px rgb(0 0 0 / 10%),
+    0 2px 6px rgb(0 0 0 / 6%);
+}
+.dark .dropdown-glass,
+.dark[data-slot="popover-popup"],
+.dark [data-slot="popover-popup"] {
+  box-shadow:
+    0 8px 24px rgb(0 0 0 / 48%),
+    0 2px 6px rgb(0 0 0 / 32%);
+}
+
+/* ---------------------------------------------------------------------------
+   Scandinavian system. Light: alpha-black ink ladder on white. Dark: white
+   ladder re-derived for near-black (#0a0a0a). No tinted grays anywhere;
+   semantic hue reserved for state (waiting / success / destructive).
+--------------------------------------------------------------------------- */
+
+:root,
+.light {
+  /* Compact UI geometry shared by sidebar / toolbar controls. */
+  --control-radius: 0.5rem;
+  --sidebar-content-inset: 0.5rem;
+  --sidebar-control-gap: 0.5rem;
+  --sidebar-row-content-inset: 0.625rem;
+  --workspace-controls-left: calc(env(safe-area-inset-left) + 0.75rem);
+  --workspace-titlebar-control-size: 1.75rem;
+  --workspace-titlebar-control-gap: 0.75rem;
+
+  --background: #ffffff;
+  --foreground: #000000;
+  --card: #ffffff;
+  --popover: #ffffff;
+  /* Primary action = pure ink: the one accent slot. */
+  --primary: #000000;
+  --primary-foreground: #ffffff;
+  --secondary: rgb(0 0 0 / 5%);
+  --secondary-foreground: #000000;
+  --muted: rgb(0 0 0 / 4%);
+  --muted-foreground: rgb(0 0 0 / 62%);
+  --accent: rgb(0 0 0 / 5%);
+  --accent-foreground: #000000;
+  --destructive: #b3261e;
+  --destructive-foreground: #ffffff;
+  --border: rgb(0 0 0 / 10%);
+  --input: rgb(0 0 0 / 18%);
+  --ring: rgb(0 0 0 / 44%);
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #000000;
+  --sidebar-muted-foreground: rgb(0 0 0 / 56%);
+  --sidebar-border: rgb(0 0 0 / 10%);
+  --sidebar-row-hover: rgb(0 0 0 / 5%);
+  --sidebar-row-active: rgb(0 0 0 / 9%);
+  --sidebar-row-selected: rgb(0 0 0 / 9%);
+  --sidebar-control-surface: rgb(0 0 0 / 5%);
+  --sidebar-icon-color: rgb(0 0 0 / 44%);
+
+  /* Quiet fill marking user-authored content without an accent hue. */
+  --bubble: rgb(0 0 0 / 4%);
+  --bubble-border: rgb(0 0 0 / 10%);
+
+  --success: #3d6b35;
+  --warning: #8a611c;
+
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+}
+
+.dark {
+  /* Alpha values are dark-canvas derivations, not inversions:
+     supporting 56–58%, metadata ~44%, borders 11%, hover 9%, pressed 14%. */
+  --background: #0a0a0a;
+  --foreground: #ffffff;
+  --card: #131313;
+  --popover: #131313;
+  --primary: #ffffff;
+  --primary-foreground: #0a0a0a;
+  --secondary: rgb(255 255 255 / 9%);
+  --secondary-foreground: #ffffff;
+  --muted: rgb(255 255 255 / 8%);
+  --muted-foreground: rgb(255 255 255 / 58%);
+  --accent: rgb(255 255 255 / 9%);
+  --accent-foreground: #ffffff;
+  --destructive: #f2b8b5;
+  --destructive-foreground: #0a0a0a;
+  --border: rgb(255 255 255 / 11%);
+  --input: rgb(255 255 255 / 18%);
+  --ring: rgb(255 255 255 / 52%);
+
+  --sidebar: #0a0a0a;
+  --sidebar-foreground: #ffffff;
+  --sidebar-muted-foreground: rgb(255 255 255 / 48%);
+  --sidebar-border: rgb(255 255 255 / 11%);
+  --sidebar-row-hover: rgb(255 255 255 / 9%);
+  --sidebar-row-active: rgb(255 255 255 / 14%);
+  --sidebar-row-selected: rgb(255 255 255 / 14%);
+  --sidebar-control-surface: rgb(255 255 255 / 9%);
+  --sidebar-icon-color: rgb(255 255 255 / 40%);
+
+  --bubble: rgb(255 255 255 / 8%);
+  --bubble-border: rgb(255 255 255 / 12%);
+
+  --success: #8fbf7f;
+  --warning: #d9b36a;
+
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-muted-foreground: var(--sidebar-muted-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-row-hover: var(--sidebar-row-hover);
+  --color-sidebar-row-active: var(--sidebar-row-active);
+  --color-sidebar-row-selected: var(--sidebar-row-selected);
+  --color-sidebar-control-surface: var(--sidebar-control-surface);
+  --color-bubble: var(--bubble);
+  --color-bubble-border: var(--bubble-border);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter,
+    "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+}
+
+/* Minimal neutral syntax palette for rehype-highlight output: hierarchy via
+   weight and opacity only, keeping code blocks quiet. */
+.hljs-comment,
+.hljs-quote {
+  color: rgb(0 0 0 / 44%);
+  font-style: italic;
+}
+.dark .hljs-comment,
+.dark .hljs-quote {
+  color: rgb(255 255 255 / 40%);
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-meta-keyword,
+.hljs-doctag,
+.hljs-section,
+.hljs-name,
+.hljs-strong {
+  font-weight: 600;
+}
+.hljs-string,
+.hljs-title,
+.hljs-attr,
+.hljs-attribute,
+.hljs-number,
+.hljs-literal,
+.hljs-built_in,
+.hljs-type,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition {
+  color: rgb(0 0 0 / 78%);
+  font-weight: 450;
+}
+.dark .hljs-string,
+.dark .hljs-title,
+.dark .hljs-attr,
+.dark .hljs-attribute,
+.dark .hljs-number,
+.dark .hljs-literal,
+.dark .hljs-built_in,
+.dark .hljs-type,
+.dark .hljs-symbol,
+.dark .hljs-bullet,
+.dark .hljs-addition {
+  color: rgb(255 255 255 / 82%);
+}
+
+/* Chat markdown: typography plugin structure with neutral ink overrides.
+   Prose handles headings/lists/spacing; we pin colors to the ink ladder. */
+.chat-md {
+  --tw-prose-body: var(--foreground);
+  --tw-prose-headings: var(--foreground);
+  --tw-prose-lead: var(--foreground);
+  --tw-prose-links: var(--foreground);
+  --tw-prose-bold: var(--foreground);
+  --tw-prose-counters: rgb(0 0 0 / 44%);
+  --tw-prose-bullets: rgb(0 0 0 / 44%);
+  --tw-prose-hr: var(--border);
+  --tw-prose-quotes: var(--foreground);
+  --tw-prose-quote-borders: var(--border);
+  --tw-prose-captions: rgb(0 0 0 / 56%);
+  --tw-prose-code: var(--foreground);
+  --tw-prose-pre-code: var(--foreground);
+  --tw-prose-pre-bg: transparent;
+  --tw-prose-th-borders: var(--border);
+  --tw-prose-td-borders: var(--border);
+  max-width: none;
+  font-size: 15px;
+  line-height: 1.65;
+}
+.dark .chat-md {
+  --tw-prose-counters: rgb(255 255 255 / 40%);
+  --tw-prose-bullets: rgb(255 255 255 / 40%);
+  --tw-prose-captions: rgb(255 255 255 / 48%);
+}
+.chat-md code {
+  font-weight: 400;
+}
+.chat-md pre code {
+  background: none;
+  padding: 0;
+}
+.chat-md :is(h1, h2, h3, h4, h5, h6) {
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
