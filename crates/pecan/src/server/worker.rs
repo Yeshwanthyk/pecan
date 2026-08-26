@@ -1,5 +1,11 @@
 //! RPC worker management: one lazily spawned `pi --mode rpc` child per session.
 //!
+//! Setting `PECAN_PI_EXTENSIONS` (comma/space separated absolute paths) pins
+//! explicit `--extension` entry points into every worker — e.g. the real
+//! local pi-askuser package — matching the proof harness in
+//! `scripts/prove-askuser-bridge.sh`. Unset by default: pi's own package
+//! discovery stays on.
+//!
 //! Workers are the write path. Reads stay filesystem-driven; a worker exists
 /// only while the user is actively steering a thread, and idle workers are
 /// reaped after [`IDLE_REAP_MS`] (the same lifecycle pican uses).
@@ -8,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 /// Idle workers are killed after this long without a command.
@@ -56,6 +62,8 @@ pub(crate) struct WorkerHandle {
     /// moment cannot belong to this process.
     spawned_ms: i64,
     forward_started: AtomicBool,
+    /// Working directory used by a newly-created, not-yet-persisted session.
+    cwd: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for WorkerHandle {
@@ -65,6 +73,11 @@ impl std::fmt::Debug for WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Returns the worker's working directory.
+    pub(crate) fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
     /// Sends one RPC command and awaits its correlated response.
     ///
     /// # Errors
@@ -221,6 +234,11 @@ impl Workers {
     pub(crate) async fn remove(&self, session_id: &str) -> Option<Arc<WorkerHandle>> {
         self.map.lock().await.remove(session_id)
     }
+
+    /// Returns a live worker by session id, when present.
+    pub(crate) async fn get(&self, session_id: &str) -> Option<Arc<WorkerHandle>> {
+        self.map.lock().await.get(session_id).cloned()
+    }
 }
 
 /// Kills and removes workers idle beyond [`IDLE_REAP_MS`].
@@ -245,6 +263,20 @@ async fn reap_once(map: &Mutex<HashMap<String, Arc<WorkerHandle>>>) {
     }
 }
 
+/// Parses the `PECAN_PI_EXTENSIONS` value into explicit `pi --extension`
+/// entry points. Entries are split on commas, spaces, and tabs; empty entries
+/// are dropped. The variable is unset by default, so pi's own package
+/// discovery (and everything installed there, e.g. pi-askuser) still applies.
+pub(crate) fn parse_extension_env(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t']).filter(|entry| !entry.is_empty()).map(str::to_owned).collect()
+}
+
+/// Reads `PECAN_PI_EXTENSIONS` once per worker spawn; absent means no
+/// explicit loads and ambient discovery stays on.
+fn read_extension_args() -> Vec<String> {
+    std::env::var("PECAN_PI_EXTENSIONS").map(|raw| parse_extension_env(&raw)).unwrap_or_default()
+}
+
 /// Spawns and wires one worker: reader task routes responses to waiters and
 /// forwards everything else onto the event channel.
 ///
@@ -255,6 +287,12 @@ async fn spawn_worker(
 ) -> Result<Arc<WorkerHandle>, WorkerError> {
     let mut cmd = tokio::process::Command::new("pi");
     cmd.args(["--mode", "rpc"]);
+    // `PECAN_PI_EXTENSIONS` pins explicit extension files (e.g. the local
+    // pi-askuser package) into every worker, mirroring the RPC proof
+    // harness; unset by default so nothing changes on existing setups.
+    for extension in read_extension_args() {
+        cmd.arg("--extension").arg(extension);
+    }
     // `--session <path>` attaches the real transcript at startup, so every
     // prompt lands in the same .jsonl our filesystem read path watches.
     if let Some(path) = session_path {
@@ -276,6 +314,8 @@ async fn spawn_worker(
     let stdin = child.stdin.take().ok_or_else(|| WorkerError::Rejected("no stdin".to_owned()))?;
     let stdout =
         child.stdout.take().ok_or_else(|| WorkerError::Rejected("no stdout".to_owned()))?;
+    let stderr =
+        child.stderr.take().ok_or_else(|| WorkerError::Rejected("no stderr".to_owned()))?;
 
     let (events_tx, _) = broadcast::channel::<serde_json::Value>(256);
     let handle = Arc::new(WorkerHandle {
@@ -287,6 +327,18 @@ async fn spawn_worker(
         last_used_ms: AtomicI64::new(now_millis()),
         spawned_ms: now_millis(),
         forward_started: AtomicBool::new(false),
+        cwd: cwd.map(std::path::Path::to_owned).unwrap_or_default(),
+    });
+
+    // Drain stderr continuously. A piped stderr that is never read can fill
+    // its OS buffer and block pi before it emits the session id.
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if !line.trim().is_empty() {
+                tracing::warn!("pi worker stderr: {line}");
+            }
+        }
     });
 
     // Reader: strict LF framing per the RPC protocol.
@@ -336,4 +388,63 @@ async fn spawn_worker(
     });
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_extension_env;
+
+    #[test]
+    fn extension_env_splits_on_separators_and_drops_empties() {
+        assert_eq!(parse_extension_env(""), Vec::<String>::new(), "empty value yields no entries");
+        assert_eq!(
+            parse_extension_env("/a.ts,/b.ts /c.ts"),
+            vec!["/a.ts".to_owned(), "/b.ts".to_owned(), "/c.ts".to_owned()],
+            "commas and spaces both split",
+        );
+        assert_eq!(
+            parse_extension_env("  /a.ts\t,/b.ts ,"),
+            vec!["/a.ts".to_owned(), "/b.ts".to_owned()],
+            "leading, trailing, and doubled separators are ignored",
+        );
+    }
+
+    #[test]
+    fn pi_subagents_wiring_env_pins_the_subagents_entry_point() {
+        // The PECAN_PI_EXTENSIONS value the pi-subagents slice documents
+        // (the real local pi-subagents extension only; the activity rail is
+        // opt-in) must map to one explicit `pi --extension` arg.
+        assert_eq!(
+            parse_extension_env("/ext/pi-subagents/extensions/subagents/index.ts"),
+            vec!["/ext/pi-subagents/extensions/subagents/index.ts".to_owned()],
+            "the subagents entry point must survive the env split",
+        );
+    }
+
+    #[test]
+    fn pi_subagents_opt_in_rail_rides_along_in_order_when_set() {
+        // Operators opt the activity rail in by appending its entry point to
+        // PECAN_PI_EXTENSIONS (the proof script's PECAN_ACTIVITY_RAIL_EXTENSION
+        // is a script-level convenience that composes the same env value); an
+        // extra entry must keep its position after the subagents entry.
+        assert_eq!(
+            parse_extension_env(
+                "/ext/pi-subagents/extensions/subagents/index.ts,/ext/pi-subagents/extensions/activity-rail/index.ts",
+            ),
+            vec![
+                "/ext/pi-subagents/extensions/subagents/index.ts".to_owned(),
+                "/ext/pi-subagents/extensions/activity-rail/index.ts".to_owned(),
+            ],
+            "subagents then opt-in rail entry points must survive the env split in order",
+        );
+    }
+
+    #[test]
+    fn pi_subagents_wiring_env_ignores_trailing_separators() {
+        assert_eq!(
+            parse_extension_env("/ext/pi-subagents/extensions/subagents/index.ts, "),
+            vec!["/ext/pi-subagents/extensions/subagents/index.ts".to_owned()],
+            "trailing commas/spaces are dropped from the documented value",
+        );
+    }
 }

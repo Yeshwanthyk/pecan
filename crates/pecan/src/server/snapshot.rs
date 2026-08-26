@@ -12,7 +12,6 @@ use pecan_core::scan::ScanCache;
 use pecan_core::session::{SessionKind, SessionSummary};
 use pecan_core::store::StateStore;
 use pecan_core::tasks::TaskList;
-use pecan_core::thread::ThreadEntry;
 use pecan_core::thread::{ThreadView, parse_thread};
 use pecan_core::workflows::WorkflowRun;
 use pecan_core::{CoreError, PiPaths};
@@ -37,18 +36,24 @@ pub(crate) struct CachedThread {
 /// Session files are append-only, so `(mtime, size)` detects new entries.
 pub(crate) type ThreadCache = HashMap<std::path::PathBuf, CachedThread>;
 
-/// One live dialog request from a session's worker (ask_user, confirm,
-/// free input), kept so answers survive browser reloads and so stale
-/// answers can be rejected instead of silently dropped.
+/// One live dialog request from a session's worker (`ask_user`, select,
+/// confirm, input, editor), kept so answers survive browser reloads and so
+/// stale answers can be rejected instead of silently dropped.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecordedAsk {
-    /// Dialog method: `select`, `confirm`, or `input`.
+    /// Dialog method: `select`, `confirm`, `input`, or `editor`.
     pub(crate) method: String,
     /// Optional prompt title.
     pub(crate) title: Option<String>,
     /// Options for `select` dialogs.
     pub(crate) options: Option<Vec<serde_json::Value>>,
+    /// Body text shown under the title of `confirm` dialogs.
+    pub(crate) message: Option<String>,
+    /// Placeholder hint for `input` dialogs.
+    pub(crate) placeholder: Option<String>,
+    /// Prefilled content for `editor` dialogs.
+    pub(crate) prefill: Option<String>,
     /// When the request was observed (epoch millis).
     pub(crate) recorded_at_ms: i64,
 }
@@ -56,7 +61,6 @@ pub(crate) struct RecordedAsk {
 /// Live dialog requests per session, keyed by pi request id.
 pub(crate) type PendingAsks = HashMap<String, HashMap<String, RecordedAsk>>;
 
-/// Upper bound on cached transcripts; the cap bounds memory when a machine
 /// Upper bound on cached transcripts; the cap bounds memory when a machine
 /// accumulates thousands of sessions. Oversubscription clears the map and
 /// rebuilds it from the sessions actually being read.
@@ -96,6 +100,7 @@ impl SessionScope {
             .iter()
             .filter(|row| {
                 row.summary.kind == SessionKind::Subagent
+                    && !row.settled
                     && row.summary.cwd == cwd
                     && row.summary.opened_at >= opened_at
                     && row.summary.agent_name.as_deref().is_some_and(|raw_name| {
@@ -162,10 +167,84 @@ fn spawned_agents(path: &std::path::Path) -> HashMap<String, HashSet<String>> {
 }
 
 fn first_user_prompt(path: &std::path::Path) -> Option<String> {
-    parse_thread(path).ok()?.entries.into_iter().find_map(|dated| match dated.entry {
-        ThreadEntry::User { text, .. } => Some(text.trim().to_owned()),
-        _ => None,
-    })
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(message) = value.get("message") else { continue };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = message.get("content") else { continue };
+        let text = match content {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| {
+                    (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                        .then(|| block.get("text").and_then(serde_json::Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_owned());
+        }
+    }
+    None
+}
+
+type ParentCandidate = (String, String, jiff::Timestamp, HashMap<String, HashSet<String>>);
+
+/// Resolves subagent sessions to their parent by matching the persisted spawn
+/// name and prompt against candidate normal-session transcripts.
+fn link_parent_sessions(rows: &mut [SessionRow]) {
+    let active_child_cwds: HashSet<&str> = rows
+        .iter()
+        .filter(|row| row.summary.kind == SessionKind::Subagent && !row.settled)
+        .map(|row| row.summary.cwd.as_str())
+        .collect();
+    let parents: Vec<ParentCandidate> = rows
+        .iter()
+        .filter(|row| {
+            row.summary.kind == SessionKind::Normal
+                && !row.settled
+                && active_child_cwds.contains(row.summary.cwd.as_str())
+        })
+        .map(|row| {
+            (
+                row.summary.id.clone(),
+                row.summary.cwd.clone(),
+                row.summary.opened_at,
+                spawned_agents(&row.summary.path),
+            )
+        })
+        .collect();
+
+    for child in
+        rows.iter_mut().filter(|row| row.summary.kind == SessionKind::Subagent && !row.settled)
+    {
+        let Some(name) = child.summary.agent_name.as_deref().map(normalize_agent_name) else {
+            continue;
+        };
+        let Some(prompt) = first_user_prompt(&child.summary.path) else { continue };
+        child.parent_session_id = parents
+            .iter()
+            .filter(|(_, cwd, opened_at, spawns)| {
+                *cwd == child.summary.cwd
+                    && *opened_at <= child.summary.opened_at
+                    && spawns.get(name).is_some_and(|prompts| prompts.contains(&prompt))
+            })
+            .max_by_key(|(_, _, opened_at, _)| *opened_at)
+            .map(|(id, _, _, _)| id.clone());
+    }
 }
 
 /// One session row as served to the client: summary + derived flags.
@@ -181,6 +260,8 @@ pub(crate) struct SessionRow {
     pub(crate) pinned: bool,
     /// Whether the transcript ends with an unanswered `ask_user` call.
     pub(crate) waiting_askuser: bool,
+    /// Resolved owning session id for a subagent, when persisted evidence identifies it.
+    pub(crate) parent_session_id: Option<String>,
 }
 
 /// Everything list views need, rebuilt atomically on changes.
@@ -229,10 +310,15 @@ impl IndexSnapshot {
                 settled: settled_flag,
                 pinned: pinned_flag,
                 waiting_askuser,
+                parent_session_id: None,
             });
         }
         if let Some(scope) = scope {
             scope.filter_rows(&mut rows);
+            // Embedded mode has a single known parent, so resolve only the
+            // already-scoped rows. Global mode uses the frontend's cheap
+            // recent-agent fallback and never parses historical transcripts.
+            link_parent_sessions(&mut rows);
         }
         let visible_ids: HashSet<&str> = rows.iter().map(|row| row.summary.id.as_str()).collect();
         let tasks = if crate::server::ui_plugins::pi_tasks_enabled(paths, store)? {
@@ -467,14 +553,16 @@ mod tests {
             settled: false,
             pinned: false,
             waiting_askuser: false,
+            parent_session_id: None,
         }
     }
 
     fn parent_with_spawn(name: &str) -> SessionRow {
         let mut parent = row("main", "/project", "2026-01-01T00:00:00Z", SessionKind::Normal);
         let path = std::env::temp_dir().join(format!(
-            "pecan-scope-parent-{}-{}.jsonl",
+            "pecan-scope-parent-{}-{:?}-{}.jsonl",
             std::process::id(),
+            std::thread::current().id(),
             name
         ));
         let line = serde_json::json!({
@@ -496,8 +584,11 @@ mod tests {
     fn child_with_prompt(id: &str, name: &str, prompt: &str, opened_at: &str) -> SessionRow {
         let mut child = row(id, "/project", opened_at, SessionKind::Subagent);
         child.summary.agent_name = Some(format!("subagents: {name}"));
-        let path = std::env::temp_dir()
-            .join(format!("pecan-scope-child-{}-{id}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "pecan-scope-child-{}-{:?}-{id}.jsonl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let header = serde_json::json!({
             "type": "session",
             "id": id,
@@ -542,6 +633,42 @@ mod tests {
         let _ = std::fs::remove_file(parent_path);
         let _ = std::fs::remove_file(child_path);
         let _ = std::fs::remove_file(unrelated_path);
+    }
+
+    #[test]
+    fn skips_settled_child_parent_resolution() {
+        let parent = parent_with_spawn("settled-child");
+        let parent_path = parent.summary.path.clone();
+        let mut child = child_with_prompt(
+            "settled-child-id",
+            "settled-child",
+            "Bound task",
+            "2026-01-02T00:00:00Z",
+        );
+        child.settled = true;
+        let child_path = child.summary.path.clone();
+        let mut rows = vec![parent, child];
+
+        super::link_parent_sessions(&mut rows);
+
+        assert_eq!(rows[1].parent_session_id, None);
+        let _ = std::fs::remove_file(parent_path);
+        let _ = std::fs::remove_file(child_path);
+    }
+
+    #[test]
+    fn links_child_to_matching_parent_session() {
+        let parent = parent_with_spawn("owned-child");
+        let parent_path = parent.summary.path.clone();
+        let child = child_with_prompt("child", "owned-child", "Bound task", "2026-01-02T00:00:00Z");
+        let child_path = child.summary.path.clone();
+        let mut rows = vec![parent, child];
+
+        super::link_parent_sessions(&mut rows);
+
+        assert_eq!(rows[1].parent_session_id.as_deref(), Some("main"));
+        let _ = std::fs::remove_file(parent_path);
+        let _ = std::fs::remove_file(child_path);
     }
 
     #[test]

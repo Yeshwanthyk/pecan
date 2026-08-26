@@ -11,20 +11,16 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "~/api/client";
 import type { DatedEntry, ThreadEntry, ThreadView, ToolCall } from "~/api/types";
 import { Badge } from "~/components/ui/badge";
-import { Button } from "~/components/ui/button";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "~/components/ui/collapsible";
-import { Input } from "~/components/ui/input";
 import { Spinner } from "~/components/ui/spinner";
 import { ChatMarkdown, DiffBlock } from "~/components/chat-markdown";
 import { useApp } from "~/store";
-import { syncPendingAsks } from "~/events";
 import { cn } from "~/lib/utils";
 
 const OPEN_TURNS = 3;
@@ -184,13 +180,14 @@ function runKey(index: number, tools: ToolCall[]) {
   return `run-${index}-${tools[0]?.toolCallId ?? ""}`;
 }
 
-/** One tool run: collapsed single line by default, expandable to chip list. */
+/** One tool run: shows its tool chips by default, with a compact toggle. */
 function ToolRun({ tools, model }: { tools: ToolCall[]; model: string | null }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const summary = runSummary(tools);
   return (
     <div className="py-0.5">
       <button
+        aria-expanded={open}
         className="group flex w-full items-center gap-2 rounded-md px-1 py-0.5 -ml-1 text-left text-[11px] font-medium text-muted-foreground/80 hover:bg-accent hover:text-foreground"
         onClick={() => setOpen((value) => !value)}
         type="button"
@@ -500,41 +497,14 @@ function jsonStringField(text: string, keys: string[]): string | null {
   return null;
 }
 
+/**
+ * Historical `ask_user` card: shows the question and its options, plus the
+ * recorded answer. Live answering is the global extension host's job, so
+ * pending requests are never rendered (or answered) from inside a card.
+ */
 function AskUserCard({ entry }: { entry: AskUserEntry }) {
   const questions = readQuestions(entry.questions);
   const answered = entry.answer !== null && entry.answer !== undefined;
-  const sessionId = useApp((state) => state.thread?.summary.id ?? "");
-  const pendingAsk = useApp(
-    (state) => (state.pendingAsks[sessionId] ?? [])[0] ?? null,
-  );
-  const removePendingAsk = useApp((state) => state.removePendingAsk);
-  const [busyId, setBusyId] = useState<string | null>(null);
-
-  async function answer(answer: {
-    cancelled?: boolean;
-    confirmed?: boolean;
-    value?: string;
-  }) {
-    if (!pendingAsk) return;
-    setBusyId(pendingAsk.id);
-    try {
-      await api.respond(sessionId, pendingAsk.id, answer);
-      removePendingAsk(sessionId, pendingAsk.id);
-    } catch (error) {
-      window.dispatchEvent(
-        new CustomEvent("pecan:error", {
-          detail: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      // The ask may be stale (worker restarted); re-sync from the server.
-      void syncPendingAsks(sessionId);
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  const canAnswer = !answered && pendingAsk !== null;
-
   return (
     <div
       className={cn(
@@ -548,89 +518,31 @@ function AskUserCard({ entry }: { entry: AskUserEntry }) {
           answered ? "text-success" : "text-warning",
         )}
       >
-        {answered ? "Answered" : pendingAsk ? "Question \u2014 pick an answer" : "Question"}
+        {answered ? "Answered" : "Question"}
       </div>
       {questions.map((question, qIndex) => (
         <div key={question.question ?? qIndex}>
           <p className="mt-1.5 text-sm font-medium">{question.question}</p>
-          {canAnswer ? (
-            <ul className="mt-1.5 flex flex-col gap-1">
-              {((question.options ?? []) as Array<{ label?: string; value?: string }>).map(
-                (option, oIndex) => (
-                  <li key={option.label ?? oIndex}>
-                    <button
-                      className="w-full rounded-lg border bg-card px-3 py-1.5 text-left text-[13px] transition-colors hover:border-input hover:bg-accent disabled:opacity-50"
-                      disabled={busyId !== null}
-                      onClick={() => void answer({ value: option.value ?? option.label })}
-                      type="button"
-                    >
-                      {option.label}
-                    </button>
-                  </li>
-                ),
-              )}
-            </ul>
-          ) : (
-            <ul className="mt-1 flex flex-col gap-0.5">
-              {((question.options ?? []) as Array<{ label?: string }>).map(
-                (option, oIndex) => (
-                  <li
-                    className="rounded-md bg-accent/60 px-2.5 py-1 text-[13px] text-muted-foreground"
-                    key={option.label ?? oIndex}
-                  >
-                    {option.label}
-                  </li>
-                ),
-              )}
-            </ul>
-          )}
+          <ul className="mt-1 flex flex-col gap-0.5">
+            {((question.options ?? []) as Array<{ label?: string }>).map(
+              (option, oIndex) => (
+                <li
+                  className="rounded-md bg-accent/60 px-2.5 py-1 text-[13px] text-muted-foreground"
+                  key={option.label ?? oIndex}
+                >
+                  {option.label ?? "…"}
+                </li>
+              ),
+            )}
+          </ul>
         </div>
       ))}
-      {canAnswer && pendingAsk.method === "input" ? (
-        <FreeInputAnswer busy={busyId !== null} onAnswer={(value) => void answer({ value })} />
-      ) : null}
-      {canAnswer && pendingAsk.method === "confirm" ? (
-        <div className="mt-2 flex gap-2">
-          <Button onClick={() => void answer({ confirmed: true })} size="xs">Yes</Button>
-          <Button onClick={() => void answer({ confirmed: false })} size="xs" variant="ghost">No</Button>
-        </div>
-      ) : null}
       {answered ? (
         <p className="mt-2 border-t pt-2 text-sm text-muted-foreground">
           → {readText(entry.answer)}
         </p>
       ) : null}
     </div>
-  );
-}
-
-function FreeInputAnswer({
-  busy,
-  onAnswer,
-}: {
-  busy: boolean;
-  onAnswer: (value: string) => void;
-}) {
-  const [value, setValue] = useState("");
-  return (
-    <form
-      className="mt-2 flex gap-2"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (value.trim()) onAnswer(value.trim());
-      }}
-    >
-      <Input
-        className="h-8 flex-1 text-[13px]"
-        disabled={busy}
-        onChange={(event) => setValue(event.target.value)}
-        placeholder="Type your answer…"
-        value={value}
-      />
-      <Button disabled={busy || !value.trim()} size="xs" type="submit">
-        Send
-      </Button>
-    </form>
   );
 }
 

@@ -1,6 +1,6 @@
 /** Live updates: one EventSource fanning debounced store refreshes. */
 import { api } from "~/api/client";
-import { useApp } from "~/store";
+import { useApp, type DialogOption, type PendingAsk } from "~/store";
 
 const SUBAGENT_ACTIVITY_WIDGET = "pi-subagents/activity/v1";
 
@@ -95,11 +95,57 @@ export function connectEvents() {
                 type?: string;
                 method?: string;
                 title?: string;
-                options?: Array<{ label?: string; value?: string }>;
+                message?: string;
+                placeholder?: string;
+                prefill?: string;
+                options?: unknown;
+                statusKey?: string;
+                statusText?: string;
                 widgetKey?: string;
                 widgetLines?: unknown;
+                widgetPlacement?: "aboveEditor" | "belowEditor";
+                notifyType?: "info" | "warning" | "error";
+                text?: string;
               })
             : undefined;
+        const requestId = envelope.event && typeof envelope.event === "object"
+          ? (envelope.event as { id?: string }).id
+          : undefined;
+        if (envelope.id && inner?.type === "extension_ui_request" && inner.method === "notify") {
+          if (typeof inner.message === "string") {
+            useApp.getState().addExtensionNotice(envelope.id, {
+              id: requestId ?? `${Date.now()}`,
+              message: inner.message,
+              notifyType: inner.notifyType ?? "info",
+            });
+          }
+        }
+        if (envelope.id && inner?.type === "extension_ui_request" && inner.method === "setStatus") {
+          if (typeof inner.statusKey === "string") {
+            useApp.getState().setExtensionStatus(envelope.id, inner.statusKey, inner.statusText);
+          }
+        }
+        if (envelope.id && inner?.type === "extension_ui_request" && inner.method === "setTitle") {
+          if (typeof inner.title === "string") useApp.getState().setExtensionTitle(envelope.id, inner.title);
+        }
+        if (envelope.id && inner?.type === "extension_ui_request" && inner.method === "set_editor_text") {
+          if (typeof inner.text === "string") useApp.getState().setExtensionEditorText(envelope.id, inner.text);
+        }
+        if (
+          envelope.id &&
+          inner?.type === "extension_ui_request" &&
+          inner.method === "setWidget" &&
+          typeof inner.widgetKey === "string"
+        ) {
+          useApp
+            .getState()
+            .setExtensionWidget(
+              envelope.id,
+              inner.widgetKey,
+              parseWidgetLines(inner.widgetLines),
+              inner.widgetPlacement,
+            );
+        }
         if (
           envelope.id &&
           inner?.type === "extension_ui_request" &&
@@ -116,15 +162,19 @@ export function connectEvents() {
           (inner.type === "extension_ui_request" || inner.type === "ui_request") &&
           (inner.method === "select" ||
             inner.method === "confirm" ||
-            inner.method === "input")
+            inner.method === "input" ||
+            inner.method === "editor")
         ) {
-          const requestId = (envelope.event as { id?: string }).id;
+
           if (requestId) {
             useApp.getState().addPendingAsk(envelope.id, {
               id: requestId,
               method: inner.method,
               title: inner.title,
-              options: inner.options,
+              message: inner.message,
+              placeholder: inner.placeholder,
+              prefill: inner.prefill,
+              options: inner.options as Array<DialogOption> | undefined,
             });
           }
         }
@@ -162,6 +212,15 @@ export function connectEvents() {
       })
       .catch(() => undefined);
   });
+}
+
+function parseWidgetLines(widgetLines: unknown): string[] | undefined {
+  if (widgetLines === undefined) return undefined;
+  if (!Array.isArray(widgetLines)) return [];
+  return widgetLines
+    .filter((line): line is string => typeof line === "string")
+    .map((line) => line.slice(0, 2000))
+    .slice(0, 64);
 }
 
 function parseSubagentActivity(
@@ -268,9 +327,12 @@ export async function syncPendingAsks(id: string) {
         id,
         asks.map((ask) => ({
           id: ask.id,
-          method: ask.method as "select" | "confirm" | "input",
+          method: ask.method as PendingAsk["method"],
           title: ask.title ?? undefined,
-          options: ask.options as Array<{ label?: string; value?: string }> | undefined,
+          message: ask.message ?? undefined,
+          placeholder: ask.placeholder ?? undefined,
+          prefill: ask.prefill ?? undefined,
+          options: ask.options as Array<DialogOption> | undefined,
         })),
       );
   } catch {

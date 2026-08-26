@@ -104,6 +104,8 @@ export function Composer({
   const contextPercent = useApp((state) =>
     state.agent?.sessionId === sessionId ? state.contextPercent : null,
   );
+  const extensionEditorText = useApp((state) => state.extensionEditorText[sessionId]);
+  const appliedEditorRevision = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [expanded, setExpanded] = useState(false);
@@ -153,6 +155,16 @@ export function Composer({
       cancelled = true;
     };
   }, [sessionId, autogrow]);
+
+  // Pi extensions can replace the composer text through set_editor_text.
+  useEffect(() => {
+    if (!extensionEditorText || extensionEditorText.revision <= appliedEditorRevision.current) return;
+    appliedEditorRevision.current = extensionEditorText.revision;
+    if (!textareaRef.current) return;
+    textareaRef.current.value = extensionEditorText.text;
+    autogrow();
+    setExpanded(extensionEditorText.text.length > 0);
+  }, [autogrow, extensionEditorText]);
 
   /** Clicking anywhere in the shell focuses the input and expands it. */
   function openEditor() {

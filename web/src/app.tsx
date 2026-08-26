@@ -14,6 +14,8 @@ import { api, captureShipToken } from "~/api/client";
 import type { ThreadView } from "~/api/types";
 import { AppSidebar, useHash } from "~/components/app-sidebar";
 import { Composer } from "~/components/composer";
+import { ExtensionHost } from "~/components/extension-host";
+import { ExtensionChrome } from "~/components/extension-chrome";
 import { SettingsPage } from "~/components/settings-page";
 import { Thread, threadChangeCount } from "~/components/thread";
 import { SubagentStrip } from "~/components/subagent-strip";
@@ -120,10 +122,22 @@ export function App() {
               parent={routeParent}
               parentId={route?.parentId ?? activeThread.summary.id}
             />
+            <ExtensionChrome
+              placement="aboveEditor"
+              sessionId={activeThread.summary.id}
+            />
+            <ExtensionHost
+              sessionId={activeThread.summary.id}
+              settled={activeThread.settled}
+            />
             <Composer
               key={activeThread.summary.id}
               sessionId={activeThread.summary.id}
               targetLabel={threadTargetLabel(activeThread)}
+            />
+            <ExtensionChrome
+              placement="belowEditor"
+              sessionId={activeThread.summary.id}
             />
             <Suspense fallback={null}>
               <DiffSidebar

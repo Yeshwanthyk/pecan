@@ -17,11 +17,42 @@ export type SubagentActivity = {
   children: RunningSubagent[];
 };
 
+/** One select choice exactly as pi sent it: a bare string or a label/value pair. */
+export type DialogOption = string | { label?: string; value?: string };
+
+export type ExtensionNotice = {
+  id: string;
+  message: string;
+  notifyType: "info" | "warning" | "error";
+};
+
+export type ExtensionStatus = {
+  key: string;
+  text: string;
+};
+
+export type ExtensionWidget = {
+  key: string;
+  lines: string[];
+  placement: "aboveEditor" | "belowEditor";
+};
+
+export type ExtensionEditorText = {
+  revision: number;
+  text: string;
+};
+
 export type PendingAsk = {
   id: string;
-  method: "select" | "confirm" | "input";
+  method: "select" | "confirm" | "input" | "editor";
   title?: string;
-  options?: Array<{ label?: string; value?: string }>;
+  /** Body text under the title of confirm dialogs. */
+  message?: string;
+  /** Placeholder hint for input dialogs. */
+  placeholder?: string;
+  /** Prefilled content for editor dialogs. */
+  prefill?: string;
+  options?: DialogOption[];
 };
 
 type AppState = {
@@ -38,6 +69,11 @@ type AppState = {
   /** Partial assistant text currently streaming for one session. */
   streamingDraft: { id: string; text: string } | null;
   pendingAsks: Record<string, PendingAsk[]>;
+  extensionNotices: Record<string, ExtensionNotice[]>;
+  extensionStatuses: Record<string, Record<string, ExtensionStatus>>;
+  extensionWidgets: Record<string, Record<string, ExtensionWidget>>;
+  extensionTitles: Record<string, string>;
+  extensionEditorText: Record<string, ExtensionEditorText>;
   subagentActivity: Record<string, SubagentActivity>;
   setBootstrap: (data: Bootstrap) => void;
   setSessions: (rows: SessionRow[]) => void;
@@ -53,6 +89,17 @@ type AppState = {
   addPendingAsk: (sessionId: string, ask: PendingAsk) => void;
   removePendingAsk: (sessionId: string, requestId: string) => void;
   setPendingAsks: (sessionId: string, asks: PendingAsk[]) => void;
+  addExtensionNotice: (sessionId: string, notice: ExtensionNotice) => void;
+  removeExtensionNotice: (sessionId: string, noticeId: string) => void;
+  setExtensionStatus: (sessionId: string, statusKey: string, statusText?: string) => void;
+  setExtensionWidget: (
+    sessionId: string,
+    widgetKey: string,
+    lines: string[] | undefined,
+    placement?: "aboveEditor" | "belowEditor",
+  ) => void;
+  setExtensionTitle: (sessionId: string, title: string) => void;
+  setExtensionEditorText: (sessionId: string, text: string) => void;
   setSubagentActivity: (sessionId: string, activity: SubagentActivity | null) => void;
 };
 
@@ -89,6 +136,11 @@ export const useApp = create<AppState>((set) => ({
   streamingDraft: null,
   setStreamingDraft: (draft) => set({ streamingDraft: draft }),
   pendingAsks: {},
+  extensionNotices: {},
+  extensionStatuses: {},
+  extensionWidgets: {},
+  extensionTitles: {},
+  extensionEditorText: {},
   subagentActivity: {},
   setBootstrap: (bootstrap) => set({ bootstrap }),
   setSessions: (sessions) => set({ sessions }),
@@ -135,6 +187,46 @@ export const useApp = create<AppState>((set) => ({
   setPendingAsks: (sessionId, asks) =>
     set((current) => ({
       pendingAsks: { ...current.pendingAsks, [sessionId]: asks },
+    })),
+  addExtensionNotice: (sessionId, notice) =>
+    set((current) => ({
+      extensionNotices: {
+        ...current.extensionNotices,
+        [sessionId]: [...(current.extensionNotices[sessionId] ?? []), notice].slice(-4),
+      },
+    })),
+  removeExtensionNotice: (sessionId, noticeId) =>
+    set((current) => ({
+      extensionNotices: {
+        ...current.extensionNotices,
+        [sessionId]: (current.extensionNotices[sessionId] ?? []).filter((notice) => notice.id !== noticeId),
+      },
+    })),
+  setExtensionStatus: (sessionId, statusKey, statusText) =>
+    set((current) => {
+      const statuses = { ...current.extensionStatuses[sessionId] };
+      if (statusText === undefined) delete statuses[statusKey];
+      else statuses[statusKey] = { key: statusKey, text: statusText };
+      return { extensionStatuses: { ...current.extensionStatuses, [sessionId]: statuses } };
+    }),
+  setExtensionWidget: (sessionId, widgetKey, lines, placement = "belowEditor") =>
+    set((current) => {
+      const widgets = { ...current.extensionWidgets[sessionId] };
+      if (lines === undefined) delete widgets[widgetKey];
+      else widgets[widgetKey] = { key: widgetKey, lines, placement };
+      return { extensionWidgets: { ...current.extensionWidgets, [sessionId]: widgets } };
+    }),
+  setExtensionTitle: (sessionId, title) =>
+    set((current) => ({ extensionTitles: { ...current.extensionTitles, [sessionId]: title } })),
+  setExtensionEditorText: (sessionId, text) =>
+    set((current) => ({
+      extensionEditorText: {
+        ...current.extensionEditorText,
+        [sessionId]: {
+          revision: (current.extensionEditorText[sessionId]?.revision ?? 0) + 1,
+          text,
+        },
+      },
     })),
   setSubagentActivity: (sessionId, activity) =>
     set((current) => {

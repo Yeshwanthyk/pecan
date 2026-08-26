@@ -2,11 +2,9 @@
  * Compact thread navigation for subagent runs.
  *
  * Pi's `session_info.parentId` is the previous JSONL entry id, not a parent
- * session id. The strip therefore uses the parent carried in the hash route
- * for exact navigation. The current scan also has no authoritative process
- * lifecycle, so this surface deliberately says "Recent agents" and shows
- * unsettled same-project candidates opened after the parent rather than
- * claiming that they are running.
+ * session id. Embedded servers resolve that relationship from the parent's
+ * spawn name/prompt evidence; the global server uses a cheap recent-agent
+ * fallback so it never parses historical transcripts just to render this UI.
  */
 import { ArrowLeftIcon } from "lucide-react";
 import { useMemo } from "react";
@@ -32,20 +30,22 @@ export function SubagentStrip({
 
   const candidates = useMemo(() => {
     const parentOpenedAt = parent ? Date.parse(parent.openedAt) : Number.NaN;
-    return sessions
-      .filter((row) => {
-        if (row.kind !== "subagent" || row.cwd !== (parent?.cwd ?? current.cwd)) {
-          return false;
-        }
-        if (row.settled && row.id !== current.id) return false;
-        const childOpenedAt = Date.parse(row.openedAt);
-        return (
-          !Number.isFinite(parentOpenedAt) ||
-          !Number.isFinite(childOpenedAt) ||
-          childOpenedAt >= parentOpenedAt
-        );
-      });
-  }, [current.cwd, current.id, parent, sessions]);
+    return sessions.filter((row) => {
+      if (row.kind !== "subagent" || row.cwd !== (parent?.cwd ?? current.cwd)) {
+        return false;
+      }
+      const exactMatch = row.parentSessionId === parentId;
+      const fallbackMatch =
+        row.parentSessionId == null &&
+        (!Number.isFinite(parentOpenedAt) ||
+          !Number.isFinite(Date.parse(row.openedAt)) ||
+          Date.parse(row.openedAt) >= parentOpenedAt);
+      if (!exactMatch && !fallbackMatch) {
+        return false;
+      }
+      return !row.settled || row.id === current.id;
+    });
+  }, [current.cwd, current.id, parent, parentId, sessions]);
 
   const runningIds = useMemo(() => {
     const ids = new Set<string>();
@@ -99,7 +99,7 @@ export function SubagentStrip({
           Main thread
         </a>
         <span className="shrink-0 px-1 text-xs text-muted-foreground">
-          Recent agents
+          Agents
         </span>
         {children.map((child) => (
           <SubagentLink

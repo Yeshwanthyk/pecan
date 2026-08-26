@@ -27,6 +27,7 @@ pub(crate) fn router(app: App, workers: Workers) -> Router {
     let with_workers = Router::new()
         // Image attachments ride in the message JSON body.
         .layer(axum::extract::DefaultBodyLimit::max(48 * 1024 * 1024))
+        .route("/session/{id}", get(thread_view))
         .route("/session/new", post(new_session))
         .route("/session/{id}/message", post(message))
         .route("/session/{id}/respond", post(respond))
@@ -38,7 +39,6 @@ pub(crate) fn router(app: App, workers: Workers) -> Router {
     let base = Router::new()
         .route("/bootstrap", get(bootstrap))
         .route("/sessions", get(sessions))
-        .route("/session/{id}", get(thread_view))
         .route("/session/{id}/git", get(session_git))
         .route("/session/{id}/diff", get(session_diff))
         .route("/session/{id}/ship", get(ship_plan).post(ship_execute))
@@ -214,20 +214,53 @@ async fn sessions(
 // ---------------------------------------------------------------- thread ----
 
 async fn thread_view(
-    State(app): State<App>,
+    State((app, workers)): State<(App, Workers)>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snap = app.snapshot().await;
-    let row = find_row(&snap, &id)?;
-    let view = app.thread_view(row.summary.path.clone()).await.map_err(ApiError::internal)?;
+    if let Some(row) = snap.sessions.iter().find(|row| row.summary.id == id) {
+        let view = app.thread_view(row.summary.path.clone()).await.map_err(ApiError::internal)?;
+        return Ok(Json(serde_json::json!({
+            "summary": row.summary,
+            "settled": row.settled,
+            "waitingAskuser": row.waiting_askuser,
+            "omitted": view.omitted,
+            "entries": view.entries,
+            "tasks": snap.tasks.get(&id).cloned().unwrap_or_default(),
+            "workflows": snap.workflows.get(&id).cloned().unwrap_or_default(),
+        })));
+    }
+
+    // A new pi session has an in-memory header but does not flush its empty
+    // transcript until the first assistant message. Serve that live session
+    // so the client can render the composer before the first prompt.
+    let worker = workers.get(&id).await.ok_or_else(|| ApiError::not_found("no such session"))?;
+    let state =
+        worker.get_state().await.map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+    let now = jiff::Timestamp::now().to_string();
+    let model = state.get("model");
     Ok(Json(serde_json::json!({
-        "summary": row.summary,
-        "settled": row.settled,
-        "waitingAskuser": row.waiting_askuser,
-        "omitted": view.omitted,
-        "entries": view.entries,
-        "tasks": snap.tasks.get(&id).cloned().unwrap_or_default(),
-        "workflows": snap.workflows.get(&id).cloned().unwrap_or_default(),
+        "summary": {
+            "id": id,
+            "path": "",
+            "cwd": worker.cwd().to_string_lossy(),
+            "openedAt": now,
+            "lastActivity": now,
+            "bytes": 0,
+            "provider": model.and_then(|value| value.get("provider")),
+            "model": model.and_then(|value| value.get("id")),
+            "preview": null,
+            "title": null,
+            "kind": "normal",
+            "parentId": null,
+            "agentName": null,
+        },
+        "settled": false,
+        "waitingAskuser": false,
+        "omitted": 0,
+        "entries": [],
+        "tasks": [],
+        "workflows": [],
     })))
 }
 
@@ -437,12 +470,21 @@ async fn respond(
             "this question is no longer pending (the agent worker restarted); ask the agent to continue",
         ));
     }
+    let frame = dialog_response_frame(&body.request_id, &body);
+    worker.send_raw(frame).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    remove_pending_ask(&app, &id, &body.request_id);
+    Ok(Json(serde_json::json!({ "responded": true })))
+}
+
+/// Builds the `extension_ui_response` frame answering a dialog request,
+/// echoing the exact request id so pi matches it to the blocking call.
+fn dialog_response_frame(request_id: &str, body: &RespondBody) -> serde_json::Value {
     let mut frame = serde_json::json!({
         "type": "extension_ui_response",
-        "id": body.request_id,
+        "id": request_id,
     });
-    if let Some(value) = body.value {
-        frame["value"] = serde_json::Value::String(value);
+    if let Some(value) = body.value.as_deref() {
+        frame["value"] = serde_json::Value::String(value.to_owned());
     }
     if let Some(confirmed) = body.confirmed {
         frame["confirmed"] = serde_json::Value::Bool(confirmed);
@@ -450,9 +492,7 @@ async fn respond(
     if let Some(cancelled) = body.cancelled {
         frame["cancelled"] = serde_json::Value::Bool(cancelled);
     }
-    worker.send_raw(frame).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
-    remove_pending_ask(&app, &id, &body.request_id);
-    Ok(Json(serde_json::json!({ "responded": true })))
+    frame
 }
 
 /// Lists live dialog requests awaiting answers for one session.
@@ -834,6 +874,27 @@ impl IncomingImage {
     }
 }
 
+fn session_id_from_state(state: &serde_json::Value) -> Option<&str> {
+    state.get("sessionId").and_then(serde_json::Value::as_str)
+}
+
+#[cfg(test)]
+mod new_session_tests {
+    use super::session_id_from_state;
+
+    #[test]
+    fn reads_session_id_from_get_state_payload() {
+        let state = serde_json::json!({"sessionId": "session-1"});
+        assert_eq!(session_id_from_state(&state), Some("session-1"));
+    }
+
+    #[test]
+    fn does_not_double_unwrap_get_state_payload() {
+        let state = serde_json::json!({"data": {"sessionId": "session-1"}});
+        assert_eq!(session_id_from_state(&state), None);
+    }
+}
+
 /// Spawns a fresh pi session rooted at `cwd` and returns its session id.
 async fn new_session(
     State((app, workers)): State<(App, Workers)>,
@@ -852,16 +913,13 @@ async fn new_session(
     for attempt in 0..120_u32 {
         match worker.get_state().await {
             Ok(state) => {
-                if let Some(found) = state
-                    .get("data")
-                    .and_then(|data| data.get("sessionId"))
-                    .and_then(serde_json::Value::as_str)
-                {
+                if let Some(found) = session_id_from_state(&state) {
                     id = Some(found.to_owned());
                     break;
                 }
             }
             Err(error) if attempt > 5 => {
+                worker.shutdown().await;
                 return Err(ApiError::bad_gateway(error.to_string()));
             }
             Err(_) => {}
@@ -869,12 +927,16 @@ async fn new_session(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let Some(id) = id else {
+        worker.shutdown().await;
         tracing::warn!("new session: worker never reported a session id (30s window)");
         return Err(ApiError::bad_gateway(
             "worker reported no session id within startup window (30s)".into(),
         ));
     };
-    workers.insert(id.clone(), worker.clone()).await;
+    workers.insert(id.clone(), std::sync::Arc::clone(&worker)).await;
+    // The new transcript is created by pi during startup. Refresh the
+    // filesystem-backed index before the client navigates to the new id.
+    app.refresh().await.map_err(ApiError::internal)?;
     forward_worker_events(app, workers, &id, &worker);
     Ok(Json(serde_json::json!({ "id": id })))
 }
@@ -906,10 +968,13 @@ async fn message(
     }
     let path = {
         let snap = app.snapshot().await;
-        find_row(&snap, &id)?.summary.path.clone()
+        snap.sessions.iter().find(|row| row.summary.id == id).map(|row| row.summary.path.clone())
     };
-    let worker =
-        workers.get_or_spawn(&id, &path).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    let worker = if let Some(path) = path {
+        workers.get_or_spawn(&id, &path).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?
+    } else {
+        workers.get(&id).await.ok_or_else(|| ApiError::not_found("no such session"))?
+    };
     forward_worker_events(app.clone(), workers.clone(), &id, &worker);
 
     let state = worker.get_state().await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
@@ -971,12 +1036,7 @@ async fn agent_attach(
     State((app, workers)): State<(App, Workers)>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = {
-        let snap = app.snapshot().await;
-        find_row(&snap, &id)?.summary.path.clone()
-    };
-    let worker =
-        workers.get_or_spawn(&id, &path).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    let worker = require_worker(&app, &workers, &id).await?;
     forward_worker_events(app.clone(), workers.clone(), &id, &worker);
     agent_snapshot(worker, &id).await
 }
@@ -1033,6 +1093,31 @@ fn forward_worker_events(
     });
 }
 
+/// Returns whether an extension request blocks the agent waiting for a user
+/// answer. Non-blocking UI updates (widgets, status, notifications) do not
+/// belong in the answer registry.
+fn is_blocking_dialog_method(method: &str) -> bool {
+    matches!(method, "select" | "confirm" | "input" | "editor")
+}
+
+/// Preserves the renderable fields of one blocking dialog request. Called
+/// only for methods accepted by [`is_blocking_dialog_method`]; fire-and-forget
+/// UI updates are never registered.
+fn dialog_fields(method: &str, event: &serde_json::Value) -> super::snapshot::RecordedAsk {
+    super::snapshot::RecordedAsk {
+        method: method.to_owned(),
+        title: event.get("title").and_then(serde_json::Value::as_str).map(str::to_owned),
+        options: event.get("options").and_then(serde_json::Value::as_array).cloned(),
+        message: event.get("message").and_then(serde_json::Value::as_str).map(str::to_owned),
+        placeholder: event
+            .get("placeholder")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        prefill: event.get("prefill").and_then(serde_json::Value::as_str).map(str::to_owned),
+        recorded_at_ms: jiff::Timestamp::now().as_second().saturating_mul(1_000),
+    }
+}
+
 /// Records a dialog request so answers survive browser reloads.
 fn record_pending_ask(app: &App, session_id: &str, event: &serde_json::Value) {
     let Some(request_id) = event.get("id").and_then(serde_json::Value::as_str) else {
@@ -1041,28 +1126,215 @@ fn record_pending_ask(app: &App, session_id: &str, event: &serde_json::Value) {
     let Some(method) = event.get("method").and_then(serde_json::Value::as_str) else {
         return;
     };
-    let ask = super::snapshot::RecordedAsk {
-        method: method.to_owned(),
-        title: event.get("title").and_then(serde_json::Value::as_str).map(str::to_owned),
-        options: event.get("options").and_then(serde_json::Value::as_array).cloned(),
-        recorded_at_ms: jiff::Timestamp::now().as_second().saturating_mul(1_000),
-    };
+    if !is_blocking_dialog_method(method) {
+        return;
+    }
+    let ask = dialog_fields(method, event);
     match app.pending_asks.lock() {
-        Ok(mut asks) => {
-            asks.entry(session_id.to_owned()).or_default().insert(request_id.to_owned(), ask);
-        }
+        Ok(mut asks) => record_pending_ask_in(&mut asks, session_id, request_id, ask),
         Err(error) => tracing::warn!(%error, "pending asks lock poisoned"),
+    }
+}
+
+/// Keys a recorded dialog by its exact pi request id inside a session bucket.
+fn record_pending_ask_in(
+    asks: &mut super::snapshot::PendingAsks,
+    session_id: &str,
+    request_id: &str,
+    ask: super::snapshot::RecordedAsk,
+) {
+    asks.entry(session_id.to_owned()).or_default().insert(request_id.to_owned(), ask);
+}
+
+#[cfg(test)]
+mod dialog_request_tests {
+    use super::{
+        RespondBody, dialog_fields, dialog_response_frame, is_blocking_dialog_method,
+        record_pending_ask_in, remove_pending_ask_in,
+    };
+    use crate::server::snapshot::PendingAsks;
+
+    #[test]
+    fn every_dialog_method_is_blocking() {
+        for method in ["select", "confirm", "input", "editor"] {
+            assert!(is_blocking_dialog_method(method), "{method} is a blocking dialog");
+        }
+    }
+
+    #[test]
+    fn fire_and_forget_updates_are_not_dialogs() {
+        for method in ["setWidget", "setStatus", "setTitle", "notify", "set_editor_text"] {
+            assert!(!is_blocking_dialog_method(method), "{method} must not be recorded");
+        }
+    }
+
+    #[test]
+    fn preserves_each_dialogs_renderable_fields() {
+        let select = dialog_fields(
+            "select",
+            &serde_json::json!({
+                "id": "request-select",
+                "method": "select",
+                "title": "Pick",
+                "options": ["Allow", "Block"],
+                "timeout": 10000,
+            }),
+        );
+        assert_eq!(select.method, "select");
+        assert_eq!(select.title.as_deref(), Some("Pick"));
+        assert_eq!(
+            select.options,
+            Some(vec![serde_json::json!("Allow"), serde_json::json!("Block")])
+        );
+        assert_eq!(select.message, None);
+        assert_eq!(select.prefill, None);
+
+        let confirm = dialog_fields(
+            "confirm",
+            &serde_json::json!({
+                "id": "request-confirm",
+                "method": "confirm",
+                "title": "Clear session?",
+                "message": "All messages will be lost.",
+            }),
+        );
+        assert_eq!(confirm.method, "confirm");
+        assert_eq!(confirm.title.as_deref(), Some("Clear session?"));
+        assert_eq!(confirm.message.as_deref(), Some("All messages will be lost."));
+
+        let input = dialog_fields(
+            "input",
+            &serde_json::json!({
+                "id": "request-input",
+                "method": "input",
+                "title": "Enter a value",
+                "placeholder": "type something...",
+            }),
+        );
+        assert_eq!(input.method, "input");
+        assert_eq!(input.placeholder.as_deref(), Some("type something..."));
+
+        let editor = dialog_fields(
+            "editor",
+            &serde_json::json!({
+                "id": "request-editor",
+                "method": "editor",
+                "title": "Edit some text",
+                "prefill": "Line 1\nLine 2",
+            }),
+        );
+        assert_eq!(editor.method, "editor");
+        assert_eq!(editor.title.as_deref(), Some("Edit some text"));
+        assert_eq!(editor.prefill.as_deref(), Some("Line 1\nLine 2"));
+    }
+
+    #[test]
+    fn registers_and_cleans_up_dialogs_by_exact_request_id() {
+        let mut asks = PendingAsks::new();
+        let event = serde_json::json!({
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"],
+        });
+        record_pending_ask_in(&mut asks, "session-1", "uuid-1", dialog_fields("select", &event));
+        let event = serde_json::json!({
+            "id": "uuid-2",
+            "method": "editor",
+            "title": "Edit some text",
+            "prefill": "Line 1\nLine 2",
+        });
+        record_pending_ask_in(&mut asks, "session-1", "uuid-2", dialog_fields("editor", &event));
+        record_pending_ask_in(
+            &mut asks,
+            "session-2",
+            "uuid-3",
+            dialog_fields(
+                "input",
+                &serde_json::json!({"id": "uuid-3", "method": "input", "title": "Value"}),
+            ),
+        );
+
+        assert_eq!(asks["session-1"].len(), 2);
+        assert_eq!(asks["session-1"]["uuid-1"].method, "select");
+        assert_eq!(asks["session-1"]["uuid-2"].prefill.as_deref(), Some("Line 1\nLine 2"));
+        assert!(asks["session-2"].contains_key("uuid-3"));
+
+        // Answer one dialog; the bucket keeps the sibling request.
+        remove_pending_ask_in(&mut asks, "session-1", "uuid-1");
+        assert_eq!(asks["session-1"].len(), 1);
+        assert!(asks["session-1"].contains_key("uuid-2"));
+
+        // Answering the last dialog drops the whole session bucket.
+        remove_pending_ask_in(&mut asks, "session-1", "uuid-2");
+        assert!(!asks.contains_key("session-1"));
+        assert!(asks.contains_key("session-2"));
+    }
+
+    #[test]
+    fn response_frame_echoes_the_exact_request_id() {
+        let value = dialog_response_frame(
+            "uuid-1",
+            &RespondBody {
+                request_id: "uuid-1".into(),
+                value: Some("Allow".into()),
+                confirmed: None,
+                cancelled: None,
+            },
+        );
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "extension_ui_response", "id": "uuid-1", "value": "Allow"})
+        );
+
+        let confirmed = dialog_response_frame(
+            "uuid-2",
+            &RespondBody {
+                request_id: "uuid-2".into(),
+                value: None,
+                confirmed: Some(false),
+                cancelled: None,
+            },
+        );
+        assert_eq!(
+            confirmed,
+            serde_json::json!({"type": "extension_ui_response", "id": "uuid-2", "confirmed": false})
+        );
+
+        let cancelled = dialog_response_frame(
+            "uuid-3",
+            &RespondBody {
+                request_id: "uuid-3".into(),
+                value: None,
+                confirmed: None,
+                cancelled: Some(true),
+            },
+        );
+        assert_eq!(
+            cancelled,
+            serde_json::json!({"type": "extension_ui_response", "id": "uuid-3", "cancelled": true})
+        );
     }
 }
 
 /// Drops an answered dialog request from the live registry.
 fn remove_pending_ask(app: &App, session_id: &str, request_id: &str) {
     if let Ok(mut asks) = app.pending_asks.lock() {
-        if let Some(per_session) = asks.get_mut(session_id) {
-            per_session.remove(request_id);
-            if per_session.is_empty() {
-                asks.remove(session_id);
-            }
+        remove_pending_ask_in(&mut asks, session_id, request_id);
+    }
+}
+
+/// Removes one answered dialog and drops empty session buckets so answered
+/// dialogs (and stale workers) cannot linger in the registry.
+fn remove_pending_ask_in(
+    asks: &mut super::snapshot::PendingAsks,
+    session_id: &str,
+    request_id: &str,
+) {
+    if let Some(per_session) = asks.get_mut(session_id) {
+        per_session.remove(request_id);
+        if per_session.is_empty() {
+            asks.remove(session_id);
         }
     }
 }
@@ -1118,11 +1390,13 @@ async fn require_worker(
     id: &str,
 ) -> Result<std::sync::Arc<super::worker::WorkerHandle>, ApiError> {
     let snap = app.snapshot().await;
-    let row = find_row(&snap, id)?;
-    workers
-        .get_or_spawn(id, &row.summary.path)
-        .await
-        .map_err(|e| ApiError::bad_gateway(e.to_string()))
+    if let Some(row) = snap.sessions.iter().find(|row| row.summary.id == id) {
+        return workers
+            .get_or_spawn(id, &row.summary.path)
+            .await
+            .map_err(|e| ApiError::bad_gateway(e.to_string()));
+    }
+    workers.get(id).await.ok_or_else(|| ApiError::not_found("no such session"))
 }
 
 /// Collects model/thinking/context info from a live worker.

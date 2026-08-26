@@ -40,7 +40,12 @@ export type SessionSummary = Static<typeof SessionSummary>;
 
 export const SessionRow = Intersect([
   SessionSummary,
-  Object({ settled: Boolean(), waitingAskuser: Boolean(), pinned: Boolean() }),
+  Object({
+    settled: Boolean(),
+    waitingAskuser: Boolean(),
+    pinned: Boolean(),
+    parentSessionId: Optional(Union([String(), Null(), Undefined()])),
+  }),
 ]);
 export type SessionRow = Static<typeof SessionRow>;
 
@@ -254,11 +259,16 @@ export const AgentSnapshot = Object({
 });
 export type AgentSnapshot = Static<typeof AgentSnapshot>;
 
-/** One live dialog request (ask_user / confirm / input) awaiting an answer. */
+/** One live extension dialog (select / confirm / input / editor) awaiting an
+ * answer. `method`, `options` and the extra text fields mirror the pi
+ * `extension_ui_request` payload the server recorded. */
 export const PendingAsk = Object({
   id: String(),
   method: String(),
   title: Optional(Union([String(), Null(), Undefined()])),
+  message: Optional(Union([String(), Null(), Undefined()])),
+  placeholder: Optional(Union([String(), Null(), Undefined()])),
+  prefill: Optional(Union([String(), Null(), Undefined()])),
   options: Optional(Union([Undefined(), Null(), Array(Unknown())])),
   recordedAtMs: Number(),
 });
