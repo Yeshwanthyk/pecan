@@ -242,6 +242,7 @@ mod tests {
             ThreadEntry::User {
                 text: "Investigate reconnect regressions".to_owned(),
                 truncated: false,
+                images: Vec::new(),
             },
             ThreadEntry::Assistant {
                 text: "The session state is stale".to_owned(),
@@ -264,8 +265,12 @@ mod tests {
     #[test]
     fn regeneration_context_keeps_recent_bounded_content() {
         let view = thread(vec![
-            ThreadEntry::User { text: "old ".repeat(3_000), truncated: false },
-            ThreadEntry::User { text: "latest durable goal".to_owned(), truncated: false },
+            ThreadEntry::User { text: "old ".repeat(3_000), truncated: false, images: Vec::new() },
+            ThreadEntry::User {
+                text: "latest durable goal".to_owned(),
+                truncated: false,
+                images: Vec::new(),
+            },
         ]);
         let context = recent_thread_context(&view);
         assert!(context.contains("[Earlier content truncated]"));

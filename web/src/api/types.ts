@@ -147,8 +147,19 @@ export const ToolCall = Object({
 });
 export type ToolCall = Static<typeof ToolCall>;
 
+export const UserImage = Object({
+  mimeType: String(),
+  data: String(),
+});
+export type UserImage = Static<typeof UserImage>;
+
 export const ThreadEntry = Union([
-  Object({ kind: Literal("user"), text: String(), truncated: Boolean() }),
+  Object({
+    kind: Literal("user"),
+    text: String(),
+    truncated: Boolean(),
+    images: Array(UserImage),
+  }),
   Object({
     kind: Literal("assistant"),
     text: String(),

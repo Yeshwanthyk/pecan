@@ -240,7 +240,7 @@ function runSummary(tools: ToolCall[]): string {
 /** Memoized so unchanged entries skip re-render on SSE refreshes. */
 const EntryRow = memo(function EntryRow({ dated }: { dated: DatedEntry }) {
   const entry = dated.entry;
-  if (entry.kind === "user") return <UserMessage text={entry.text} />;
+  if (entry.kind === "user") return <UserMessage entry={entry} />;
   if (entry.kind === "assistant") return <AssistantMessage entry={entry} />;
   if (entry.kind === "toolError") return <ToolErrorNote text={entry.text} />;
   return <AskUserCard entry={entry} />;
@@ -260,7 +260,10 @@ function ToolErrorNote({ text }: { text: string }) {
 
 const USER_COLLAPSE_LINES = 22;
 
-function UserMessage({ text }: { text: string }) {
+type UserEntry = Extract<ThreadEntry, { kind: "user" }>;
+
+function UserMessage({ entry }: { entry: UserEntry }) {
+  const { text, images } = entry;
   const lines = useMemo(() => text.split("\n"), [text]);
   const overflows = lines.length > USER_COLLAPSE_LINES;
   const [expanded, setExpanded] = useState(false);
@@ -268,12 +271,15 @@ function UserMessage({ text }: { text: string }) {
   return (
     <div className="flex justify-end py-2">
       <div className="chat-md prose prose-sm relative min-w-0 max-w-[85%] break-words rounded-xl rounded-br-sm border border-bubble-border bg-bubble px-3.5 py-2">
-        <div className={cn(!expanded && overflows && "relative overflow-hidden")}>
-          <ChatMarkdown text={shown} />
-          {!expanded && overflows ? (
-            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-bubble to-transparent" />
-          ) : null}
-        </div>
+        {text ? (
+          <div className={cn(!expanded && overflows && "relative overflow-hidden")}>
+            <ChatMarkdown text={shown} />
+            {!expanded && overflows ? (
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-bubble to-transparent" />
+            ) : null}
+          </div>
+        ) : null}
+        {images.length > 0 ? <UserImages images={images} hasText={Boolean(text)} /> : null}
         {overflows ? (
           <button
             className="mt-1 text-[12px] font-medium text-muted-foreground hover:text-foreground"
@@ -284,6 +290,34 @@ function UserMessage({ text }: { text: string }) {
           </button>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+function UserImages({ images, hasText }: { images: UserEntry["images"]; hasText: boolean }) {
+  return (
+    <div className={cn("not-prose flex flex-wrap justify-end gap-1.5", hasText && "mt-2")}>
+      {images.map((image, index) => {
+        const source = `data:${image.mimeType};base64,${image.data}`;
+        return (
+          <a
+            aria-label={`Open attached image ${index + 1}`}
+            className="block overflow-hidden rounded-md outline outline-black/10 focus-visible:ring-2 focus-visible:ring-ring dark:outline-white/10"
+            href={source}
+            key={`${image.mimeType}-${index}`}
+            rel="noreferrer"
+            target="_blank"
+          >
+            <img
+              alt={`Attached image ${index + 1}`}
+              className="h-20 w-16 bg-muted object-cover object-top sm:h-24 sm:w-20"
+              decoding="async"
+              loading="lazy"
+              src={source}
+            />
+          </a>
+        );
+      })}
     </div>
   );
 }

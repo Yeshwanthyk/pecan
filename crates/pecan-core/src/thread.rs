@@ -18,6 +18,10 @@ const BLOCK_TEXT_CAP: usize = 8_000;
 const ARGS_PREVIEW_CAP: usize = 240;
 /// Maximum serialized tool details retained from a transcript result.
 const TOOL_DETAILS_CAP: usize = 64 * 1024;
+/// Maximum base64 characters retained for one inline chat thumbnail.
+const IMAGE_DATA_CAP: usize = 2 * 1024 * 1024;
+/// Maximum images retained from one user message.
+const MAX_USER_IMAGES: usize = 4;
 /// Maximum entries returned, counted from the tail of the transcript.
 pub const MAX_ENTRIES: usize = 600;
 
@@ -37,6 +41,16 @@ pub struct ToolCall {
     pub details: Option<serde_json::Value>,
 }
 
+/// One bounded image attached to a user message.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserImage {
+    /// Validated raster MIME type.
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    /// Base64 payload without a data-URL prefix.
+    pub data: String,
+}
+
 /// One renderable row of a conversation thread.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -47,6 +61,8 @@ pub enum ThreadEntry {
         text: String,
         /// Whether `text` hit the display cap.
         truncated: bool,
+        /// Small, bounded image attachments shown with the prompt.
+        images: Vec<UserImage>,
     },
     /// An assistant response.
     Assistant {
@@ -128,9 +144,11 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
         let Some(message) = value.get("message") else { continue };
         match message.get("role").and_then(serde_json::Value::as_str) {
             Some("user") => {
-                if let Some((text, truncated)) = text_blocks(message.get("content"), BLOCK_TEXT_CAP)
-                {
-                    all.push(Dated { ts, entry: ThreadEntry::User { text, truncated } });
+                let (text, truncated) =
+                    text_blocks(message.get("content"), BLOCK_TEXT_CAP).unwrap_or_default();
+                let images = user_images(message.get("content"));
+                if !text.is_empty() || !images.is_empty() {
+                    all.push(Dated { ts, entry: ThreadEntry::User { text, truncated, images } });
                 }
             }
             Some("assistant") => {
@@ -261,6 +279,31 @@ fn as_array<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Valu
 
 fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
+}
+
+/// Retains browser-safe raster attachments under a strict response-size cap.
+fn user_images(content: Option<&serde_json::Value>) -> Vec<UserImage> {
+    let Some(blocks) = content.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("image") {
+                return None;
+            }
+            let mime_type = block.get("mimeType").and_then(serde_json::Value::as_str)?;
+            if !matches!(mime_type, "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+                return None;
+            }
+            let data = block.get("data").and_then(serde_json::Value::as_str)?;
+            if data.is_empty() || data.len() > IMAGE_DATA_CAP {
+                return None;
+            }
+            Some(UserImage { mime_type: mime_type.to_owned(), data: data.to_owned() })
+        })
+        .take(MAX_USER_IMAGES)
+        .collect()
 }
 
 /// Joins text blocks into `(joined, truncated)`; returns `None` when no text.
@@ -422,6 +465,24 @@ mod tests {
         assert_eq!(tools[0].name, "bash");
         assert!(tools[0].details.is_none());
         assert_eq!(model.as_deref(), Some("m1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_bounded_raster_images_from_user_messages() {
+        let dir = temp_dir("user-images");
+        let file = write_thread(
+            &dir,
+            &[r#"{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"see this"},{"type":"image","mimeType":"image/png","data":"cG5n"},{"type":"image","mimeType":"image/svg+xml","data":"PHN2Zz4="}]}}"#.to_owned()],
+        );
+        let view = parse_thread(&file).expect("parse");
+        let ThreadEntry::User { text, images, .. } = &view.entries[0].entry else {
+            panic!("expected user entry");
+        };
+        assert_eq!(text, "see this");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, "cG5n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

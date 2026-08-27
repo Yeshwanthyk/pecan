@@ -231,7 +231,7 @@ fn show_thread(session_id: &String) -> Result<(), CliError> {
         let clock =
             dated.ts.map_or_else(|| "--:--:--".to_owned(), |t| t.strftime("%H:%M:%S").to_string());
         match &dated.entry {
-            ThreadEntry::User { text, truncated } => {
+            ThreadEntry::User { text, truncated, .. } => {
                 println!("[{clock}] USER   {}{}", first_line(text), ellipsis_flag(*truncated))
             }
             ThreadEntry::Assistant { text, truncated, thinking, tools, model } => {
