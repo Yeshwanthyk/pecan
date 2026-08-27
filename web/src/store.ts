@@ -7,7 +7,11 @@ export type ThemeName = "earl-grey-light" | "one-dark";
 export type SendMode = "steer" | "queue";
 
 export type RunningSubagent = {
+  id?: string;
   title: string;
+  status?: "running" | "settled";
+  backend?: string;
+  model?: string;
   startedAt: number;
   lastActivityAt: number;
 };

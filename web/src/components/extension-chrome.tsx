@@ -3,6 +3,7 @@ import { useEffect } from "react";
 
 import { Button } from "~/components/ui/button";
 import { cn } from "~/lib/utils";
+import { ExtensionWidgetRenderer } from "~/components/extension-ui";
 import { useApp, type ExtensionNotice, type ExtensionWidget } from "~/store";
 
 const EMPTY_NOTICES: ExtensionNotice[] = [];
@@ -19,6 +20,7 @@ export function ExtensionChrome({
   const notices = useApp((state) => state.extensionNotices[sessionId] ?? EMPTY_NOTICES);
   const statuses = useApp((state) => state.extensionStatuses[sessionId] ?? EMPTY_STATUSES);
   const widgets = useApp((state) => state.extensionWidgets[sessionId] ?? EMPTY_WIDGETS);
+  const activity = useApp((state) => state.subagentActivity[sessionId]);
   const title = useApp((state) => state.extensionTitles[sessionId]);
   const removeNotice = useApp((state) => state.removeExtensionNotice);
 
@@ -56,7 +58,9 @@ export function ExtensionChrome({
           ))}
         </>
       ) : null}
-      {visibleWidgets.map((widget) => <Widget key={widget.key} widget={widget} />)}
+      {visibleWidgets.map((widget) => (
+        <ExtensionWidgetRenderer activity={activity} key={widget.key} widget={widget} />
+      ))}
     </div>
   );
 }
@@ -82,19 +86,5 @@ function Notice({ notice, onDismiss }: { notice: ExtensionNotice; onDismiss: () 
         <XIcon />
       </Button>
     </div>
-  );
-}
-
-function Widget({ widget }: { widget: ExtensionWidget }) {
-  if (widget.lines.length === 0) return null;
-  return (
-    <section aria-label={`Extension widget ${widget.key}`} className="rounded-lg border bg-card px-3 py-2">
-      <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-        {widget.key}
-      </div>
-      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-muted-foreground">
-        {widget.lines.join("\n")}
-      </pre>
-    </section>
   );
 }

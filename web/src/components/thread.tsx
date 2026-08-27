@@ -20,6 +20,7 @@ import {
 } from "~/components/ui/collapsible";
 import { Spinner } from "~/components/ui/spinner";
 import { ChatMarkdown, DiffBlock } from "~/components/chat-markdown";
+import { TaskListPanel } from "~/components/extension-ui";
 import { useApp } from "~/store";
 import { cn } from "~/lib/utils";
 
@@ -554,51 +555,7 @@ function Panels({ data }: { data: ThreadView }) {
   if (taskCount === 0 && data.workflows.length === 0) return null;
   return (
     <div className="mt-6 flex flex-col gap-2 border-t pt-3">
-      {taskCount > 0 ? (
-        <Collapsible defaultOpen>
-          <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] font-medium text-muted-foreground hover:bg-accent">
-            Tasks <Badge variant="secondary">{taskCount}</Badge>
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            <div className="flex flex-col">
-              {data.tasks.flatMap((list) =>
-                list.tasks.map((task) => (
-                  <div
-                    className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3 gap-y-0.5 px-3 py-1.5 text-sm"
-                    key={`${list.sessionId}:${task.id}`}
-                  >
-                    <span
-                      className={cn(
-                        "text-xs tabular-nums",
-                        task.status === "completed" && "text-success",
-                        task.status === "in_progress" && "text-warning",
-                        !["completed", "in_progress"].includes(task.status) &&
-                          "text-muted-foreground",
-                      )}
-                    >
-                      {task.status.replace("_", " ")}
-                    </span>
-                    <span className="min-w-0 font-medium">{task.subject}</span>
-                    {task.owner || task.harness || task.blockedBy.length > 0 ? (
-                      <span className="col-start-2 text-[11px] text-muted-foreground">
-                        {[
-                          task.owner ? `Owner ${task.owner}` : null,
-                          task.harness ? task.harness : null,
-                          task.blockedBy.length > 0
-                            ? `Blocked by ${task.blockedBy.join(", ")}`
-                            : null,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </span>
-                    ) : null}
-                  </div>
-                )),
-              )}
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
-      ) : null}
+      {taskCount > 0 ? <TaskListPanel groups={data.tasks} /> : null}
       {data.workflows.length > 0 ? (
         <Collapsible>
           <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] font-medium text-muted-foreground hover:bg-accent">

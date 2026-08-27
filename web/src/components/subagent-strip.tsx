@@ -36,7 +36,7 @@ export function SubagentStrip({
       }
       const exactMatch = row.parentSessionId === parentId;
       const fallbackMatch =
-        row.parentSessionId == null &&
+        (row.parentSessionId === null || row.parentSessionId === undefined) &&
         (!Number.isFinite(parentOpenedAt) ||
           !Number.isFinite(Date.parse(row.openedAt)) ||
           Date.parse(row.openedAt) >= parentOpenedAt);

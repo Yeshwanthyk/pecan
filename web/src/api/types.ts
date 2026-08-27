@@ -185,6 +185,8 @@ export const TaskItem = Object({
   blockedBy: Array(String()),
 });
 export const TaskList = Object({ sessionId: String(), tasks: Array(TaskItem) });
+export type TaskItem = Static<typeof TaskItem>;
+export type TaskGroup = Static<typeof TaskList>;
 
 export const WorkflowAgent = Object({
   label: Optional(Union([String(), Null(), Undefined()])),

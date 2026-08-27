@@ -1,6 +1,6 @@
 /** Live updates: one EventSource fanning debounced store refreshes. */
 import { api } from "~/api/client";
-import { useApp, type DialogOption, type PendingAsk } from "~/store";
+import { useApp, type DialogOption, type PendingAsk, type SubagentActivity } from "~/store";
 
 const SUBAGENT_ACTIVITY_WIDGET = "pi-subagents/activity/v1";
 
@@ -223,9 +223,7 @@ function parseWidgetLines(widgetLines: unknown): string[] | undefined {
     .slice(0, 64);
 }
 
-function parseSubagentActivity(
-  widgetLines: unknown,
-): { revision: number; children: Array<{ title: string; startedAt: number; lastActivityAt: number }> } | null {
+function parseSubagentActivity(widgetLines: unknown): SubagentActivity | null {
   if (widgetLines === undefined) return null;
   if (!Array.isArray(widgetLines) || widgetLines.length !== 1) return null;
   const line = widgetLines[0];
@@ -245,8 +243,11 @@ function parseSubagentActivity(
     const children = snapshot.children.flatMap((child) => {
       if (typeof child !== "object" || child === null) return [];
       const row = child as {
+        id?: unknown;
         status?: unknown;
         title?: unknown;
+        backend?: unknown;
+        model?: unknown;
         startedAt?: unknown;
         lastActivityAt?: unknown;
       };
@@ -263,7 +264,11 @@ function parseSubagentActivity(
         return [];
       }
       return [{
+        id: typeof row.id === "string" ? row.id : undefined,
         title: row.title,
+        status: "running" as const,
+        backend: typeof row.backend === "string" ? row.backend : undefined,
+        model: typeof row.model === "string" ? row.model : undefined,
         startedAt: row.startedAt,
         lastActivityAt: row.lastActivityAt,
       }];
