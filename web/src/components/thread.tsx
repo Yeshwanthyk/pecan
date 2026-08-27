@@ -12,7 +12,6 @@ import {
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { DatedEntry, ThreadEntry, ThreadView, ToolCall } from "~/api/types";
-import { Badge } from "~/components/ui/badge";
 import {
   Collapsible,
   CollapsibleContent,
@@ -20,7 +19,7 @@ import {
 } from "~/components/ui/collapsible";
 import { Spinner } from "~/components/ui/spinner";
 import { ChatMarkdown, DiffBlock } from "~/components/chat-markdown";
-import { TaskListPanel } from "~/components/extension-ui";
+import { TaskListPanel, WorkflowListPanel } from "~/components/extension-ui";
 import { useApp } from "~/store";
 import { cn } from "~/lib/utils";
 
@@ -416,10 +415,40 @@ function ToolBody({ tool }: { tool: ToolCall }) {
   const lines = body.split("\n");
   const shown = lines.slice(0, 24).join("\n");
   return (
-    <pre className="mt-1 max-h-56 overflow-auto rounded-md bg-muted p-2.5 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
-      {shown}
-      {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
-    </pre>
+    <>
+      <pre className="mt-1 max-h-56 overflow-auto rounded-md bg-muted p-2.5 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
+        {shown}
+        {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
+      </pre>
+      {tool.details !== undefined ? <ToolDetails details={tool.details} /> : null}
+    </>
+  );
+}
+
+function ToolDetails({ details }: { details: unknown }) {
+  if (details === null || typeof details !== "object") return null;
+  const record = details as Record<string, unknown>;
+  const artifactPaths = [record.artifactPath, record.resultArtifact, record.transcriptArtifact]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  let text: string;
+  try {
+    text = JSON.stringify(details, null, 2);
+  } catch {
+    return null;
+  }
+  const lines = text.split("\n");
+  return (
+    <div className="mt-1">
+      {artifactPaths.length > 0 ? (
+        <div className="mb-1 text-[11px] text-muted-foreground">
+          Artifacts: {artifactPaths.join(" · ")}
+        </div>
+      ) : null}
+      <pre className="max-h-72 overflow-auto rounded-md border bg-card p-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
+        {lines.slice(0, 80).join("\n")}
+        {lines.length > 80 ? `\n… ${lines.length - 80} more lines` : ""}
+      </pre>
+    </div>
   );
 }
 
@@ -556,30 +585,7 @@ function Panels({ data }: { data: ThreadView }) {
   return (
     <div className="mt-6 flex flex-col gap-2 border-t pt-3">
       {taskCount > 0 ? <TaskListPanel groups={data.tasks} /> : null}
-      {data.workflows.length > 0 ? (
-        <Collapsible>
-          <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] font-medium text-muted-foreground hover:bg-accent">
-            Workflows <Badge variant="secondary">{data.workflows.length}</Badge>
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            {data.workflows.map((workflow) => (
-              <div
-                className="flex flex-wrap items-baseline gap-x-3 px-3 py-1 text-sm"
-                key={workflow.runId}
-              >
-                <span className="font-medium">
-                  {workflow.name ?? workflow.runId}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  {workflow.agents
-                    .map((agent) => `${agent.label ?? "?"}: ${agent.state ?? "?"}`)
-                    .join(" · ")}
-                </span>
-              </div>
-            ))}
-          </CollapsibleContent>
-        </Collapsible>
-      ) : null}
+      {data.workflows.length > 0 ? <WorkflowListPanel runs={data.workflows} /> : null}
     </div>
   );
 }

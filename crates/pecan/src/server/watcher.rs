@@ -49,7 +49,8 @@ pub(crate) fn spawn(
     let watched = [
         (paths.sessions_dir(), RecursiveMode::Recursive),
         (paths.tasks_dir(), RecursiveMode::NonRecursive),
-        (paths.workflows_dir(), RecursiveMode::NonRecursive),
+        // Workflow runs are directories containing workflow.json and sidecars.
+        (paths.workflows_dir(), RecursiveMode::Recursive),
     ];
     for (dir, mode) in &watched {
         if dir.exists() {

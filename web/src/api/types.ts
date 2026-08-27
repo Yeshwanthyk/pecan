@@ -143,6 +143,7 @@ export const ToolCall = Object({
   toolCallId: String(),
   name: String(),
   argsPreview: String(),
+  details: Optional(Unknown()),
 });
 export type ToolCall = Static<typeof ToolCall>;
 
@@ -180,9 +181,13 @@ export const TaskItem = Object({
   subject: String(),
   status: String(),
   description: Union([String(), Null()]),
+  activeForm: Union([String(), Null()]),
   owner: Union([String(), Null()]),
   harness: Union([String(), Null()]),
   blockedBy: Array(String()),
+  blocks: Array(String()),
+  execution: Union([Unknown(), Null()]),
+  updatedAt: Union([Number(), Null()]),
 });
 export const TaskList = Object({ sessionId: String(), tasks: Array(TaskItem) });
 export type TaskItem = Static<typeof TaskItem>;
@@ -192,14 +197,32 @@ export const WorkflowAgent = Object({
   label: Optional(Union([String(), Null(), Undefined()])),
   phase: Optional(Union([String(), Null(), Undefined()])),
   state: Optional(Union([String(), Null(), Undefined()])),
+  model: Optional(Union([String(), Null(), Undefined()])),
+  provider: Optional(Union([String(), Null(), Undefined()])),
+  completedOperations: Optional(Union([Number(), Null(), Undefined()])),
 });
+export const WorkflowPhase = Object({
+  title: String(),
+  detail: Optional(Union([String(), Null(), Undefined()])),
+});
+export type WorkflowPhase = Static<typeof WorkflowPhase>;
 export const WorkflowRun = Object({
   runId: String(),
   sessionId: Optional(Union([String(), Null(), Undefined()])),
   name: Optional(Union([String(), Null(), Undefined()])),
+  description: Optional(Union([String(), Null(), Undefined()])),
+  background: Boolean(),
+  startedAt: Optional(Union([Number(), Null(), Undefined()])),
+  finishedAt: Optional(Union([Number(), Null(), Undefined()])),
   status: Optional(Union([String(), Null(), Undefined()])),
+  currentPhase: Optional(Union([String(), Null(), Undefined()])),
+  phases: Array(WorkflowPhase),
+  error: Optional(Union([String(), Null(), Undefined()])),
+  resultArtifact: Optional(Union([String(), Null(), Undefined()])),
+  transcriptArtifact: Optional(Union([String(), Null(), Undefined()])),
   agents: Array(WorkflowAgent),
 });
+export type WorkflowRun = Static<typeof WorkflowRun>;
 
 export const ThreadView = Object({
   summary: SessionSummary,

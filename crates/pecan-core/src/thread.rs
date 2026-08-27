@@ -16,6 +16,8 @@ use crate::session::truncate_chars;
 const BLOCK_TEXT_CAP: usize = 8_000;
 /// Maximum arguments-preview characters kept per tool call.
 const ARGS_PREVIEW_CAP: usize = 240;
+/// Maximum serialized tool details retained from a transcript result.
+const TOOL_DETAILS_CAP: usize = 64 * 1024;
 /// Maximum entries returned, counted from the tail of the transcript.
 pub const MAX_ENTRIES: usize = 600;
 
@@ -30,6 +32,9 @@ pub struct ToolCall {
     /// Compact single-line preview of the arguments JSON.
     #[serde(rename = "argsPreview")]
     pub args_preview: String,
+    /// Structured details returned by the tool, when the producer supplied them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// One renderable row of a conversation thread.
@@ -103,6 +108,11 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
     let mut all: Vec<Dated<ThreadEntry>> = Vec::new();
     // toolCallId -> index into `all` of the unanswered AskUser entry.
     let mut open_askuser: Vec<(String, usize)> = Vec::new();
+    // Tool results are recorded after their assistant message. Keep the
+    // location so workflow/tool details can be joined without rendering the
+    // result as a second transcript row.
+    let mut tool_positions: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
 
     for line in bytes.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -158,7 +168,12 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                                         entry: ThreadEntry::AskUser { questions, answer: None },
                                     });
                                 } else {
-                                    tools.push(ToolCall { tool_call_id: id, name, args_preview });
+                                    tools.push(ToolCall {
+                                        tool_call_id: id,
+                                        name,
+                                        args_preview,
+                                        details: None,
+                                    });
                                 }
                             }
                             _ => {}
@@ -169,6 +184,7 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                     continue;
                 }
                 let model = str_field(message, "model");
+                let entry_index = all.len();
                 all.push(Dated {
                     ts,
                     entry: ThreadEntry::Assistant {
@@ -179,9 +195,26 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                         model,
                     },
                 });
+                if let Some(ThreadEntry::Assistant { tools, .. }) =
+                    all.get(entry_index).map(|dated| &dated.entry)
+                {
+                    for (tool_index, tool) in tools.iter().enumerate() {
+                        if !tool.tool_call_id.is_empty() {
+                            tool_positions
+                                .insert(tool.tool_call_id.clone(), (entry_index, tool_index));
+                        }
+                    }
+                }
             }
             Some("toolResult") => {
                 let call_id = str_field(message, "toolCallId").unwrap_or_default();
+                if let Some((entry_index, tool_index)) = tool_positions.get(&call_id).copied()
+                    && let Some(ThreadEntry::Assistant { tools, .. }) =
+                        all.get_mut(entry_index).map(|dated| &mut dated.entry)
+                    && let Some(tool) = tools.get_mut(tool_index)
+                {
+                    tool.details = message.get("details").and_then(bounded_tool_details);
+                }
                 if let Some((_, idx)) = open_askuser.iter().rev().find(|(id, _)| *id == call_id) {
                     let idx = *idx;
                     if let Some(ThreadEntry::AskUser { answer, .. }) =
@@ -214,6 +247,12 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
     let omitted = all.len().saturating_sub(MAX_ENTRIES);
     let entries = all.into_iter().skip(omitted).collect();
     Ok(ThreadView { entries, omitted, waiting_askuser })
+}
+
+/// Retains structured tool details only when they fit the transcript bound.
+fn bounded_tool_details(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let encoded = serde_json::to_vec(value).ok()?;
+    (encoded.len() <= TOOL_DETAILS_CAP).then(|| value.clone())
 }
 
 fn as_array<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
@@ -327,6 +366,39 @@ mod tests {
     }
 
     #[test]
+    fn joins_workflow_tool_details_from_tool_result() {
+        let dir = temp_dir("tool-details");
+        let file = write_thread(
+            &dir,
+            &[
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"wf-call","name":"workflow","arguments":{"script":"return"}}]}}"#.to_owned(),
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:02Z","message":{"role":"toolResult","toolCallId":"wf-call","toolName":"workflow","isError":false,"details":{"kind":"draft","draftId":"draft_abc123","artifactPath":"/tmp/draft.json","script":"phase()"},"content":[{"type":"text","text":"draft ready"}]}}"#.to_owned(),
+            ],
+        );
+        let view = parse_thread(&file).expect("parse");
+        let ThreadEntry::Assistant { tools, .. } = &view.entries[0].entry else {
+            panic!("expected assistant entry");
+        };
+        assert_eq!(
+            tools[0]
+                .details
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("draft")
+        );
+        assert_eq!(
+            tools[0]
+                .details
+                .as_ref()
+                .and_then(|value| value.get("artifactPath"))
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/draft.json")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parses_user_assistant_and_tools() {
         let dir = temp_dir("basic");
         let file = write_thread(
@@ -348,7 +420,7 @@ mod tests {
         assert_eq!(text, "sure");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "bash");
-        assert_eq!(tools[0].name, "bash");
+        assert!(tools[0].details.is_none());
         assert_eq!(model.as_deref(), Some("m1"));
         let _ = std::fs::remove_dir_all(&dir);
     }

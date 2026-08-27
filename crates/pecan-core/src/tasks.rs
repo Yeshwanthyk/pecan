@@ -23,12 +23,20 @@ pub struct TaskItem {
     pub status: String,
     /// Longer task context, when persisted by the producer.
     pub description: Option<String>,
+    /// Present-tense label used while the task is active.
+    pub active_form: Option<String>,
     /// Current owner label.
     pub owner: Option<String>,
     /// Selected execution harness.
     pub harness: Option<String>,
     /// Incomplete prerequisite ids.
     pub blocked_by: Vec<String>,
+    /// Dependent task ids.
+    pub blocks: Vec<String>,
+    /// Current background execution state, when one exists.
+    pub execution: Option<serde_json::Value>,
+    /// Last producer update time in epoch milliseconds.
+    pub updated_at: Option<i64>,
 }
 
 /// A task list projected into one session.
@@ -168,6 +176,7 @@ fn parse_task(task: &serde_json::Value) -> Option<TaskItem> {
         subject: bounded_string(task.get("subject"), MAX_SUBJECT_BYTES)?,
         status: status.to_owned(),
         description: bounded_string(task.get("description"), MAX_DESCRIPTION_BYTES),
+        active_form: bounded_string(task.get("activeForm"), MAX_SUBJECT_BYTES),
         owner: bounded_string(task.get("owner"), 160),
         harness: task
             .get("harness")
@@ -175,6 +184,12 @@ fn parse_task(task: &serde_json::Value) -> Option<TaskItem> {
             .filter(|value| matches!(*value, "pi" | "claude" | "codex"))
             .map(str::to_owned),
         blocked_by: bounded_ids(task.get("blockedBy")),
+        blocks: bounded_ids(task.get("blocks")),
+        execution: bounded_value(task.get("execution"), 64 * 1024),
+        updated_at: task
+            .get("updatedAt")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| *value >= 0),
     })
 }
 
@@ -202,6 +217,12 @@ fn bounded_ids(value: Option<&serde_json::Value>) -> Vec<String> {
         .take(MAX_RELATION_IDS)
         .filter_map(|id| bounded_string(Some(id), 80))
         .collect()
+}
+
+fn bounded_value(value: Option<&serde_json::Value>, max_bytes: usize) -> Option<serde_json::Value> {
+    let value = value?;
+    let encoded = serde_json::to_vec(value).ok()?;
+    (encoded.len() <= max_bytes).then(|| value.clone())
 }
 
 #[cfg(test)]
