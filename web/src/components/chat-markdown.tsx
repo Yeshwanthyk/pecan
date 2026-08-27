@@ -1,7 +1,6 @@
 /**
- * Chat markdown: GFM rendering with highlighted code fences and unified-diff
- * blocks (+/- line coloring) for ```diff fences. Diagram fences remain
- * inspectable source instead of pulling a multi-megabyte renderer into Pecan.
+ * Chat markdown: GFM rendering with highlighted code fences, unified-diff
+ * blocks (+/- line coloring), and lazily rendered Mermaid diagrams.
  */
 import { isValidElement, memo, type ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
@@ -9,6 +8,7 @@ import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 
 import { CopyButton } from "~/components/copy-button";
+import { MermaidDiagram } from "~/components/mermaid-diagram";
 import { cn } from "~/lib/utils";
 
 export const ChatMarkdown = memo(function ChatMarkdown({ text }: { text: string }) {
@@ -74,6 +74,7 @@ function CodeFence({ className, children }: CodeProps) {
   const lang = /language-(\S+)/.exec(className ?? "")?.[1] ?? "";
   if (lang === "diff") return <DiffBlock code={raw} />;
   const codeText = raw.replace(/\n$/, "");
+  if (lang === "mermaid") return <MermaidDiagram source={codeText} />;
   return (
     <div className="group/code relative my-3 overflow-hidden rounded-lg border bg-card">
       <div className="flex items-center border-b bg-muted/50 px-3 py-1">
