@@ -30,6 +30,9 @@ export function SubagentStrip({
 
   const candidates = useMemo(() => {
     const parentOpenedAt = parent ? Date.parse(parent.openedAt) : Number.NaN;
+    const liveNames = new Set(
+      (activity?.children ?? []).map((child) => normalizeAgentName(child.title)),
+    );
     return sessions.filter((row) => {
       if (row.kind !== "subagent" || row.cwd !== (parent?.cwd ?? current.cwd)) {
         return false;
@@ -37,6 +40,7 @@ export function SubagentStrip({
       const exactMatch = row.parentSessionId === parentId;
       const fallbackMatch =
         (row.parentSessionId === null || row.parentSessionId === undefined) &&
+        (row.id === current.id || liveNames.has(agentName(row))) &&
         (!Number.isFinite(parentOpenedAt) ||
           !Number.isFinite(Date.parse(row.openedAt)) ||
           Date.parse(row.openedAt) >= parentOpenedAt);
@@ -45,7 +49,7 @@ export function SubagentStrip({
       }
       return !row.settled || row.id === current.id;
     });
-  }, [current.cwd, current.id, parent, parentId, sessions]);
+  }, [activity, current.cwd, current.id, parent, parentId, sessions]);
 
   const runningIds = useMemo(() => {
     const ids = new Set<string>();
@@ -96,9 +100,10 @@ export function SubagentStrip({
           title={parent?.preview ?? "Open the main thread"}
         >
           {isInsideChild ? <ArrowLeftIcon aria-hidden className="size-3.5" /> : null}
-          Main thread
+          <span className="sm:hidden">Main</span>
+          <span className="hidden sm:inline">Main thread</span>
         </a>
-        <span className="shrink-0 px-1 text-xs text-muted-foreground">
+        <span className="hidden shrink-0 px-1 text-xs text-muted-foreground sm:inline">
           Agents
         </span>
         {children.map((child) => (
@@ -132,7 +137,7 @@ function SubagentLink({
     <a
       aria-current={active ? "page" : undefined}
       className={cn(
-        "flex min-h-11 max-w-[17rem] shrink-0 items-center gap-2 rounded-md border px-2.5 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:min-h-8",
+        "flex min-h-11 max-w-[12rem] shrink-0 items-center gap-2 rounded-md border px-2.5 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring sm:max-w-[17rem] md:min-h-8",
         active
           ? "border-input bg-accent font-medium text-foreground"
           : "border-border bg-card text-muted-foreground hover:border-input hover:text-foreground",

@@ -214,12 +214,32 @@ export function connectEvents() {
   });
 }
 
+const ESCAPE_CHARACTER = String.fromCharCode(27);
+const BELL_CHARACTER = String.fromCharCode(7);
+const ANSI_OSC_SEQUENCE = new RegExp(
+  `${ESCAPE_CHARACTER}\\][^${BELL_CHARACTER}]*(?:${BELL_CHARACTER}|${ESCAPE_CHARACTER}\\\\)`,
+  "g",
+);
+const ANSI_CSI_SEQUENCE = new RegExp(
+  `${ESCAPE_CHARACTER}\\[[0-?]*[ -/]*[@-~]`,
+  "g",
+);
+
+/** Extension widgets may contain terminal styling, but the browser surface is
+ * semantic text. Strip escape sequences at the event boundary. */
+function cleanWidgetLine(line: string): string {
+  return line
+    .replace(ANSI_OSC_SEQUENCE, "")
+    .replace(ANSI_CSI_SEQUENCE, "")
+    .replaceAll("\r", "");
+}
+
 function parseWidgetLines(widgetLines: unknown): string[] | undefined {
   if (widgetLines === undefined) return undefined;
   if (!Array.isArray(widgetLines)) return [];
   return widgetLines
     .filter((line): line is string => typeof line === "string")
-    .map((line) => line.slice(0, 2000))
+    .map((line) => cleanWidgetLine(line).slice(0, 2000))
     .slice(0, 64);
 }
 

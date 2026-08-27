@@ -1,8 +1,9 @@
-import { CircleDotIcon, ListTodoIcon } from "lucide-react";
+import { ChevronDownIcon, CircleDotIcon, ListTodoIcon } from "lucide-react";
 import type { TaskGroup, TaskItem, WorkflowRun } from "~/api/types";
 import { Badge } from "~/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/components/ui/collapsible";
 import { cn } from "~/lib/utils";
+import { useIsMobile } from "~/hooks/useMediaQuery";
 import type { ExtensionWidget, SubagentActivity } from "~/store";
 
 const SUBAGENT_WIDGET = "pi-subagents/activity/v1";
@@ -21,26 +22,36 @@ export function ExtensionWidgetRenderer({
 }
 
 export function ActivityList({ activity }: { activity: SubagentActivity }) {
+  const isMobile = useIsMobile();
   if (activity.children.length === 0) return null;
   return (
-    <section aria-label="Subagent activity" aria-live="polite" className="rounded-lg border bg-card px-3 py-2">
-      <div className="mb-1.5 flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
-        Agents working <Badge variant="secondary">{activity.children.length}</Badge>
-      </div>
-      <div className="flex flex-col gap-1">
-        {activity.children.map((child) => (
-          <div className="flex min-w-0 items-center gap-2 text-[12px]" key={child.id ?? child.title}>
-            <CircleDotIcon className="size-3 shrink-0 text-success" />
-            <span className="min-w-0 truncate font-medium">{child.title}</span>
-            {child.backend || child.model ? (
-              <span className="ms-auto shrink-0 text-[10px] text-muted-foreground">
-                {[child.backend, child.model].filter(Boolean).join(" · ")}
-              </span>
-            ) : null}
+    <Collapsible defaultOpen={!isMobile}>
+      <section aria-label="Subagent activity" aria-live="polite" className="rounded-lg border bg-card">
+        <CollapsibleTrigger className="group flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-[12px] font-medium text-muted-foreground md:min-h-9">
+          <CircleDotIcon className="size-3.5 shrink-0 text-success" />
+          <span>{activity.children.length} {activity.children.length === 1 ? "agent" : "agents"} working</span>
+          <span className="ms-auto max-w-[45%] truncate text-[11px] font-normal md:hidden">
+            {activity.children.map((child) => child.title).join(", ")}
+          </span>
+          <ChevronDownIcon className="size-3.5 shrink-0 transition-transform group-data-[panel-open]:rotate-180" />
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="flex flex-col gap-1 border-t px-3 py-2">
+            {activity.children.map((child) => (
+              <div className="flex min-w-0 items-center gap-2 text-[12px]" key={child.id ?? child.title}>
+                <CircleDotIcon className="size-3 shrink-0 text-success" />
+                <span className="min-w-0 truncate font-medium">{child.title}</span>
+                {child.backend || child.model ? (
+                  <span className="ms-auto hidden shrink-0 text-[10px] text-muted-foreground sm:inline">
+                    {[child.backend, child.model].filter(Boolean).join(" · ")}
+                  </span>
+                ) : null}
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-    </section>
+        </CollapsibleContent>
+      </section>
+    </Collapsible>
   );
 }
 
