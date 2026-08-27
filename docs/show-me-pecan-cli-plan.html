@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pecan CLI · KISS plan</title>
+<style>
+:root{--bg:#fff;--ink:#000;--muted:#626262;--line:#dedede;--soft:#f5f5f5;--accent:#8a611c;--green:#3d6b35;font:14px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,"Segoe UI",sans-serif;color:var(--ink);background:var(--bg)}
+*{box-sizing:border-box}body{margin:0}main{max-width:1080px;margin:auto;padding:42px 28px 68px}header{display:flex;justify-content:space-between;gap:28px;align-items:end;border-bottom:1px solid var(--ink);padding-bottom:24px;margin-bottom:30px}h1{font-size:clamp(30px,5vw,54px);line-height:1;letter-spacing:-.04em;margin:0;max-width:690px}h2{font-size:18px;letter-spacing:-.02em;margin:0 0 14px}h3{font-size:13px;margin:0 0 7px}p{margin:7px 0;color:var(--muted)}.kicker{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:11px}.stamp{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);text-align:right}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{border:1px solid var(--line);padding:18px;min-width:0}.wide{grid-column:span 12}.half{grid-column:span 6}.third{grid-column:span 4}.decision{border-color:var(--ink);background:var(--soft)}.decision strong{font-size:16px}.flow{display:flex;align-items:stretch;gap:8px;overflow:auto;padding:2px 0 7px}.node{min-width:145px;border:1px solid var(--line);padding:12px;background:var(--bg)}.node b{display:block}.node small{display:block;color:var(--muted);margin-top:5px}.arrow{align-self:center;color:var(--accent);font-size:20px}pre{margin:0;white-space:pre-wrap;overflow:auto;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}code{font:inherit}.cmd{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding:9px 0}.cmd:last-child{border:0}.cmd code{color:var(--ink);font-weight:650;flex:0 0 auto}.cmd span{color:var(--muted)}ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}li{margin:6px 0}.yes{color:var(--green);font-weight:650}.no{color:var(--muted)}.phase{display:grid;grid-template-columns:28px 1fr;gap:11px;border-top:1px solid var(--line);padding:13px 0}.phase:first-child{border-top:0;padding-top:0}.num{width:24px;height:24px;border:1px solid var(--ink);border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700}.tag{display:inline-block;border:1px solid var(--line);padding:3px 7px;margin:3px 3px 0 0;font-size:11px;color:var(--muted)}.accept{color:var(--green)}@media(max-width:720px){main{padding:27px 16px 48px}header{display:block}.stamp{text-align:left;margin-top:16px}.half,.third{grid-column:span 12}.flow{display:grid;grid-template-columns:1fr}.arrow{justify-self:center;transform:rotate(90deg)}}
+</style>
+</head>
+<body><main>
+<header><div><div class="kicker">Pecan · control plane</div><h1>One small CLI for every important GUI action.</h1></div><div class="stamp">KISS plan<br>server stays authoritative</div></header>
+
+<section class="grid">
+<div class="card wide decision"><h2>Decision</h2><strong>Extend the existing <code>pecan</code> binary. Do not build a second daemon, TUI, plugin system, or generic runtime abstraction.</strong><p>The running Pecan server already owns Pi workers and exposes the GUI's JSON API. The CLI becomes a thin, scriptable client of that same API. Humans get readable output; agents use <code>--json</code>.</p></div>
+
+<div class="card wide"><h2>Today → target</h2><div class="flow"><div class="node"><b>AI agent</b><small>shell command<br>stable JSON</small></div><div class="arrow">→</div><div class="node"><b>pecan CLI</b><small>parse + validate<br>HTTP client</small></div><div class="arrow">→</div><div class="node"><b>Pecan server</b><small>same API +<br>same worker pool</small></div><div class="arrow">→</div><div class="node"><b>Pi workers</b><small>sessions<br>events / replies</small></div></div></div>
+
+<div class="card half"><h2>Small command surface</h2>
+<div class="cmd"><code>pecan session list</code><span>browse sessions</span></div>
+<div class="cmd"><code>pecan session create</code><span>start one</span></div>
+<div class="cmd"><code>pecan session send</code><span>normal prompt</span></div>
+<div class="cmd"><code>pecan session steer</code><span>interrupt with direction</span></div>
+<div class="cmd"><code>pecan session queue</code><span>follow-up after turn</span></div>
+<div class="cmd"><code>pecan session wait</code><span>orchestrator synchronization</span></div>
+<div class="cmd"><code>pecan session abort</code><span>stop work</span></div>
+<div class="cmd"><code>pecan session state</code><span>live model / streaming state</span></div>
+<div class="cmd"><code>pecan events</code><span>JSONL event stream</span></div>
+</div>
+
+<div class="card half"><h2>GUI parity, still simple</h2>
+<div class="cmd"><code>session respond</code><span>AskUser answer/cancel</span></div>
+<div class="cmd"><code>session model</code><span>switch provider/model</span></div>
+<div class="cmd"><code>session thinking</code><span>change effort</span></div>
+<div class="cmd"><code>session pin / settle</code><span>curation</span></div>
+<div class="cmd"><code>project add / remove</code><span>scope sessions</span></div>
+<div class="cmd"><code>session diff</code><span>machine-readable diff</span></div>
+<div class="cmd"><code>session ship</code><span>explicit confirmation only</span></div>
+<p>Existing <code>index</code>, <code>thread</code>, and <code>serve</code> stay as compatibility aliases.</p>
+</div>
+
+<div class="card wide"><h2>Orchestrator path</h2><pre>orchestrator
+  ├─ pecan session create --cwd /repo --json     → A
+  ├─ pecan session create --cwd /repo --json     → B
+  ├─ pecan session send A --message "Inspect API" 
+  ├─ pecan session send B --message "Inspect UI"
+  ├─ pecan session wait A --until idle --json
+  ├─ pecan session steer B --message "Use A's findings: ..."
+  └─ pecan session wait B --until settled --json</pre><p>Pi Subagents remains the native way for one Pi agent to spawn and wait for children. The CLI also lets an external orchestrator control known session IDs directly.</p></div>
+
+<div class="card third"><h2>One config</h2><p>Where to find the server:</p><div class="tag">--server URL</div><div class="tag">PECAN_SERVER_URL</div><p>Default: <code>http://127.0.0.1:7614</code>. No config file for v1.</p></div>
+<div class="card third"><h2>One output rule</h2><p>Every mutating command supports:</p><div class="tag">human text</div><div class="tag">--json</div><p>JSON goes to stdout. Diagnostics go to stderr. Exit 0 only after accepted/complete semantics are known.</p></div>
+<div class="card third"><h2>One safety rule</h2><p>Bounded timeouts everywhere. Ship requires an explicit flag and capability token. No arbitrary shell execution through Pecan.</p></div>
+
+<div class="card wide"><h2>Implementation slices</h2>
+<div class="phase"><div class="num">1</div><div><h3>Thin client + grammar</h3><p>Add a small async HTTP client and command parser. Centralize URL resolution, request errors, timeout, and JSON output. Reuse existing API schemas where practical.</p><span class="accept">Proof: list/create return stable JSON and readable errors.</span></div></div>
+<div class="phase"><div class="num">2</div><div><h3>Session control</h3><p>Implement create, send, steer, queue, abort, state, model, thinking, and respond. Keep mode validation aligned with the server's existing conflict behavior.</p><span class="accept">Proof: create two sessions, send to both, steer one, answer an AskUser request.</span></div></div>
+<div class="phase"><div class="num">3</div><div><h3>Wait + events</h3><p>Consume the existing SSE stream and expose filtered JSONL events. <code>wait</code> exits on idle, settled, or timeout; it never polls aggressively.</p><span class="accept">Proof: orchestrator script runs A → B handoff deterministically.</span></div></div>
+<div class="phase"><div class="num">4</div><div><h3>Parity extras</h3><p>Add project curation, pin/settle, diff, and guarded ship only after the control loop is solid. Add aliases for current commands.</p><span class="accept">Proof: command inventory maps to every GUI mutation and read.</span></div></div>
+</div>
+
+<div class="card half"><h2>Files</h2><pre>crates/pecan/src/cli.rs       # commands
+crates/pecan/src/control.rs   # HTTP client
+crates/pecan/src/server/api.rs# existing contracts
+web/src/api/client.ts         # browser reference
+scripts/prove-cli-control.sh  # end-to-end proof</pre></div>
+<div class="card half"><h2>Explicitly not doing</h2><ul><li class="no">No second worker/runtime implementation</li><li class="no">No abstraction for other UIs/runtimes</li><li class="no">No background orchestration daemon</li><li class="no">No command to execute arbitrary code</li><li class="no">No broad CLI redesign before the control loop works</li></ul></div>
+
+<div class="card wide"><h2>Done means</h2><p class="accept">An AI agent can start sessions, talk to each session, steer or queue work, answer blocking questions, observe events, and wait for completion using only <code>pecan ... --json</code>.</p><p>That is the smallest useful control plane. Everything else remains GUI polish or a later decision.</p></div>
+</section>
+</main></body></html>
