@@ -1,73 +1,48 @@
-# rust-template
+# Pecan
 
-Tight Rust lint template tuned for coding agents.
+Pecan is a local browser UI for [Pi](https://github.com/badlogic/pi-mono) coding-agent sessions. It keeps Pi authoritative: Pecan launches the normal `pi --mode rpc` worker, reads Pi's JSONL sessions, and renders a web UI over the same local data.
 
-Source shape: audited against the Rust-specific policy patterns and heuristic rules shipped in `../slop-scan`.
+## What works
 
-## Goals
+- browse projects, sessions, and transcripts
+- send, steer, queue, abort, resume, and switch Pi models
+- stream assistant text and tool calls
+- answer Pi extension dialogs (`select`, `confirm`, `input`, `editor`)
+- render Pi extension notices, statuses, widgets, and editor-prefill updates
+- show `pi-subagents` child activity and persisted child sessions
+- show `pi-tasks` task lists and active task state
+- show `pi-workflows` runs, phases, agents, artifacts, and errors
+- use `/workflow-draft` through an RPC-safe editor/confirmation flow
 
-- fail fast on correctness and safety issues
-- bias agents toward narrow, documented, library-friendly APIs
-- explicitly deny selected allow-by-default Clippy lints for conversion safety, docs hygiene, async hazards, Cargo metadata, and ignored errors
-- block common AI-generated Rust failure modes: `unwrap`, `expect`, broad `allow`, panic-driven control flow, clone-heavy ownership workarounds, undocumented `unsafe`, and sloppy public error surfaces
-- give future Rust repos a copyable baseline instead of re-inventing lint policy
+Pecan uses your existing Pi installation and `~/.pi/agent/settings.json` by default, so installed Pi extensions continue to be discovered by Pi. For an explicit extension entry point during development, set `PECAN_PI_EXTENSIONS` to absolute paths separated by commas or whitespace.
 
-## Files
-
-- `Cargo.toml` — workspace-level Rust + Clippy lint policy
-- `.cargo/config.toml` — cargo aliases agents can run predictably
-- `clippy.toml` — test-aware Clippy configuration and disallowed methods
-- `rustfmt.toml` — deterministic formatting defaults
-- `rust-toolchain.toml` — ensures `clippy` + `rustfmt` exist
-- `deny.toml` — dependency hygiene policy via `cargo-deny`
-- `slop-scan.config.json` — explicit Rust slop heuristics with non-production overrides
-- `AGENTS.md` — authoring rules for coding agents before lint even runs
-- `docs/rust-lint-policy.md` — detailed mapping from slop-scan findings to enforcement layers
-- `.github/workflows/lint.yml` — CI example
-- `scripts/lint.sh` — single local/CI entrypoint
-
-## Use in another Rust repo
-
-1. Copy these files into the target repo.
-2. Keep a workspace root, even for single-crate repos.
-3. Add this to every crate manifest:
-
-```toml
-[lints]
-workspace = true
-```
-
-4. Adjust `members` in the root `Cargo.toml`.
-5. If the project is binary-only or intentionally uses a different docs policy, relax specific lints deliberately instead of deleting the policy wholesale.
-
-## Default validation loop
+## Run
 
 ```bash
-export RUSTFLAGS="-Dwarnings"
-cargo fmt-check
-cargo lint
+cargo run -p pecan -- serve
+```
+
+Useful options:
+
+```text
+pecan serve --no-open
+pecan serve --host 127.0.0.1 --port 7615
+pecan serve --session <id>
+pecan serve --session latest --cwd <absolute-cwd>
+```
+
+The server is local-only by default and serves the built frontend from `web/dist`.
+
+## Verify
+
+```bash
 cargo test-all
-cargo deny-check
-npx -y slop-scan scan . --lint
+cd web && npm run lint && npm run build
+cd ../pi-workflows && npm run check && npm test
 ```
 
-Or run everything through:
+The extension bridge proof is documented in [`docs/extension-dialog-proof.md`](docs/extension-dialog-proof.md), with deterministic scripts under `scripts/`.
 
-```bash
-./scripts/lint.sh
-```
+## Scope
 
-## Why both Clippy and slop-scan?
-
-Clippy catches mechanical Rust issues well. `slop-scan` covers repo-shape and AI-slop heuristics that Clippy cannot express cleanly, including:
-
-- broad lint suppression
-- unwrap / panic density in production code
-- `anyhow` or `Result<T, String>` leaking through public APIs
-- clone-heavy / string-owning ownership workarounds
-- over-broad visibility and pass-through public wrappers
-- undocumented or poorly bounded `unsafe`
-
-## Template status
-
-This repo includes `crates/template-lib` only so the template is self-validating. Real projects should rename or replace it.
+Pecan intentionally supports Pi's portable RPC UI surface rather than trying to load arbitrary TypeScript extensions into Rust or the browser. Extensions that rely on Pi's TUI-only `ctx.ui.custom()` need an RPC-safe fallback in the extension; `pi-workflows` now provides that fallback for draft review. Pi remains responsible for executing extension code and persisting its state.

@@ -27,7 +27,7 @@ pub struct WorkflowRun {
     pub started_at: Option<i64>,
     /// Epoch-millisecond completion time.
     pub finished_at: Option<i64>,
-    /// `running`, `completed`, `failed`, `cancelled`, ...
+    /// `running`, `completed`, `failed`, `aborted`, ...
     pub status: Option<String>,
     /// Currently executing phase, when the run is active.
     pub current_phase: Option<String>,

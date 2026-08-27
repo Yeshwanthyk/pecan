@@ -293,3 +293,18 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Personal reading controls. Values are updated by fonts.ts and remain
+   intentionally modest so layout stays stable while readability improves. */
+:root {
+  --ui-font-scale: 1;
+  --code-font-scale: 1;
+}
+
+body {
+  font-size: calc(14px * var(--ui-font-scale));
+}
+
+.font-mono {
+  font-size: calc(1em * var(--code-font-scale));
+}

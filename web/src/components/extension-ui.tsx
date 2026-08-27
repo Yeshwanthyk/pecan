@@ -1,4 +1,4 @@
-import { CircleDotIcon } from "lucide-react";
+import { CircleDotIcon, ListTodoIcon } from "lucide-react";
 import type { TaskGroup, TaskItem, WorkflowRun } from "~/api/types";
 import { Badge } from "~/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/components/ui/collapsible";
@@ -23,9 +23,9 @@ export function ExtensionWidgetRenderer({
 export function ActivityList({ activity }: { activity: SubagentActivity }) {
   if (activity.children.length === 0) return null;
   return (
-    <section aria-label="Subagent activity" className="rounded-lg border bg-card px-3 py-2">
+    <section aria-label="Subagent activity" aria-live="polite" className="rounded-lg border bg-card px-3 py-2">
       <div className="mb-1.5 flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
-        Agents <Badge variant="secondary">{activity.children.length}</Badge>
+        Agents working <Badge variant="secondary">{activity.children.length}</Badge>
       </div>
       <div className="flex flex-col gap-1">
         {activity.children.map((child) => (
@@ -47,10 +47,21 @@ export function ActivityList({ activity }: { activity: SubagentActivity }) {
 export function TaskListPanel({ groups }: { groups: TaskGroup[] }) {
   const tasks = groups.flatMap((group) => group.tasks);
   if (tasks.length === 0) return null;
+  const activeTasks = tasks.filter((task) => task.status === "in_progress");
+  const activeTask = activeTasks.find((task) => task.status === "in_progress");
+  const activeLabel = activeTask?.activeForm ?? activeTask?.subject;
   return (
     <Collapsible defaultOpen>
-      <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] font-medium text-muted-foreground hover:bg-accent">
-        Tasks <Badge variant="secondary">{tasks.length}</Badge>
+      <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] font-medium text-muted-foreground hover:bg-accent">
+        <ListTodoIcon className="size-3.5 shrink-0" />
+        <span className="shrink-0">Tasks</span>
+        <Badge variant="secondary">{tasks.length}</Badge>
+        {activeLabel ? (
+          <span className="ms-auto flex min-w-0 items-center gap-1 text-[11px] font-normal text-warning">
+            <CircleDotIcon className="size-3 shrink-0 animate-pulse" />
+            <span className="truncate" title={activeLabel}>{activeLabel}</span>
+          </span>
+        ) : null}
       </CollapsibleTrigger>
       <CollapsibleContent>
         <div className="flex flex-col">
@@ -60,6 +71,32 @@ export function TaskListPanel({ groups }: { groups: TaskGroup[] }) {
         </div>
       </CollapsibleContent>
     </Collapsible>
+  );
+}
+
+/** Compact header status for the task currently marked `in_progress`. */
+export function ActiveTaskStatus({ groups }: { groups: TaskGroup[] }) {
+  const activeTasks = groups
+    .flatMap((group) => group.tasks)
+    .filter((task) => task.status === "in_progress");
+  const activeTask = activeTasks.find((task) => task.status === "in_progress");
+  if (!activeTask) return null;
+  const label = activeTask.activeForm ?? activeTask.subject;
+  return (
+    <div
+      aria-label={`Working on ${label}`}
+      className="mt-1 flex min-w-0 items-center gap-1.5 text-[11px] leading-4 text-warning"
+      title={label}
+    >
+      <CircleDotIcon className="size-3 shrink-0 animate-pulse" />
+      <span className="shrink-0 font-medium">Working on</span>
+      <span className="min-w-0 truncate">{label}</span>
+      {activeTasks.length > 1 ? (
+        <span className="shrink-0 tabular-nums text-muted-foreground">
+          +{activeTasks.length - 1}
+        </span>
+      ) : null}
+    </div>
   );
 }
 

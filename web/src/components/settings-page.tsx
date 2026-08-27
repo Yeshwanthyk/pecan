@@ -18,6 +18,7 @@ import {
   type TitleModelPreset,
 } from "~/api/client";
 import { Button } from "~/components/ui/button";
+import { Input } from "~/components/ui/input";
 import { Switch } from "~/components/ui/switch";
 import {
   Select,
@@ -33,11 +34,20 @@ import {
   CURATED_UI_FONTS,
   SYSTEM_CODE,
   SYSTEM_UI,
+  addCustomCodeFont,
+  addCustomUiFont,
   loadInstalledFonts,
   readCodeFont,
+  readCodeTextSize,
+  readCustomCodeFonts,
+  readCustomUiFonts,
   readUiFont,
+  readUiTextSize,
+  saveCodeTextSize,
   saveCodeFont,
+  saveUiTextSize,
   saveUiFont,
+  type TextSize,
 } from "~/fonts";
 
 const EMPTY_PROJECTS: Array<{ cwd: string; name: string }> = [];
@@ -80,6 +90,8 @@ export function SettingsPage() {
   const [titleModel, setTitleModel] = useState<TitleModelPreset>(readTitleModelPreset);
   const [uiFont, setUiFont] = useState(readUiFont);
   const [codeFont, setCodeFont] = useState(readCodeFont);
+  const [uiTextSize, setUiTextSize] = useState<TextSize>(readUiTextSize);
+  const [codeTextSize, setCodeTextSize] = useState<TextSize>(readCodeTextSize);
 
   async function removeProject(cwd: string) {
     setRemoving(cwd);
@@ -123,8 +135,40 @@ export function SettingsPage() {
             description="Stored in this browser and applied immediately."
             title="Theme"
           />
-          <FontControl code={codeFont} kind="code" onChange={setCodeFont} title="Code font" />
-          <FontControl code={uiFont} kind="ui" onChange={setUiFont} title="UI font" />
+          <FontControl
+            code={codeFont}
+            kind="code"
+            onChange={(font) => {
+              setCodeFont(font);
+              saveCodeFont(font);
+            }}
+            title="Code font"
+          />
+          <FontControl
+            code={uiFont}
+            kind="ui"
+            onChange={(font) => {
+              setUiFont(font);
+              saveUiFont(font);
+            }}
+            title="UI font"
+          />
+          <TextSizeControl
+            onChange={(size) => {
+              setUiTextSize(size);
+              saveUiTextSize(size);
+            }}
+            title="Interface text size"
+            value={uiTextSize}
+          />
+          <TextSizeControl
+            onChange={(size) => {
+              setCodeTextSize(size);
+              saveCodeTextSize(size);
+            }}
+            title="Code text size"
+            value={codeTextSize}
+          />
         </SettingsSection>
 
         <SettingsSection icon={<SparklesIcon />} title="Thread titles">
@@ -402,6 +446,42 @@ function ThemeButton({
   );
 }
 
+function TextSizeControl({
+  title,
+  value,
+  onChange,
+}: {
+  title: string;
+  value: TextSize;
+  onChange: (size: TextSize) => void;
+}) {
+  const options: Array<{ value: TextSize; label: string }> = [
+    { value: "small", label: "Small" },
+    { value: "default", label: "Default" },
+    { value: "large", label: "Large" },
+  ];
+  return (
+    <div aria-label={title} className="flex rounded-lg bg-muted p-0.5" role="group">
+      {options.map((option) => (
+        <button
+          aria-pressed={value === option.value}
+          className={cn(
+            "min-h-8 rounded-md px-2.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            value === option.value
+              ? "bg-background font-medium text-foreground shadow-xs"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+          key={option.value}
+          onClick={() => onChange(option.value)}
+          type="button"
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function reportError(message: string) {
   window.dispatchEvent(new CustomEvent("pecan:error", { detail: message }));
 }
@@ -424,9 +504,18 @@ function FontControl({
 }) {
   const [installed, setInstalled] = useState<string[]>([]);
   const [scanning, setScanning] = useState(false);
+  const [customFonts, setCustomFonts] = useState<string[]>(() =>
+    kind === "ui" ? readCustomUiFonts() : readCustomCodeFonts(),
+  );
+  const [customFont, setCustomFont] = useState("");
   const systemLabel = kind === "ui" ? "System default (SF Pro)" : "System default (SF Mono)";
   const curated = kind === "ui" ? CURATED_UI_FONTS : CURATED_CODE_FONTS;
-  const options = [...curated, ...installed.filter((font) => !curated.includes(font))];
+  const options = [...new Set([
+    ...curated,
+    ...customFonts,
+    ...installed,
+    ...(code !== SYSTEM_UI && code !== SYSTEM_CODE ? [code] : []),
+  ])];
   const canScan = typeof (globalThis as { queryLocalFonts?: unknown }).queryLocalFonts === "function";
 
   async function scan() {
@@ -438,10 +527,38 @@ function FontControl({
     }
   }
 
+  function addFont() {
+    const value = customFont.trim();
+    if (!value) return;
+    const next = kind === "ui" ? addCustomUiFont(value) : addCustomCodeFont(value);
+    if (!next.includes(value)) return;
+    setCustomFonts(next);
+    onChange(value);
+    setCustomFont("");
+  }
+
   return (
     <SettingsRow
       control={
-        <div className="flex flex-col items-stretch gap-1.5">
+        <div className="flex w-[min(17rem,calc(100vw-2.5rem))] flex-col items-stretch gap-1.5 sm:w-64">
+          <div className="flex gap-1.5">
+            <Input
+              aria-label={`Add ${title}`}
+              className="h-8 min-w-0 flex-1 text-[13px]"
+              onChange={(event) => setCustomFont(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  addFont();
+                }
+              }}
+              placeholder="Add a font family…"
+              value={customFont}
+            />
+            <Button disabled={!customFont.trim()} onClick={addFont} size="xs" variant="ghost">
+              Add
+            </Button>
+          </div>
           <Select
             onValueChange={(next) => {
               if (!next) return;

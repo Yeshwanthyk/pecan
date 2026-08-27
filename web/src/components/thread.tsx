@@ -19,6 +19,7 @@ import {
 } from "~/components/ui/collapsible";
 import { Spinner } from "~/components/ui/spinner";
 import { ChatMarkdown, DiffBlock } from "~/components/chat-markdown";
+import { CopyButton } from "~/components/copy-button";
 import { TaskListPanel, WorkflowListPanel } from "~/components/extension-ui";
 import { useApp } from "~/store";
 import { cn } from "~/lib/utils";
@@ -304,8 +305,15 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
       </div>
       {entry.thinking ? <ThinkingFold text={entry.thinking} /> : null}
       {entry.text ? (
-        <div className="chat-md prose prose-sm break-words">
-          <ChatMarkdown text={entry.text} />
+        <div className="group/output relative">
+          <CopyButton
+            className="absolute top-0 right-0 opacity-0 group-hover/output:opacity-100 focus-visible:opacity-100"
+            label="Copy response"
+            text={entry.text}
+          />
+          <div className="chat-md prose prose-sm break-words pe-7">
+            <ChatMarkdown text={entry.text} />
+          </div>
         </div>
       ) : null}
       {tools.length > 0 ? <ToolChips tools={tools} /> : null}
@@ -416,10 +424,17 @@ function ToolBody({ tool }: { tool: ToolCall }) {
   const shown = lines.slice(0, 24).join("\n");
   return (
     <>
-      <pre className="mt-1 max-h-56 overflow-auto rounded-md bg-muted p-2.5 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
-        {shown}
-        {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
-      </pre>
+      <div className="relative mt-1">
+        <CopyButton
+          className="absolute top-1 right-1 z-10"
+          label="Copy tool output"
+          text={body}
+        />
+        <pre className="max-h-56 overflow-auto rounded-md bg-muted p-2.5 pe-10 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
+          {shown}
+          {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
+        </pre>
+      </div>
       {tool.details !== undefined ? <ToolDetails details={tool.details} /> : null}
     </>
   );
@@ -444,10 +459,17 @@ function ToolDetails({ details }: { details: unknown }) {
           Artifacts: {artifactPaths.join(" · ")}
         </div>
       ) : null}
-      <pre className="max-h-72 overflow-auto rounded-md border bg-card p-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
-        {lines.slice(0, 80).join("\n")}
-        {lines.length > 80 ? `\n… ${lines.length - 80} more lines` : ""}
-      </pre>
+      <div className="relative">
+        <CopyButton
+          className="absolute top-1 right-1 z-10"
+          label="Copy tool result"
+          text={text}
+        />
+        <pre className="max-h-72 overflow-auto rounded-md border bg-card p-2.5 pe-10 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
+          {lines.slice(0, 80).join("\n")}
+          {lines.length > 80 ? `\n… ${lines.length - 80} more lines` : ""}
+        </pre>
+      </div>
     </div>
   );
 }

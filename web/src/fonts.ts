@@ -9,9 +9,21 @@
 
 const UI_FONT_KEY = "pecan:font-ui";
 const CODE_FONT_KEY = "pecan:font-code";
+const UI_CUSTOM_FONTS_KEY = "pecan:font-ui-custom";
+const CODE_CUSTOM_FONTS_KEY = "pecan:font-code-custom";
+const UI_SIZE_KEY = "pecan:text-size-ui";
+const CODE_SIZE_KEY = "pecan:text-size-code";
 
 export const SYSTEM_UI = "system-ui";
 export const SYSTEM_CODE = "system-mono";
+
+export type TextSize = "small" | "default" | "large";
+
+export const TEXT_SIZE_SCALES: Record<TextSize, number> = {
+  small: 0.9,
+  default: 1,
+  large: 1.12,
+};
 
 /** Common device-installed proportional fonts (fallback when local scan is unavailable). */
 export const CURATED_UI_FONTS = [
@@ -45,8 +57,15 @@ const UI_FALLBACK =
   '-apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, "Segoe UI", Roboto, sans-serif';
 const CODE_FALLBACK = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
 
+function normalizeFont(font: string): string | null {
+  const value = font.trim();
+  return value.length > 0 && value.length <= 80 && /^[\p{L}\p{N} .,'_-]+$/u.test(value)
+    ? value
+    : null;
+}
+
 function familyStack(font: string, fallback: string): string {
-  return `"${font.replaceAll('"', "")}", ${fallback}`;
+  return `"${normalizeFont(font) ?? "system-ui"}", ${fallback}`;
 }
 
 /** Returns locally installed font families, or [] when unsupported/denied. */
@@ -61,7 +80,7 @@ export async function loadInstalledFonts(): Promise<string[]> {
   }
 }
 
-/** Applies stored font choices as :root variable overrides. */
+/** Applies stored font choices and size preferences as :root variable overrides. */
 export function applyFonts(): void {
   try {
     const ui = localStorage.getItem(UI_FONT_KEY);
@@ -76,6 +95,14 @@ export function applyFonts(): void {
     } else {
       document.documentElement.style.removeProperty("--font-mono");
     }
+    document.documentElement.style.setProperty(
+      "--ui-font-scale",
+      String(TEXT_SIZE_SCALES[readUiTextSize()]),
+    );
+    document.documentElement.style.setProperty(
+      "--code-font-scale",
+      String(TEXT_SIZE_SCALES[readCodeTextSize()]),
+    );
   } catch {
     /* private mode */
   }
@@ -98,21 +125,80 @@ export function readCodeFont(): string {
 }
 
 export function saveUiFont(font: string): void {
+  const normalized = normalizeFont(font);
+  if (!normalized) return;
   try {
-    localStorage.setItem(UI_FONT_KEY, font);
+    localStorage.setItem(UI_FONT_KEY, normalized);
   } catch {
-    /* private mode */
+    /* in-memory style update still works when persistence is unavailable */
   }
   applyFonts();
 }
 
 export function saveCodeFont(font: string): void {
+  const normalized = normalizeFont(font);
+  if (!normalized) return;
   try {
-    localStorage.setItem(CODE_FONT_KEY, font);
+    localStorage.setItem(CODE_FONT_KEY, normalized);
   } catch {
-    /* private mode */
+    /* in-memory style update still works when persistence is unavailable */
   }
   applyFonts();
 }
+
+function readCustomFonts(key: string): string[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
+    if (!Array.isArray(value)) return [];
+    return [...new Set(value.flatMap((font) => {
+      if (typeof font !== "string") return [];
+      const normalized = normalizeFont(font);
+      return normalized ? [normalized] : [];
+    }))];
+  } catch {
+    return [];
+  }
+}
+
+function addCustomFont(key: string, font: string): string[] {
+  const normalized = normalizeFont(font);
+  if (!normalized) return readCustomFonts(key);
+  const fonts = [...new Set([...readCustomFonts(key), normalized])];
+  try {
+    localStorage.setItem(key, JSON.stringify(fonts));
+  } catch {
+    /* The active choice still works when persistence is unavailable. */
+  }
+  return fonts;
+}
+
+export const readCustomUiFonts = () => readCustomFonts(UI_CUSTOM_FONTS_KEY);
+export const readCustomCodeFonts = () => readCustomFonts(CODE_CUSTOM_FONTS_KEY);
+export const addCustomUiFont = (font: string) => addCustomFont(UI_CUSTOM_FONTS_KEY, font);
+export const addCustomCodeFont = (font: string) => addCustomFont(CODE_CUSTOM_FONTS_KEY, font);
+
+function readTextSize(key: string): TextSize {
+  try {
+    const value = localStorage.getItem(key);
+    return value === "small" || value === "large" ? value : "default";
+  } catch {
+    return "default";
+  }
+}
+
+export const readUiTextSize = () => readTextSize(UI_SIZE_KEY);
+export const readCodeTextSize = () => readTextSize(CODE_SIZE_KEY);
+
+function saveTextSize(key: string, size: TextSize): void {
+  try {
+    localStorage.setItem(key, size);
+  } catch {
+    /* The current page still receives the style update. */
+  }
+  applyFonts();
+}
+
+export const saveUiTextSize = (size: TextSize) => saveTextSize(UI_SIZE_KEY, size);
+export const saveCodeTextSize = (size: TextSize) => saveTextSize(CODE_SIZE_KEY, size);
 
 applyFonts();

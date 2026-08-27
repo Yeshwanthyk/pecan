@@ -31,7 +31,7 @@ export function ExtensionHost({
   const asks = useApp((state) => state.pendingAsks[sessionId] ?? NO_ASKS);
   if (asks.length === 0 || settled) return null;
   return (
-    <div className="mx-auto w-full max-w-[46rem] px-4 pb-1 md:px-6">
+    <div aria-live="polite" className="mx-auto w-full max-w-[46rem] px-4 pb-1 md:px-6">
       <div className="flex flex-col gap-2">
         {asks.map((ask) => (
           <DialogCard key={ask.id} ask={ask} sessionId={sessionId} />
@@ -163,6 +163,9 @@ function DialogBody({
             </button>
           </li>
         ))}
+        {(ask.options ?? []).length === 0 ? (
+          <li className="text-[13px] text-muted-foreground">No options were provided.</li>
+        ) : null}
       </ul>
     );
   }

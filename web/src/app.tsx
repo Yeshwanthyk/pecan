@@ -16,6 +16,7 @@ import { AppSidebar, useHash } from "~/components/app-sidebar";
 import { Composer } from "~/components/composer";
 import { ExtensionHost } from "~/components/extension-host";
 import { ExtensionChrome } from "~/components/extension-chrome";
+import { ActiveTaskStatus } from "~/components/extension-ui";
 import { SettingsPage } from "~/components/settings-page";
 import { Thread, threadChangeCount } from "~/components/thread";
 import { SubagentStrip } from "~/components/subagent-strip";
@@ -289,6 +290,7 @@ function HeaderContext({
             </>
           ) : null}
         </div>
+        <ActiveTaskStatus groups={data.tasks} />
       </div>
       <Button
         aria-label="Open workspace diff"

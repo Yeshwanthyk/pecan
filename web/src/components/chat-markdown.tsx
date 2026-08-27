@@ -3,7 +3,7 @@
  * blocks (+/- line coloring) for ```diff fences. Diagram fences remain
  * inspectable source instead of pulling a multi-megabyte renderer into Pecan.
  */
-import { memo, type ReactNode } from "react";
+import { isValidElement, memo, type ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
@@ -62,7 +62,7 @@ type CodeProps = {
 };
 
 function CodeFence({ className, children }: CodeProps) {
-  const raw = String(children ?? "");
+  const raw = nodeText(children);
   const inline = !className?.includes("language-") && !raw.includes("\n");
   if (inline) {
     return (
@@ -95,8 +95,9 @@ export function DiffBlock({ code }: { code: string }) {
   const lines = code.replace(/\n$/, "").split("\n");
   return (
     <div className="my-3 overflow-hidden rounded-lg border bg-card">
-      <div className="border-b bg-muted/50 px-3 py-1 font-mono text-[11px] text-muted-foreground">
-        diff
+      <div className="flex items-center border-b bg-muted/50 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+        <span>diff</span>
+        <CopyButton className="ml-auto" label="Copy diff" text={code} />
       </div>
       <pre className="overflow-x-auto p-0 font-mono text-[12px] leading-[1.6]">
         {lines.map((line, i) => (
@@ -116,4 +117,16 @@ export function DiffBlock({ code }: { code: string }) {
       </pre>
     </div>
   );
+}
+
+/** Extracts source text from highlighted React children without stringifying spans. */
+function nodeText(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (isValidElement(node)) {
+    const props = node.props as { children?: ReactNode };
+    return nodeText(props.children);
+  }
+  return "";
 }
