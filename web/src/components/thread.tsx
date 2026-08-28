@@ -377,7 +377,6 @@ function UserImages({ images, hasText }: { images: UserEntry["images"]; hasText:
               alt={`Attached image ${index + 1}`}
               className="h-20 w-16 bg-muted object-cover object-top sm:h-24 sm:w-20"
               decoding="async"
-              loading="lazy"
               src={source}
             />
           </a>
