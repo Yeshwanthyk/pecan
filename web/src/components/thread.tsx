@@ -151,18 +151,14 @@ function TurnBlock({ turn }: { turn: Turn }) {
   );
 }
 
-/**
- * Groups consecutive assistant entries that carry only tools into one
- * collapsed row, so streaming turns read quietly instead of repeating the
- * "pecan · model" header per entry. Thinking-bearing entries stay visible.
- */
+/** Groups consecutive tool-loop entries into one quiet activity block. */
 const ToolRunBlock = memo(function ToolRunBlock({
   entries,
 }: {
   entries: DatedEntry[];
 }) {
   const blocks: Array<
-    | { kind: "run"; tools: ToolCall[] }
+    | { kind: "run"; tools: ToolCall[]; thoughts: string[]; model: string | null }
     | { kind: "entry"; dated: DatedEntry }
   > = [];
   for (const dated of entries) {
@@ -170,8 +166,7 @@ const ToolRunBlock = memo(function ToolRunBlock({
     const isRunPart =
       entry.kind === "assistant" &&
       !entry.text &&
-      !entry.thinking &&
-      (entry.tools?.length ?? 0) > 0;
+      ((entry.tools?.length ?? 0) > 0 || Boolean(entry.thinking));
     if (!isRunPart) {
       blocks.push({ kind: "entry", dated });
       continue;
@@ -179,8 +174,14 @@ const ToolRunBlock = memo(function ToolRunBlock({
     const last = blocks.at(-1);
     if (last?.kind === "run") {
       last.tools.push(...(entry.tools ?? []));
+      if (entry.thinking) last.thoughts.push(entry.thinking);
     } else {
-      blocks.push({ kind: "run", tools: [...(entry.tools ?? [])] });
+      blocks.push({
+        kind: "run",
+        tools: [...(entry.tools ?? [])],
+        thoughts: entry.thinking ? [entry.thinking] : [],
+        model: entry.model ?? null,
+      });
     }
   }
 
@@ -188,7 +189,12 @@ const ToolRunBlock = memo(function ToolRunBlock({
     <>
       {blocks.map((block, index) =>
         block.kind === "run" ? (
-          <ToolRun key={runKey(index, block.tools)} tools={block.tools} />
+          <ToolRun
+            key={runKey(index, block.tools)}
+            model={block.model}
+            thoughts={block.thoughts}
+            tools={block.tools}
+          />
         ) : (
           <EntryRow key={entryKey(block.dated)} dated={block.dated} />
         ),
@@ -201,9 +207,24 @@ function runKey(index: number, tools: ToolCall[]) {
   return `run-${index}-${tools[0]?.toolCallId ?? ""}`;
 }
 
-/** One tool run, collapsed until the reader asks for its categorized actions. */
-function ToolRun({ tools }: { tools: ToolCall[] }) {
-  return <ToolActivity tools={tools} />;
+/** One compact tool loop: one header, latest thought, one activity row. */
+function ToolRun({
+  tools,
+  thoughts,
+  model,
+}: {
+  tools: ToolCall[];
+  thoughts: string[];
+  model: string | null;
+}) {
+  const latestThought = thoughts.at(-1);
+  return (
+    <div className="py-1.5">
+      <AssistantByline model={model} />
+      {latestThought ? <ThinkingLine text={latestThought} /> : null}
+      {tools.length > 0 ? <ToolActivity tools={tools} /> : null}
+    </div>
+  );
 }
 
 type ToolCategory = ToolCall["category"];
@@ -392,16 +413,11 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
   const tools = entry.tools ?? [];
   return (
     <div className="py-2">
-      <div className="mb-1 flex h-5 items-center gap-2 text-[11px] font-medium text-muted-foreground/80">
-        pecan
-        {entry.model ? (
-          <span className="font-normal">{shortModel(entry.model)}</span>
-        ) : null}
-        {!entry.text && tools.length === 0 && !entry.thinking ? (
-          <Spinner className="size-3" />
-        ) : null}
-      </div>
-      {entry.thinking ? <ThinkingFold text={entry.thinking} /> : null}
+      <AssistantByline
+        loading={!entry.text && tools.length === 0 && !entry.thinking}
+        model={entry.model ?? null}
+      />
+      {entry.thinking ? <ThinkingLine text={entry.thinking} /> : null}
       {entry.text ? (
         <div className="group/output relative">
           <CopyButton
@@ -419,20 +435,30 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
   );
 }
 
-function ThinkingFold({ text }: { text: string }) {
+function AssistantByline({ model, loading = false }: { model: string | null; loading?: boolean }) {
   return (
-    <Collapsible className="mb-2">
-      <CollapsibleTrigger className="group -ml-1.5 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground">
-        <ChevronRightIcon className="size-3 transition-transform group-data-[panel-open]:rotate-90" />
-        thinking
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="mt-1 mb-2 ml-1 max-h-64 overflow-y-auto border-l-2 pl-3 text-[13px] leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">
-          {text}
-        </div>
-      </CollapsibleContent>
-    </Collapsible>
+    <div className="mb-1 flex h-5 items-center gap-2 text-[11px] font-medium text-muted-foreground/80">
+      pecan
+      {model ? <span className="font-normal">{shortModel(model)}</span> : null}
+      {loading ? <Spinner className="size-3" /> : null}
+    </div>
   );
+}
+
+function ThinkingLine({ text }: { text: string }) {
+  return (
+    <p className="mb-1.5 line-clamp-2 text-[12px] font-semibold italic leading-relaxed text-muted-foreground/65">
+      {plainThought(text)}
+    </p>
+  );
+}
+
+function plainThought(text: string): string {
+  return text
+    .trim()
+    .replace(/^\*\*(.+)\*\*$/s, "$1")
+    .replace(/^__(.+)__$/s, "$1")
+    .replace(/\s+/g, " ");
 }
 
 /** Renders the bounded raw argument preview and any structured tool result. */
