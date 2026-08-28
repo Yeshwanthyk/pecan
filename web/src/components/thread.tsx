@@ -1,14 +1,14 @@
 /**
  * Thread view: scrollable transcript with turn folding, user bubbles,
- * collapsible thinking + tool chips (capped with "+N" expander), ask_user
- * cards and workspace-change summaries. Pins to bottom while the reader is already
- * near it so streaming never yanks the viewport.
+ * collapsible thinking + deterministic tool activity, ask_user cards and
+ * workspace-change summaries. Pins to bottom while the reader is already near
+ * it so streaming never yanks the viewport.
  */
 import {
+  ActivityIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CircleAlertIcon,
-  WrenchIcon,
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { DatedEntry, ThreadEntry, ThreadView, ToolCall } from "~/api/types";
@@ -25,7 +25,26 @@ import { useApp } from "~/store";
 import { cn } from "~/lib/utils";
 
 const OPEN_TURNS = 3;
-const MAX_VISIBLE_TOOLS = 4;
+const TOOL_CATEGORY_ORDER: ToolCategory[] = [
+  "inspect",
+  "change",
+  "check",
+  "research",
+  "agent",
+  "task",
+  "runtime",
+  "other",
+];
+const TOOL_CATEGORY_LABELS: Record<ToolCategory, string> = {
+  inspect: "Inspect",
+  change: "Changes",
+  check: "Checks",
+  research: "Research",
+  agent: "Agents",
+  task: "Task plan",
+  runtime: "Runtime",
+  other: "Other",
+};
 
 export function Thread({ data }: { data: ThreadView }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -133,9 +152,9 @@ function TurnBlock({ turn }: { turn: Turn }) {
 }
 
 /**
- * Groups consecutive assistant entries that carry no text (tool/thinking
- * runs) into one collapsed row, so streaming turns read quietly instead of
- * repeating the "pecan · model" header per entry.
+ * Groups consecutive assistant entries that carry only tools into one
+ * collapsed row, so streaming turns read quietly instead of repeating the
+ * "pecan · model" header per entry. Thinking-bearing entries stay visible.
  */
 const ToolRunBlock = memo(function ToolRunBlock({
   entries,
@@ -143,7 +162,7 @@ const ToolRunBlock = memo(function ToolRunBlock({
   entries: DatedEntry[];
 }) {
   const blocks: Array<
-    | { kind: "run"; tools: ToolCall[]; model: string | null }
+    | { kind: "run"; tools: ToolCall[] }
     | { kind: "entry"; dated: DatedEntry }
   > = [];
   for (const dated of entries) {
@@ -151,7 +170,8 @@ const ToolRunBlock = memo(function ToolRunBlock({
     const isRunPart =
       entry.kind === "assistant" &&
       !entry.text &&
-      ((entry.tools?.length ?? 0) > 0 || Boolean(entry.thinking));
+      !entry.thinking &&
+      (entry.tools?.length ?? 0) > 0;
     if (!isRunPart) {
       blocks.push({ kind: "entry", dated });
       continue;
@@ -160,7 +180,7 @@ const ToolRunBlock = memo(function ToolRunBlock({
     if (last?.kind === "run") {
       last.tools.push(...(entry.tools ?? []));
     } else {
-      blocks.push({ kind: "run", tools: [...(entry.tools ?? [])], model: entry.model ?? null });
+      blocks.push({ kind: "run", tools: [...(entry.tools ?? [])] });
     }
   }
 
@@ -168,7 +188,7 @@ const ToolRunBlock = memo(function ToolRunBlock({
     <>
       {blocks.map((block, index) =>
         block.kind === "run" ? (
-          <ToolRun key={runKey(index, block.tools)} model={block.model} tools={block.tools} />
+          <ToolRun key={runKey(index, block.tools)} tools={block.tools} />
         ) : (
           <EntryRow key={entryKey(block.dated)} dated={block.dated} />
         ),
@@ -181,60 +201,105 @@ function runKey(index: number, tools: ToolCall[]) {
   return `run-${index}-${tools[0]?.toolCallId ?? ""}`;
 }
 
-/** One tool run: shows its tool chips by default, with a compact toggle. */
-function ToolRun({ tools, model }: { tools: ToolCall[]; model: string | null }) {
-  const [open, setOpen] = useState(true);
-  const summary = runSummary(tools);
+/** One tool run, collapsed until the reader asks for its categorized actions. */
+function ToolRun({ tools }: { tools: ToolCall[] }) {
+  return <ToolActivity tools={tools} />;
+}
+
+type ToolCategory = ToolCall["category"];
+type ToolGroup = { category: ToolCategory; tools: ToolCall[] };
+
+function ToolActivity({ tools }: { tools: ToolCall[] }) {
+  const groups = groupTools(tools);
+  const firstSummary = tools[0]?.summary;
+  const title =
+    tools.length === 1
+      ? (firstSummary ?? "Tool activity")
+      : firstSummary
+        ? `${firstSummary} + ${tools.length - 1} more actions`
+        : "Tool activity";
   return (
-    <div className="py-0.5">
-      <button
-        aria-expanded={open}
-        className="group flex w-full items-center gap-2 rounded-md px-1 py-0.5 -ml-1 text-left text-[11px] font-medium text-muted-foreground/80 hover:bg-accent hover:text-foreground"
-        onClick={() => setOpen((value) => !value)}
-        type="button"
+    <Collapsible className="my-1 min-w-0" defaultOpen={false}>
+      <CollapsibleTrigger
+        aria-label={`Show ${tools.length} tool ${tools.length === 1 ? "action" : "actions"}`}
+        className="group flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-1.5 text-left text-[12px] text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
       >
-        <ChevronRightIcon
-          className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")}
-        />
-        <span className="shrink-0">pecan</span>
-        {model ? (
-          <span className="shrink-0 font-normal">{shortModel(model)}</span>
-        ) : null}
-        <span className="min-w-0 truncate font-normal opacity-80">
-          {summary}
+        <ActivityIcon className="size-3.5 shrink-0 opacity-70" />
+        <span className="min-w-0 flex-1 truncate font-medium">{title}</span>
+        <span className="shrink-0 tabular-nums text-[11px] opacity-70">
+          {tools.length} {tools.length === 1 ? "action" : "actions"}
         </span>
-        <span className="ms-auto shrink-0 tabular-nums opacity-70">
-          {tools.length} tools
-        </span>
-      </button>
-      {open ? (
-        <div className="mt-1 flex flex-wrap items-center gap-1 ps-4">
-          <ToolChips tools={tools} forceAll />
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[panel-open]:rotate-90" />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="mt-0.5 border-t ps-1 sm:ps-4">
+          {groups.map((group) => (
+            <ToolActivityGroup group={group} key={group.category} />
+          ))}
         </div>
-      ) : null}
-    </div>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
-/** Short human summary for a collapsed run: files touched or command head. */
-function runSummary(tools: ToolCall[]): string {
-  const paths = new Set<string>();
-  let firstCommand = "";
+function groupTools(tools: ToolCall[]): ToolGroup[] {
+  const grouped = new Map<ToolCategory, ToolCall[]>();
   for (const tool of tools) {
-    const path = filePathOf(tool.argsPreview);
-    if (path) {
-      paths.add(path.split("/").at(-1) ?? path);
-      continue;
-    }
-    const body = previewBody(tool.argsPreview);
-    if (!firstCommand && body.length > 0) {
-      firstCommand = body.split("\n")[0]?.slice(0, 40) ?? "";
-    }
+    const current = grouped.get(tool.category);
+    if (current) current.push(tool);
+    else grouped.set(tool.category, [tool]);
   }
-  const parts: string[] = [];
-  if (paths.size > 0) parts.push([...paths].slice(0, 3).join(", "));
-  if (firstCommand) parts.push(firstCommand);
-  return parts.join(" · ");
+  return TOOL_CATEGORY_ORDER.flatMap((category) => {
+    const categoryTools = grouped.get(category);
+    return categoryTools ? [{ category, tools: categoryTools }] : [];
+  });
+}
+
+function ToolActivityGroup({ group }: { group: ToolGroup }) {
+  const isTaskPlan = group.category === "task";
+  return (
+    <Collapsible defaultOpen={!isTaskPlan}>
+      <CollapsibleTrigger className="group flex min-h-11 w-full items-center gap-2 px-1.5 text-[11px] font-medium text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-8">
+        <ChevronRightIcon className="size-3 shrink-0 transition-transform group-data-[panel-open]:rotate-90" />
+        <span>{TOOL_CATEGORY_LABELS[group.category]}</span>
+        <span className="ms-auto tabular-nums opacity-70">{group.tools.length}</span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="pb-1">
+          {group.tools.map((tool, index) => (
+            <ToolAction key={`${tool.toolCallId}-${index}`} tool={tool} />
+          ))}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+function ToolAction({ tool }: { tool: ToolCall }) {
+  const body = previewBody(tool.argsPreview);
+  const diff = looksLikeDiff(body);
+  return (
+    <Collapsible>
+      <CollapsibleTrigger
+        className="group flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-1.5 text-left text-[12px] text-foreground/85 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
+        title={tool.summary}
+      >
+        <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground transition-transform group-data-[panel-open]:rotate-90" />
+        <span className="min-w-0 flex-1 truncate">{tool.summary}</span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="pb-2 ps-5 pe-1 sm:ps-6">
+          {tool.targetCount > 0 ? (
+            <div className="mb-1 text-[11px] text-muted-foreground">
+              Targets ({tool.targetCount}): {tool.targets.join(", ") || "not retained"}
+            </div>
+          ) : null}
+          {diff ? <DiffBlock code={body} /> : null}
+          <ToolBody showArguments={!diff} tool={tool} />
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
 }
 
 /** Memoized so unchanged entries skip re-render on SSE refreshes. */
@@ -333,7 +398,7 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
         {entry.model ? (
           <span className="font-normal">{shortModel(entry.model)}</span>
         ) : null}
-        {!entry.text && tools.length === 0 ? (
+        {!entry.text && tools.length === 0 && !entry.thinking ? (
           <Spinner className="size-3" />
         ) : null}
       </div>
@@ -350,7 +415,7 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
           </div>
         </div>
       ) : null}
-      {tools.length > 0 ? <ToolChips tools={tools} /> : null}
+      {tools.length > 0 ? <ToolActivity tools={tools} /> : null}
     </div>
   );
 }
@@ -371,104 +436,26 @@ function ThinkingFold({ text }: { text: string }) {
   );
 }
 
-function ToolChips({
-  tools,
-  forceAll = false,
-}: {
-  tools: ToolCall[];
-  forceAll?: boolean;
-}) {
-  const [showAll, setShowAll] = useState(false);
-  const showEverything = showAll || forceAll;
-  const visible = showEverything ? tools : tools.slice(0, MAX_VISIBLE_TOOLS);
-  const hiddenCount = tools.length - visible.length;
-  return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-1">
-      {visible.map((tool) => (
-        <ToolChip key={tool.toolCallId} tool={tool} />
-      ))}
-      {!showAll && hiddenCount > 0 ? (
-        <button
-          className="rounded-md border border-dashed px-2 py-0.5 font-mono text-[11px] text-muted-foreground hover:bg-accent"
-          onClick={() => setShowAll(true)}
-          type="button"
-        >
-          +{hiddenCount} more
-        </button>
-      ) : null}
-      {showAll && tools.length > MAX_VISIBLE_TOOLS ? (
-        <button
-          className="rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent"
-          onClick={() => setShowAll(false)}
-          type="button"
-        >
-          less
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-function ToolChip({ tool }: { tool: ToolCall }) {
-  const label = chipLabel(tool);
-  return (
-    <Collapsible className="min-w-0">
-      <CollapsibleTrigger
-        className="group flex min-w-0 max-w-full items-center gap-1 rounded-md border bg-card px-2 py-0.5 font-mono text-[11px] text-muted-foreground normal-case hover:bg-accent hover:text-foreground"
-        title={previewBody(tool.argsPreview).split("\n")[0]?.slice(0, 160)}
-      >
-        <WrenchIcon className="size-3 shrink-0 opacity-60" />
-        <span className="truncate">{label}</span>
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        {looksLikeDiff(previewBody(tool.argsPreview)) ? (
-          <DiffBlock code={previewBody(tool.argsPreview)} />
-        ) : (
-          <ToolBody tool={tool} />
-        )}
-      </CollapsibleContent>
-    </Collapsible>
-  );
-}
-
-/** Chip label differentiates targets: file basename for file tools,
- *  command head for bash, otherwise the bare tool name. */
-function chipLabel(tool: ToolCall): string {
-    const path = filePathOf(tool.argsPreview);
-    if (path) {
-      const base = path.split("/").at(-1) ?? path;
-      const action =
-        tool.name.toLowerCase() === "write" || tool.name.toLowerCase() === "create"
-          ? "+"
-          : "~";
-      return `${action} ${base}`;
-    }
-    if (tool.name.toLowerCase() === "bash") {
-      const command = previewBody(tool.argsPreview).split("\n")[0] ?? "";
-      const trimmed = command.length > 28 ? `${command.slice(0, 28)}…` : command;
-      if (trimmed) return `$ ${trimmed}`;
-    }
-    return tool.name;
-}
-
-/** Renders a tool body: unwrapped JSON fields, mono pre with head cap. */
-function ToolBody({ tool }: { tool: ToolCall }) {
+/** Renders the bounded raw argument preview and any structured tool result. */
+function ToolBody({ tool, showArguments = true }: { tool: ToolCall; showArguments?: boolean }) {
   const body = previewBody(tool.argsPreview);
   const lines = body.split("\n");
   const shown = lines.slice(0, 24).join("\n");
   return (
     <>
-      <div className="relative mt-1">
-        <CopyButton
-          className="absolute top-1 right-1 z-10"
-          label="Copy tool output"
-          text={body}
-        />
-        <pre className="max-h-56 overflow-auto rounded-md bg-muted p-2.5 pe-10 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
-          {shown}
-          {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
-        </pre>
-      </div>
+      {showArguments ? (
+        <div className="relative mt-1">
+          <CopyButton
+            className="absolute top-1 right-1 z-10"
+            label="Copy tool arguments"
+            text={body}
+          />
+          <pre className="max-h-56 overflow-auto rounded-md bg-muted p-2.5 pe-10 font-mono text-[11.5px] leading-relaxed break-words whitespace-pre-wrap">
+            {shown}
+            {lines.length > 24 ? `\n… ${lines.length - 24} more lines` : ""}
+          </pre>
+        </div>
+      ) : null}
       {tool.details !== undefined ? <ToolDetails details={tool.details} /> : null}
     </>
   );
@@ -525,35 +512,25 @@ function looksLikeDiff(text: string): boolean {
 
 type AskUserEntry = Extract<ThreadEntry, { kind: "askUser" }>;
 
-type ThreadChange = { path: string; previews: string[] };
+const CHANGE_TOOL_NAMES = new Set(["edit", "write", "create", "multiedit"]);
 
-function collectChanges(entries: DatedEntry[]): ThreadChange[] {
-  const byPath = new Map<string, ThreadChange>();
+function collectChanges(entries: DatedEntry[]): string[] {
+  const paths = new Set<string>();
   for (const dated of entries) {
     if (dated.entry.kind !== "assistant") continue;
     for (const tool of dated.entry.tools ?? []) {
-      const lower = tool.name.toLowerCase();
-      if (!["edit", "write", "create", "multiedit"].includes(lower)) continue;
-      const path = filePathOf(tool.argsPreview);
-      if (!path) continue;
-      const existing = byPath.get(path);
-      if (existing) existing.previews.push(tool.argsPreview);
-      else byPath.set(path, { path, previews: [tool.argsPreview] });
+      // Preserve the header's historical meaning: count file paths from the
+      // file-edit tools only, not every action classified as a change.
+      if (!CHANGE_TOOL_NAMES.has(tool.name.toLowerCase())) continue;
+      for (const target of tool.targets) paths.add(target);
     }
   }
-  return [...byPath.values()];
+  return [...paths];
 }
 
 /** Number shown in the persistent header's Diff action. */
 export function threadChangeCount(entries: DatedEntry[]): number {
   return collectChanges(entries).length;
-}
-
-/** Pulls a file path out of a tool argsPreview: `[path]` prefix or JSON field. */
-function filePathOf(preview: string): string | null {
-  const bracket = /^\s*\[([^\]\n]+)\]/.exec(preview);
-  if (bracket?.[1]) return bracket[1];
-  return jsonStringField(preview, ["filePath", "file_path", "path", "notebookPath"]);
 }
 
 /**

@@ -139,10 +139,26 @@ export const SessionPage = Object({
 });
 export type SessionPage = Static<typeof SessionPage>;
 
+export const ToolCategory = Union([
+  Literal("inspect"),
+  Literal("change"),
+  Literal("check"),
+  Literal("research"),
+  Literal("agent"),
+  Literal("task"),
+  Literal("runtime"),
+  Literal("other"),
+]);
+export type ToolCategory = Static<typeof ToolCategory>;
+
 export const ToolCall = Object({
   toolCallId: String(),
   name: String(),
   argsPreview: String(),
+  summary: String(),
+  category: ToolCategory,
+  targets: Array(String()),
+  targetCount: Number(),
   details: Optional(Unknown()),
 });
 export type ToolCall = Static<typeof ToolCall>;
