@@ -7,6 +7,7 @@ use axum::response::Sse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
+use pecan_core::session::SessionKind;
 use pecan_core::thread;
 use serde::Deserialize;
 use std::time::Duration;
@@ -100,11 +101,14 @@ async fn bootstrap(State(app): State<App>) -> Result<Json<serde_json::Value>, Ap
     } else {
         let added_cwds: std::collections::HashSet<&str> =
             project_rows.iter().map(|(cwd, _)| cwd.as_str()).collect();
-        snap.sessions
+        let mut rows: Vec<&SessionRow> = snap
+            .sessions
             .iter()
             .filter(|row| added_cwds.contains(row.summary.cwd.as_str()))
-            .take(MAX_PAGE)
-            .collect()
+            .collect();
+        rows.sort_by_key(|row| list_order(row));
+        rows.truncate(MAX_PAGE);
+        rows
     };
     Ok(Json(serde_json::json!({
         "seeded": seeded,
@@ -149,8 +153,23 @@ async fn set_ui_plugin(
     Ok(Json(descriptor))
 }
 
+/// Page order for list views: threads before subagents (only reached via
+/// their parent), active before Done, then most recently active first, so the
+/// page cap never hides a thread behind old child runs.
+fn list_order(row: &SessionRow) -> (bool, bool, std::cmp::Reverse<jiff::Timestamp>) {
+    (
+        row.summary.kind == SessionKind::Subagent,
+        row.settled,
+        std::cmp::Reverse(row.summary.last_activity),
+    )
+}
+
+/// User-opened sessions in a project; subagents are not threads of their own.
 fn session_count(snap: &IndexSnapshot, cwd: &str) -> usize {
-    snap.sessions.iter().filter(|s| s.summary.cwd == cwd).count()
+    snap.sessions
+        .iter()
+        .filter(|s| s.summary.cwd == cwd && s.summary.kind == SessionKind::Normal)
+        .count()
 }
 
 fn last_activity(snap: &IndexSnapshot, cwd: &str) -> Option<String> {
@@ -213,12 +232,13 @@ async fn sessions(
     };
     let limit = query.limit.unwrap_or(DEFAULT_PAGE).min(MAX_PAGE);
     let offset = query.offset.unwrap_or(0);
-    let matching: Vec<&SessionRow> = snap
+    let mut matching: Vec<&SessionRow> = snap
         .sessions
         .iter()
         .filter(|row| query.project.as_deref().is_none_or(|p| row.summary.cwd == p))
         .filter(|row| added_cwds.as_ref().is_none_or(|cwds| cwds.contains(&row.summary.cwd)))
         .collect();
+    matching.sort_by_key(|row| list_order(row));
     let page: Vec<&SessionRow> = matching.iter().skip(offset).take(limit).copied().collect();
     Ok(Json(serde_json::json!({
         "total": matching.len(),
@@ -795,9 +815,15 @@ async fn add_project(
     if !body.cwd.starts_with('/') {
         return Err(ApiError::bad_request("cwd must be absolute".into()));
     }
+    let snap = app.snapshot().await;
+    let idle = pecan_core::session::idle_session_ids(
+        snap.sessions.iter().map(|row| &row.summary),
+        &body.cwd,
+        jiff::Timestamp::now(),
+    );
     {
         let store = lock(&app)?;
-        store.add_project(&body.cwd)?;
+        store.add_project(&body.cwd, idle)?;
     }
     app.refresh().await?;
     Ok(Json(serde_json::json!({"added": true})))
@@ -1656,4 +1682,46 @@ fn reject_global_route(app: &App) -> Result<(), ApiError> {
         return Err(ApiError::not_found("not available in single-session mode"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, kind: SessionKind, settled: bool, last_activity: &str) -> SessionRow {
+        let at = last_activity.parse::<jiff::Timestamp>().expect("valid test timestamp");
+        SessionRow {
+            summary: pecan_core::session::SessionSummary {
+                id: id.to_owned(),
+                path: std::path::PathBuf::from(format!("/{id}.jsonl")),
+                cwd: "/p".to_owned(),
+                opened_at: at,
+                last_activity: at,
+                bytes: 1,
+                provider: None,
+                model: None,
+                preview: None,
+                title: None,
+                kind,
+                agent_name: None,
+            },
+            settled,
+            pinned: false,
+            waiting_askuser: false,
+            parent_session_id: None,
+        }
+    }
+
+    #[test]
+    fn list_order_puts_threads_before_children_and_done_last() {
+        let mut rows = [
+            row("new-child", SessionKind::Subagent, false, "2026-09-27T10:00:00Z"),
+            row("done", SessionKind::Normal, true, "2026-09-27T09:00:00Z"),
+            row("old", SessionKind::Normal, false, "2026-09-01T00:00:00Z"),
+            row("recent", SessionKind::Normal, false, "2026-09-26T00:00:00Z"),
+        ];
+        rows.sort_by_key(list_order);
+        let ids: Vec<&str> = rows.iter().map(|row| row.summary.id.as_str()).collect();
+        assert_eq!(ids, ["recent", "old", "done", "new-child"]);
+    }
 }

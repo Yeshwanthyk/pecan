@@ -157,10 +157,10 @@ mod tests {
         let ids: Vec<&str> = rows.iter().filter_map(|row| row["id"].as_str()).collect();
         assert_eq!(
             ids,
-            vec![WORKFLOW_CHILD, PARENT],
-            "scope keeps only the run's child: {sessions}"
+            vec![PARENT, WORKFLOW_CHILD],
+            "scope keeps only the run's child, listed after its thread: {sessions}"
         );
-        assert_eq!(rows[0]["parentSessionId"], json!(PARENT), "linked via run id: {sessions}");
+        assert_eq!(rows[1]["parentSessionId"], json!(PARENT), "linked via run id: {sessions}");
 
         let (status, _) = get_json(&addr, &format!("/api/session/{PLAIN_SESSION}"))
             .expect("request out-of-scope session");

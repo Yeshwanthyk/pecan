@@ -39,6 +39,29 @@ pub enum SessionKind {
     Subagent,
 }
 
+/// How long a session may sit idle before linking its project archives it.
+pub const ARCHIVE_IDLE_SECS: i64 = 2 * 24 * 60 * 60;
+
+/// Ids of user-opened sessions in `cwd` whose last activity is more than
+/// [`ARCHIVE_IDLE_SECS`] before `now`. Subagents are left alone: they are
+/// reached through their parent, never listed on their own.
+pub fn idle_session_ids<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionSummary>,
+    cwd: &str,
+    now: Timestamp,
+) -> Vec<&'a str> {
+    sessions
+        .into_iter()
+        .filter(|session| {
+            session.cwd == cwd
+                && session.kind == SessionKind::Normal
+                && now.as_second().saturating_sub(session.last_activity.as_second())
+                    > ARCHIVE_IDLE_SECS
+        })
+        .map(|session| session.id.as_str())
+        .collect()
+}
+
 /// Lightweight per-session data used by list views.
 ///
 /// Transcript metadata is derived from bounded reads; user-owned overrides
@@ -232,6 +255,41 @@ mod tests {
         assert_eq!(header.cwd, "/tmp/proj");
         assert_eq!(header.provider.as_deref(), Some("anthropic"));
         assert_eq!(header.model_id.as_deref(), Some("m1"));
+    }
+
+    fn summary(id: &str, cwd: &str, last_activity: &str) -> SessionSummary {
+        let at = last_activity.parse::<Timestamp>().expect("valid test timestamp");
+        SessionSummary {
+            id: id.to_owned(),
+            path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            cwd: cwd.to_owned(),
+            opened_at: at,
+            last_activity: at,
+            bytes: 0,
+            provider: None,
+            model: None,
+            preview: None,
+            title: None,
+            kind: SessionKind::Normal,
+            agent_name: None,
+        }
+    }
+
+    #[test]
+    fn idle_sessions_are_older_than_two_days_in_that_cwd() {
+        let now = "2026-09-27T12:00:00Z".parse::<Timestamp>().expect("now");
+        let sessions = [
+            summary("fresh", "/p", "2026-09-26T12:00:00Z"),
+            summary("edge", "/p", "2026-09-25T12:00:00Z"),
+            summary("old", "/p", "2026-09-20T12:00:00Z"),
+            summary("other", "/q", "2026-09-01T12:00:00Z"),
+            SessionSummary {
+                kind: SessionKind::Subagent,
+                ..summary("old-child", "/p", "2026-09-20T12:00:00Z")
+            },
+        ];
+        assert_eq!(idle_session_ids(&sessions, "/p", now), vec!["old"]);
+        assert!(idle_session_ids(&sessions, "/none", now).is_empty());
     }
 
     #[test]

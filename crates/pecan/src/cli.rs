@@ -216,7 +216,13 @@ pub(crate) fn open_store(paths: &PiPaths) -> pecan_core::Result<StateStore> {
 
 fn add_remove(rest: &[String], add: bool) -> Result<(), CliError> {
     let cwd = arg(rest, "<cwd>")?;
-    with_store(|store| if add { store.add_project(cwd) } else { store.remove_project(cwd) })?;
+    if add {
+        let sessions = scan_all(&paths()?)?;
+        let idle = pecan_core::session::idle_session_ids(&sessions, cwd, Timestamp::now());
+        with_store(|store| store.add_project(cwd, idle).map(drop))?;
+    } else {
+        with_store(|store| store.remove_project(cwd))?;
+    }
     println!("{} {}", if add { "added" } else { "removed" }, display_name(cwd));
     Ok(())
 }

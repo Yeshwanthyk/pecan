@@ -225,19 +225,42 @@ impl StateStore {
         )?)
     }
 
-    /// Marks a project as added to the sidebar.
+    /// Marks a project as added to the sidebar. When it was not already
+    /// added, the `idle` sessions move to Done in the same transaction so the
+    /// project opens with only recent work; pinned and already-settled
+    /// sessions are left as they are. Returns whether the project was newly
+    /// added.
     ///
     /// # Errors
     /// Returns [`CoreError::Sql`] when the write fails.
-    pub fn add_project(&self, cwd: &str) -> Result<()> {
+    pub fn add_project<'a>(
+        &self,
+        cwd: &str,
+        idle: impl IntoIterator<Item = &'a str>,
+    ) -> Result<bool> {
         let now = now_millis();
         self.with_tx(|tx| {
+            let already: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM project WHERE cwd = ?1 AND added = 1)",
+                [cwd],
+                |row| row.get(0),
+            )?;
             tx.execute(
                 "INSERT INTO project (cwd, added, added_at_ms) VALUES (?1, 1, ?2)
                  ON CONFLICT(cwd) DO UPDATE SET added = 1",
                 rusqlite::params![cwd, now],
             )?;
-            Ok(())
+            if already {
+                return Ok(false);
+            }
+            let mut archive = tx.prepare(
+                "INSERT OR IGNORE INTO settled (session_id, settled_at_ms)
+                 SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM pinned WHERE session_id = ?1)",
+            )?;
+            for session_id in idle {
+                archive.execute(rusqlite::params![session_id, now])?;
+            }
+            Ok(true)
         })
     }
 
@@ -596,11 +619,24 @@ mod tests {
     #[test]
     fn add_remove_projects_round_trip() {
         let store = StateStore::open_in_memory().expect("open");
-        store.add_project("/proj").expect("add");
+        assert!(store.add_project("/proj", []).expect("add"));
         assert!(store.is_added("/proj").expect("added"));
         store.remove_project("/proj").expect("remove");
         assert!(!store.is_added("/proj").expect("gone"));
         assert_eq!(store.projects().expect("projects").len(), 0);
+    }
+
+    #[test]
+    fn adding_a_project_archives_idle_sessions_once() {
+        let store = StateStore::open_in_memory().expect("open");
+        store.set_pinned("pinned-old", true).expect("pin");
+        assert!(store.add_project("/proj", ["old-1", "pinned-old"]).expect("add"));
+        assert!(store.is_settled("old-1").expect("read"), "idle session moves to Done");
+        assert!(!store.is_settled("pinned-old").expect("read"), "pinned stays out of Done");
+
+        store.reopen("old-1").expect("reopen");
+        assert!(!store.add_project("/proj", ["old-1"]).expect("re-add"), "already added");
+        assert!(!store.is_settled("old-1").expect("read"), "re-adding keeps user reopens");
     }
 
     #[test]

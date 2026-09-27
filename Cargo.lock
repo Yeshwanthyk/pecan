@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "pecan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "pecan-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jiff",
  "rusqlite",
