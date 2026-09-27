@@ -10,6 +10,7 @@ import { ArrowLeftIcon } from "lucide-react";
 import { useMemo } from "react";
 
 import type { SessionRow, SessionSummary } from "~/api/types";
+import { agentTitle } from "~/lib/format";
 import { cn } from "~/lib/utils";
 import { useApp } from "~/store";
 
@@ -31,7 +32,7 @@ export function SubagentStrip({
   const candidates = useMemo(() => {
     const parentOpenedAt = parent ? Date.parse(parent.openedAt) : Number.NaN;
     const liveNames = new Set(
-      (activity?.children ?? []).map((child) => normalizeAgentName(child.title)),
+      (activity?.children ?? []).map((child) => agentTitle(child.title)),
     );
     return sessions.filter((row) => {
       if (row.kind !== "subagent" || row.cwd !== (parent?.cwd ?? current.cwd)) {
@@ -55,7 +56,7 @@ export function SubagentStrip({
     const ids = new Set<string>();
     for (const live of activity?.children ?? []) {
       const match = candidates
-        .filter((row) => agentName(row) === normalizeAgentName(live.title))
+        .filter((row) => agentName(row) === agentTitle(live.title))
         .sort(
           (a, b) =>
             Math.abs(Date.parse(a.openedAt) - live.startedAt) -
@@ -159,9 +160,5 @@ function SubagentLink({
 }
 
 function agentName(row: SessionRow) {
-  return normalizeAgentName(row.agentName ?? row.preview ?? row.id.slice(0, 8));
-}
-
-function normalizeAgentName(value: string) {
-  return value.replace(/^subagents:\s*/, "").trim();
+  return agentTitle(row.agentName ?? row.preview ?? row.id.slice(0, 8));
 }

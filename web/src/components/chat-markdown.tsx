@@ -8,8 +8,8 @@ import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 
 import { CopyButton } from "~/components/copy-button";
+import { DiffBlock } from "~/components/diff-block";
 import { MermaidDiagram } from "~/components/mermaid-diagram";
-import { cn } from "~/lib/utils";
 
 export const ChatMarkdown = memo(function ChatMarkdown({ text }: { text: string }) {
   return (
@@ -38,8 +38,8 @@ const COMPONENTS: Components = {
     </a>
   ),
   table: ({ children }) => (
-    <div className="my-3 overflow-x-auto">
-      <table className="w-full border-collapse text-[13px] [&_td,th]:border-border [&_td,th]:border [&_td,th]:px-2.5 [&_td,th]:py-1.5 [&_th]:bg-muted [&_th]:text-left">
+    <div className="not-prose my-3 overflow-x-auto rounded-xl border px-1">
+      <table className="my-0! w-full border-collapse text-[13px] [&_td,th]:border-b [&_td,th]:px-2.5 [&_td,th]:py-2 [&_th]:text-left [&_th]:font-medium [&_th]:text-muted-foreground [&_tr:last-child_td]:border-b-0">
         {children}
       </table>
     </div>
@@ -66,7 +66,7 @@ function CodeFence({ className, children }: CodeProps) {
   const inline = !className?.includes("language-") && !raw.includes("\n");
   if (inline) {
     return (
-      <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[12.5px]">
+      <code className="rounded-[5px] bg-muted px-1 py-px font-mono text-[0.86em]">
         {children}
       </code>
     );
@@ -76,45 +76,16 @@ function CodeFence({ className, children }: CodeProps) {
   const codeText = raw.replace(/\n$/, "");
   if (lang === "mermaid") return <MermaidDiagram source={codeText} />;
   return (
-    <div className="group/code relative my-3 overflow-hidden rounded-lg border bg-card">
-      <div className="flex items-center border-b bg-muted/50 px-3 py-1">
-        <span className="font-mono text-[11px] text-muted-foreground">{lang || "code"}</span>
+    <div className="group/code not-prose relative my-3 overflow-hidden rounded-xl bg-muted">
+      <div className="flex h-8 items-center ps-3.5 pe-1">
+        <span className="text-[11px] font-medium text-muted-foreground">{lang || "code"}</span>
         <CopyButton
           className="ml-auto"
           text={() => codeText}
         />
       </div>
-      <pre className="overflow-x-auto p-3 font-mono text-[12.5px] leading-relaxed">
+      <pre className="code-scaled overflow-x-auto px-3.5 pb-3 font-mono leading-relaxed">
         <code className={className}>{children}</code>
-      </pre>
-    </div>
-  );
-}
-
-/** Unified diff renderer: hunk headers muted, + success tint, - destructive tint. */
-export function DiffBlock({ code }: { code: string }) {
-  const lines = code.replace(/\n$/, "").split("\n");
-  return (
-    <div className="my-3 overflow-hidden rounded-lg border bg-card">
-      <div className="flex items-center border-b bg-muted/50 px-3 py-1 font-mono text-[11px] text-muted-foreground">
-        <span>diff</span>
-        <CopyButton className="ml-auto" label="Copy diff" text={code} />
-      </div>
-      <pre className="overflow-x-auto p-0 font-mono text-[12px] leading-[1.6]">
-        {lines.map((line, i) => (
-          <div
-            className={cn(
-              "px-3",
-              line.startsWith("+") && line.startsWith("+++") === false && "bg-success/[0.08] text-success",
-              line.startsWith("-") && line.startsWith("---") === false && "bg-destructive/[0.07] text-destructive",
-              (line.startsWith("@@") || line.startsWith("---") || line.startsWith("+++")) &&
-                "bg-muted/40 text-muted-foreground",
-            )}
-            key={i}
-          >
-            {line || " "}
-          </div>
-        ))}
       </pre>
     </div>
   );

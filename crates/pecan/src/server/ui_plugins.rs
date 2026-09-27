@@ -92,11 +92,11 @@ mod tests {
     fn detect(settings: &str, tag: &str) -> (bool, bool) {
         let root =
             std::env::temp_dir().join(format!("pecan-ui-plugin-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap_or_default();
         std::fs::create_dir_all(&root).expect("mkdir");
         std::fs::write(root.join("settings.json"), settings).expect("settings");
         let result = detect_pi_tasks(&PiPaths::from_agent_dir(root.clone()));
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap_or_default();
         result
     }
 

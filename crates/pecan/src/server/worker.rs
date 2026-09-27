@@ -49,6 +49,10 @@ impl WorkerError {
     }
 }
 
+/// Event type published on [`WorkerHandle::raw_events`] after the child's
+/// stdout closes; nothing follows it.
+pub(crate) const WORKER_EXIT: &str = "worker_exit";
+
 /// A live `pi --mode rpc` child process with request correlation.
 pub(crate) struct WorkerHandle {
     next_id: AtomicU64,
@@ -88,7 +92,9 @@ impl WorkerHandle {
     ) -> Result<serde_json::Value, WorkerError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let key = format!("pecan-{id}");
-        cmd["id"] = serde_json::Value::String(key.clone());
+        if let Some(map) = cmd.as_object_mut() {
+            map.insert("id".to_owned(), serde_json::Value::String(key.clone()));
+        }
         self.touch();
 
         let (send, recv) = oneshot::channel();
@@ -147,7 +153,7 @@ impl WorkerHandle {
     /// Returns [`WorkerError::Io`] when the kill itself fails; absence is fine.
     pub(crate) async fn shutdown(self: Arc<Self>) {
         let mut child = self.child.lock().await;
-        let _ = child.start_kill();
+        child.start_kill().unwrap_or_default();
     }
 
     /// Claims the single SSE-forwarding task for this worker.
@@ -207,10 +213,10 @@ impl Workers {
         session_path: &std::path::Path,
     ) -> Result<Arc<WorkerHandle>, WorkerError> {
         if let Some(existing) = self.map.lock().await.get(session_id) {
-            return Ok(existing.clone());
+            return Ok(Arc::clone(existing));
         }
-        let handle = spawn_worker(Some(session_path), None).await?;
-        self.map.lock().await.insert(session_id.to_owned(), handle.clone());
+        let handle = spawn_worker(Some(session_path), None)?;
+        self.map.lock().await.insert(session_id.to_owned(), Arc::clone(&handle));
         Ok(handle)
     }
 
@@ -223,11 +229,11 @@ impl Workers {
     ///
     /// # Errors
     /// Returns [`WorkerError`] when pi is missing or startup fails.
-    pub(crate) async fn spawn_new(
+    pub(crate) fn spawn_new(
         &self,
         cwd: &std::path::Path,
     ) -> Result<Arc<WorkerHandle>, WorkerError> {
-        spawn_worker(None, Some(cwd)).await
+        spawn_worker(None, Some(cwd))
     }
 
     /// Drops a worker unconditionally (e.g. after it crashed).
@@ -281,7 +287,7 @@ fn read_extension_args() -> Vec<String> {
 /// forwards everything else onto the event channel.
 ///
 /// `session_path` attaches an existing transcript; `cwd` roots a fresh one.
-async fn spawn_worker(
+fn spawn_worker(
     session_path: Option<&std::path::Path>,
     cwd: Option<&std::path::Path>,
 ) -> Result<Arc<WorkerHandle>, WorkerError> {
@@ -293,6 +299,16 @@ async fn spawn_worker(
     for extension in read_extension_args() {
         cmd.arg("--extension").arg(extension);
     }
+    // `PECAN_PI_ARGS` appends raw pi flags (whitespace separated), e.g. the
+    // deterministic fixture model used by `scripts/pecan-check.sh`.
+    if let Ok(raw) = std::env::var("PECAN_PI_ARGS") {
+        cmd.args(raw.split_whitespace());
+    }
+    // Pi reads and writes sessions where Pecan reads them: an overridden
+    // `PECAN_AGENT_DIR` isolates the worker too.
+    if let Ok(dir) = std::env::var("PECAN_AGENT_DIR") {
+        cmd.env("PI_CODING_AGENT_DIR", dir);
+    }
     // `--session <path>` attaches the real transcript at startup, so every
     // prompt lands in the same .jsonl our filesystem read path watches.
     if let Some(path) = session_path {
@@ -303,7 +319,8 @@ async fn spawn_worker(
     }
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             WorkerError::PiMissing
@@ -351,12 +368,18 @@ async fn spawn_worker(
         'read: loop {
             match buf.read(&mut chunk).await {
                 Ok(0) => break 'read,
-                Ok(n) => carry.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    if let Some(bytes) = chunk.get(..n) {
+                        carry.extend_from_slice(bytes);
+                    }
+                }
                 Err(_) => break 'read,
             }
             while let Some(pos) = carry.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = carry.drain(..=pos).collect();
-                let mut text = String::from_utf8_lossy(&line[..line.len() - 1]).to_string();
+                let body_len = line.len().saturating_sub(1);
+                let mut text =
+                    String::from_utf8_lossy(line.get(..body_len).unwrap_or_default()).to_string();
                 if text.ends_with('\r') {
                     text.pop();
                 }
@@ -367,23 +390,30 @@ async fn spawn_worker(
                     continue;
                 };
                 if value.get("type").and_then(serde_json::Value::as_str) == Some("response") {
-                    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
-                        if let Some(sender) = pending.lock().await.remove(id) {
-                            let _ = sender.send(value);
-                        }
+                    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
+                        && let Some(sender) = pending.lock().await.remove(id)
+                    {
+                        sender.send(value).unwrap_or_default();
                     }
                     continue;
                 }
                 if let Some(handle) = weak.upgrade() {
-                    let _ = handle.raw_events.send(value);
+                    handle.raw_events.send(value).unwrap_or_default();
                 }
             }
         }
         // Child exited: fail every waiter so callers do not hang.
         for (_, sender) in pending.lock().await.drain() {
-            let _ = sender.send(serde_json::json!({
-                "type": "response", "success": false, "error": "worker exited",
-            }));
+            sender
+                .send(serde_json::json!({
+                    "type": "response", "success": false, "error": "worker exited",
+                }))
+                .unwrap_or_default();
+        }
+        // The registry still holds the handle (and so the sender); tell the
+        // forwarder explicitly that this process is gone.
+        if let Some(handle) = weak.upgrade() {
+            handle.raw_events.send(serde_json::json!({ "type": WORKER_EXIT })).unwrap_or_default();
         }
     });
 

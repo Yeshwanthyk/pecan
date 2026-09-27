@@ -19,7 +19,7 @@ import {
 } from "@sinclair/typebox";
 
 export const SessionKind = Union([Literal("normal"), Literal("subagent")]);
-export type SessionKind = Static<typeof SessionKind>;
+type SessionKind = Static<typeof SessionKind>;
 
 export const SessionSummary = Object({
   id: String(),
@@ -33,7 +33,6 @@ export const SessionSummary = Object({
   preview: Optional(Union([String(), Null(), Undefined()])),
   title: Optional(Union([String(), Null(), Undefined()])),
   kind: SessionKind,
-  parentId: Optional(Union([String(), Null(), Undefined()])),
   agentName: Optional(Union([String(), Null(), Undefined()])),
 });
 export type SessionSummary = Static<typeof SessionSummary>;
@@ -65,7 +64,7 @@ export const UiPlugin = Object({
   sourceEnabled: Boolean(),
   enabled: Boolean(),
 });
-export type UiPlugin = Static<typeof UiPlugin>;
+type UiPlugin = Static<typeof UiPlugin>;
 
 export const WorkspaceDiff = Object({
   branch: Union([String(), Null()]),
@@ -84,7 +83,7 @@ export const PullRequest = Object({
   baseRefName: String(),
   headRefName: String(),
 });
-export type PullRequest = Static<typeof PullRequest>;
+type PullRequest = Static<typeof PullRequest>;
 
 export const ShipPlan = Object({
   branch: Union([String(), Null()]),
@@ -137,7 +136,7 @@ export const SessionPage = Object({
   limit: Number(),
   sessions: Array(SessionRow),
 });
-export type SessionPage = Static<typeof SessionPage>;
+type SessionPage = Static<typeof SessionPage>;
 
 export const ToolCategory = Union([
   Literal("inspect"),
@@ -149,7 +148,7 @@ export const ToolCategory = Union([
   Literal("runtime"),
   Literal("other"),
 ]);
-export type ToolCategory = Static<typeof ToolCategory>;
+type ToolCategory = Static<typeof ToolCategory>;
 
 export const ToolCall = Object({
   toolCallId: String(),
@@ -167,7 +166,7 @@ export const UserImage = Object({
   mimeType: String(),
   data: String(),
 });
-export type UserImage = Static<typeof UserImage>;
+type UserImage = Static<typeof UserImage>;
 
 export const ThreadEntry = Union([
   Object({
@@ -183,11 +182,31 @@ export const ThreadEntry = Union([
     thinking: Optional(Union([String(), Null(), Undefined()])),
     tools: Array(ToolCall),
     model: Optional(Union([String(), Null(), Undefined()])),
+    error: Optional(String()),
   }),
   Object({
     kind: Literal("askUser"),
     questions: Unknown(),
     answer: Optional(Unknown()),
+  }),
+  Object({
+    kind: Literal("childQuestions"),
+    questions: Array(
+      Object({
+        childId: String(),
+        requestId: String(),
+        question: String(),
+        context: Optional(Union([String(), Null(), Undefined()])),
+        deadlineAt: Optional(Union([Number(), Null(), Undefined()])),
+        answered: Boolean(),
+      }),
+    ),
+  }),
+  Object({
+    kind: Literal("childResults"),
+    text: String(),
+    truncated: Boolean(),
+    results: Array(Object({ id: String(), title: String(), status: String() })),
   }),
   Object({
     kind: Literal("toolError"),
@@ -220,34 +239,32 @@ export const TaskList = Object({ sessionId: String(), tasks: Array(TaskItem) });
 export type TaskItem = Static<typeof TaskItem>;
 export type TaskGroup = Static<typeof TaskList>;
 
-export const WorkflowAgent = Object({
-  label: Optional(Union([String(), Null(), Undefined()])),
-  phase: Optional(Union([String(), Null(), Undefined()])),
-  state: Optional(Union([String(), Null(), Undefined()])),
-  model: Optional(Union([String(), Null(), Undefined()])),
-  provider: Optional(Union([String(), Null(), Undefined()])),
-  completedOperations: Optional(Union([Number(), Null(), Undefined()])),
-});
-export const WorkflowPhase = Object({
-  title: String(),
-  detail: Optional(Union([String(), Null(), Undefined()])),
-});
-export type WorkflowPhase = Static<typeof WorkflowPhase>;
-export const WorkflowRun = Object({
-  runId: String(),
-  sessionId: Optional(Union([String(), Null(), Undefined()])),
-  name: Optional(Union([String(), Null(), Undefined()])),
-  description: Optional(Union([String(), Null(), Undefined()])),
-  background: Boolean(),
+export const WorkflowTask = Object({
+  id: String(),
+  label: String(),
+  kind: Optional(Union([String(), Null(), Undefined()])),
+  needs: Array(String()),
+  status: String(),
+  attempt: Number(),
+  childId: Optional(Union([String(), Null(), Undefined()])),
   startedAt: Optional(Union([Number(), Null(), Undefined()])),
   finishedAt: Optional(Union([Number(), Null(), Undefined()])),
-  status: Optional(Union([String(), Null(), Undefined()])),
-  currentPhase: Optional(Union([String(), Null(), Undefined()])),
-  phases: Array(WorkflowPhase),
+  result: Optional(Union([String(), Null(), Undefined()])),
   error: Optional(Union([String(), Null(), Undefined()])),
-  resultArtifact: Optional(Union([String(), Null(), Undefined()])),
-  transcriptArtifact: Optional(Union([String(), Null(), Undefined()])),
-  agents: Array(WorkflowAgent),
+  sessionId: Optional(Union([String(), Null(), Undefined()])),
+});
+export type WorkflowTask = Static<typeof WorkflowTask>;
+export const WorkflowRun = Object({
+  runId: String(),
+  name: Optional(Union([String(), Null(), Undefined()])),
+  description: Optional(Union([String(), Null(), Undefined()])),
+  status: String(),
+  createdAt: Optional(Union([Number(), Null(), Undefined()])),
+  startedAt: Optional(Union([Number(), Null(), Undefined()])),
+  finishedAt: Optional(Union([Number(), Null(), Undefined()])),
+  lastActivityAt: Optional(Union([Number(), Null(), Undefined()])),
+  outcome: Optional(Union([String(), Null(), Undefined()])),
+  tasks: Array(WorkflowTask),
 });
 export type WorkflowRun = Static<typeof WorkflowRun>;
 
@@ -267,7 +284,7 @@ export const AgentModel = Object({
   name: Optional(Union([String(), Null(), Undefined()])),
   provider: String(),
 });
-export type AgentModel = Static<typeof AgentModel>;
+type AgentModel = Static<typeof AgentModel>;
 
 export const AgentSnapshot = Object({
   sessionId: String(),
@@ -308,6 +325,7 @@ export const AgentSnapshot = Object({
     ]),
   ),
   models: Optional(Union([Undefined(), Null(), Array(AgentModel)])),
+  favorites: Optional(Array(String())),
 });
 export type AgentSnapshot = Static<typeof AgentSnapshot>;
 
@@ -324,4 +342,23 @@ export const PendingAsk = Object({
   options: Optional(Union([Undefined(), Null(), Array(Unknown())])),
   recordedAtMs: Number(),
 });
-export type PendingAskWire = Static<typeof PendingAsk>;
+
+export const Health = Object({
+  status: Union([Literal("ok"), Literal("missing"), Literal("error")]),
+  version: Optional(Union([String(), Null()])),
+  detail: Optional(Union([String(), Null()])),
+  agentDir: Boolean(),
+  authFile: Boolean(),
+});
+export type Health = Static<typeof Health>;
+
+/** A browser or phone allowed to use this server. */
+export const Device = Object({
+  id: String(),
+  name: String(),
+  createdAtMs: Number(),
+  lastSeenAtMs: Number(),
+});
+
+/** `POST /api/pair` success. */
+export const Paired = Object({ device: Device });

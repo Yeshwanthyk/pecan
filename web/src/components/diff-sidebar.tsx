@@ -15,6 +15,7 @@ import {
   SheetTitle,
 } from "~/components/ui/sheet";
 import { useApp } from "~/store";
+import { readLocalStorage, writeLocalStorage } from "~/lib/storage";
 import { cn } from "~/lib/utils";
 
 type DiffStyle = "split" | "unified";
@@ -66,11 +67,7 @@ export default function DiffSidebar({
 
   function chooseStyle(next: DiffStyle) {
     setStyle(next);
-    try {
-      localStorage.setItem(DIFF_STYLE_KEY, next);
-    } catch {
-      // The selection remains active for the current page.
-    }
+    writeLocalStorage(DIFF_STYLE_KEY, next);
   }
 
   return (
@@ -185,11 +182,7 @@ function DiffLoading() {
 }
 
 function initialDiffStyle(): DiffStyle {
-  try {
-    const stored = localStorage.getItem(DIFF_STYLE_KEY);
-    if (stored === "split" || stored === "unified") return stored;
-  } catch {
-    // Fall through to the viewport-aware default.
-  }
+  const stored = readLocalStorage(DIFF_STYLE_KEY);
+  if (stored === "split" || stored === "unified") return stored;
   return window.matchMedia("(max-width: 767px)").matches ? "unified" : "split";
 }

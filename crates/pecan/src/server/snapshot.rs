@@ -13,9 +13,7 @@ use pecan_core::session::{SessionKind, SessionSummary};
 use pecan_core::store::StateStore;
 use pecan_core::tasks::TaskList;
 use pecan_core::thread::{ThreadView, parse_thread};
-use pecan_core::workflows::WorkflowRun;
-use pecan_core::{CoreError, PiPaths};
-use tokio::sync::broadcast;
+use pecan_core::{CoreError, PiPaths, workflows};
 
 /// Sessions modified within this window get a bounded tail scan for an
 /// unanswered `ask_user` call; older files never pay that cost.
@@ -95,7 +93,7 @@ impl SessionScope {
         };
         let cwd = main.summary.cwd.clone();
         let opened_at = main.summary.opened_at;
-        let spawned_agents = spawned_agents(&main.summary.path);
+        let evidence = SpawnEvidence::read(&main.summary.path);
         let mut child_ids: Vec<String> = rows
             .iter()
             .filter(|row| {
@@ -103,13 +101,8 @@ impl SessionScope {
                     && !row.settled
                     && row.summary.cwd == cwd
                     && row.summary.opened_at >= opened_at
-                    && row.summary.agent_name.as_deref().is_some_and(|raw_name| {
-                        let name = normalize_agent_name(raw_name);
-                        first_user_prompt(&row.summary.path).is_some_and(|prompt| {
-                            spawned_agents
-                                .get(name)
-                                .is_some_and(|prompts| prompts.contains(&prompt))
-                        })
+                    && row.summary.agent_name.as_deref().is_some_and(|name| {
+                        evidence.owns(name, || first_user_prompt(&row.summary.path))
                     })
             })
             .take(self.max_children)
@@ -123,47 +116,81 @@ impl SessionScope {
     }
 }
 
+/// Strips the `<owner>: ` prefix pi-subagents puts on child session names
+/// (`subagents: scout`, `workflow:wf-1: Build`), leaving the spawn title.
 fn normalize_agent_name(value: &str) -> &str {
-    value.strip_prefix("subagents: ").unwrap_or(value).trim()
+    let title = match value.split_once(": ") {
+        Some((owner, title)) if !owner.is_empty() && !owner.contains(char::is_whitespace) => title,
+        _ => value,
+    };
+    title.trim()
 }
 
-/// Reads explicit `subagent_spawn` names and prompts from the parent transcript.
-/// Child session metadata does not carry the parent session UUID, so this is
-/// the strongest persisted relationship available without widening the scope.
-fn spawned_agents(path: &std::path::Path) -> HashMap<String, HashSet<String>> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return HashMap::new();
-    };
-    let mut spawns: HashMap<String, HashSet<String>> = HashMap::new();
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+/// Persisted parent-side evidence of spawned children. Child session metadata
+/// does not carry the parent session UUID, so explicit `subagent_spawn`
+/// name/prompt pairs and `workflow*` run ids are the strongest relationship
+/// available without widening the scope.
+#[derive(Debug, Default)]
+struct SpawnEvidence {
+    /// `subagent_spawn` names mapped to their prompts.
+    spawns: HashMap<String, HashSet<String>>,
+    /// Workflow run ids this transcript started or controlled.
+    workflow_runs: HashSet<String>,
+}
+
+impl SpawnEvidence {
+    fn read(path: &std::path::Path) -> Self {
+        let mut evidence = Self::default();
+        let Ok(file) = std::fs::File::open(path) else {
+            return evidence;
         };
-        let Some(blocks) = value.pointer("/message/content").and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(serde_json::Value::as_str) != Some("toolCall")
-                || block.get("name").and_then(serde_json::Value::as_str) != Some("subagent_spawn")
-            {
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(message) = value.get("message") else { continue };
+            if let Some(run_id) = workflows::tool_result_run_id(message) {
+                evidence.workflow_runs.insert(run_id.to_owned());
                 continue;
             }
-            let name =
-                block.pointer("/arguments/name").and_then(serde_json::Value::as_str).map(str::trim);
-            let prompt = block
-                .pointer("/arguments/prompt")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim);
-            if let (Some(name), Some(prompt)) = (name, prompt)
-                && !name.is_empty()
-                && !prompt.is_empty()
-            {
-                spawns.entry(name.to_owned()).or_default().insert(prompt.to_owned());
+            let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for block in blocks {
+                evidence.record_spawn(block);
             }
         }
+        evidence
     }
-    spawns
+
+    fn record_spawn(&mut self, block: &serde_json::Value) {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("toolCall")
+            || block.get("name").and_then(serde_json::Value::as_str) != Some("subagent_spawn")
+        {
+            return;
+        }
+        let name =
+            block.pointer("/arguments/name").and_then(serde_json::Value::as_str).map(str::trim);
+        let prompt =
+            block.pointer("/arguments/prompt").and_then(serde_json::Value::as_str).map(str::trim);
+        if let (Some(name), Some(prompt)) = (name, prompt)
+            && !name.is_empty()
+            && !prompt.is_empty()
+        {
+            self.spawns.entry(name.to_owned()).or_default().insert(prompt.to_owned());
+        }
+    }
+
+    /// Whether this transcript spawned the child named `agent_name`. Workflow
+    /// children match by run id; direct subagents by spawn name and prompt.
+    fn owns<P: AsRef<str>>(&self, agent_name: &str, prompt: impl FnOnce() -> Option<P>) -> bool {
+        if let Some((run_id, _)) = workflows::child_session_task(agent_name) {
+            return self.workflow_runs.contains(run_id);
+        }
+        self.spawns
+            .get(normalize_agent_name(agent_name))
+            .is_some_and(|prompts| prompt().is_some_and(|prompt| prompts.contains(prompt.as_ref())))
+    }
 }
 
 fn first_user_prompt(path: &std::path::Path) -> Option<String> {
@@ -201,10 +228,11 @@ fn first_user_prompt(path: &std::path::Path) -> Option<String> {
     None
 }
 
-type ParentCandidate = (String, String, jiff::Timestamp, HashMap<String, HashSet<String>>);
+type ParentCandidate = (String, String, jiff::Timestamp, SpawnEvidence);
 
 /// Resolves subagent sessions to their parent by matching the persisted spawn
-/// name and prompt against candidate normal-session transcripts.
+/// name and prompt (or workflow run id) against candidate normal-session
+/// transcripts.
 fn link_parent_sessions(rows: &mut [SessionRow]) {
     let active_child_cwds: HashSet<&str> = rows
         .iter()
@@ -223,7 +251,7 @@ fn link_parent_sessions(rows: &mut [SessionRow]) {
                 row.summary.id.clone(),
                 row.summary.cwd.clone(),
                 row.summary.opened_at,
-                spawned_agents(&row.summary.path),
+                SpawnEvidence::read(&row.summary.path),
             )
         })
         .collect();
@@ -231,16 +259,22 @@ fn link_parent_sessions(rows: &mut [SessionRow]) {
     for child in
         rows.iter_mut().filter(|row| row.summary.kind == SessionKind::Subagent && !row.settled)
     {
-        let Some(name) = child.summary.agent_name.as_deref().map(normalize_agent_name) else {
+        let Some(name) = child.summary.agent_name.as_deref() else {
             continue;
         };
-        let Some(prompt) = first_user_prompt(&child.summary.path) else { continue };
+        // Read the child's prompt once; workflow children never need it.
+        let prompt = if workflows::child_session_task(name).is_some() {
+            None
+        } else {
+            let Some(prompt) = first_user_prompt(&child.summary.path) else { continue };
+            Some(prompt)
+        };
         child.parent_session_id = parents
             .iter()
-            .filter(|(_, cwd, opened_at, spawns)| {
+            .filter(|(_, cwd, opened_at, evidence)| {
                 *cwd == child.summary.cwd
                     && *opened_at <= child.summary.opened_at
-                    && spawns.get(name).is_some_and(|prompts| prompts.contains(&prompt))
+                    && evidence.owns(name, || prompt.as_deref())
             })
             .max_by_key(|(_, _, opened_at, _)| *opened_at)
             .map(|(id, _, _, _)| id.clone());
@@ -271,27 +305,30 @@ pub(crate) struct IndexSnapshot {
     pub(crate) sessions: Arc<Vec<SessionRow>>,
     /// Task lists grouped by session id.
     pub(crate) tasks: HashMap<String, Vec<TaskList>>,
-    /// Workflow runs grouped by session id.
-    pub(crate) workflows: HashMap<String, Vec<WorkflowRun>>,
 }
 
 impl IndexSnapshot {
-    /// Builds a fresh snapshot from disk plus current settle state.
+    /// Builds a fresh snapshot from disk plus store data already captured by
+    /// [`StoreData::capture`].
+    ///
+    /// Takes no reference to the live `StateStore`: the filesystem scan and
+    /// transcript parsing below can be slow, and the caller captures
+    /// `store_data` under a short-lived lock precisely so that lock is not
+    /// held for the duration of this call.
     ///
     /// # Errors
-    /// Returns [`pecan_core::CoreError`] when the sessions tree is unreadable
-    /// or the state store fails.
+    /// Returns [`pecan_core::CoreError`] when the sessions tree is unreadable.
     pub(crate) fn build(
         paths: &PiPaths,
-        store: &StateStore,
+        store_data: &StoreData,
         scope: Option<&SessionScope>,
         scans: &mut ScanCache,
         threads: &mut ThreadCache,
     ) -> pecan_core::Result<Self> {
         let summaries = scans.refresh(&paths.sessions_dir())?;
-        let settled = store.settled()?;
-        let pinned = store.pinned()?;
-        let titles = store.titles()?;
+        let settled = &store_data.settled;
+        let pinned = &store_data.pinned;
+        let titles = &store_data.titles;
         let now_ms = jiff::Timestamp::now().as_second().saturating_mul(1_000);
         let mut rows: Vec<SessionRow> = Vec::with_capacity(summaries.len());
         for mut s in summaries {
@@ -320,24 +357,14 @@ impl IndexSnapshot {
             // recent-agent fallback and never parses historical transcripts.
             link_parent_sessions(&mut rows);
         }
-        let visible_ids: HashSet<&str> = rows.iter().map(|row| row.summary.id.as_str()).collect();
-        let tasks = if crate::server::ui_plugins::pi_tasks_enabled(paths, store)? {
-            let added_cwds = if scope.is_some() {
-                None
-            } else {
-                Some(
-                    store
-                        .projects()?
-                        .into_iter()
-                        .filter(|(_, preference)| preference.added)
-                        .map(|(cwd, _)| cwd)
-                        .collect::<HashSet<_>>(),
-                )
-            };
+        let tasks = if store_data.pi_tasks_enabled {
             pecan_core::tasks::load_for_sessions(
                 rows.iter()
                     .filter(|row| {
-                        added_cwds.as_ref().is_none_or(|cwds| cwds.contains(&row.summary.cwd))
+                        store_data
+                            .added_cwds
+                            .as_ref()
+                            .is_none_or(|cwds| cwds.contains(&row.summary.cwd))
                     })
                     .map(|row| (row.summary.id.as_str(), row.summary.cwd.as_str())),
                 &paths.tasks_dir(),
@@ -345,9 +372,48 @@ impl IndexSnapshot {
         } else {
             HashMap::new()
         };
-        let mut workflows = pecan_core::workflows::load_all(&paths.workflows_dir());
-        workflows.retain(|id, _| visible_ids.contains(id.as_str()));
-        Ok(Self { sessions: Arc::new(rows), tasks, workflows })
+        Ok(Self { sessions: Arc::new(rows), tasks })
+    }
+}
+
+/// Store-derived data captured once, under a short-lived lock, before the
+/// filesystem scan and transcript parsing in [`IndexSnapshot::build`].
+pub(crate) struct StoreData {
+    settled: HashMap<String, i64>,
+    pinned: HashMap<String, i64>,
+    titles: HashMap<String, String>,
+    /// Added project cwds, only meaningful in global (non-scoped) mode.
+    added_cwds: Option<HashSet<String>>,
+    pi_tasks_enabled: bool,
+}
+
+impl StoreData {
+    /// Reads everything [`IndexSnapshot::build`] needs from the store.
+    ///
+    /// # Errors
+    /// Returns [`pecan_core::CoreError`] when the state store fails.
+    fn capture(
+        paths: &PiPaths,
+        store: &StateStore,
+        scope: Option<&SessionScope>,
+    ) -> pecan_core::Result<Self> {
+        let settled = store.settled()?;
+        let pinned = store.pinned()?;
+        let titles = store.titles()?;
+        let added_cwds = if scope.is_some() {
+            None
+        } else {
+            Some(
+                store
+                    .projects()?
+                    .into_iter()
+                    .filter(|(_, preference)| preference.added)
+                    .map(|(cwd, _)| cwd)
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        let pi_tasks_enabled = crate::server::ui_plugins::pi_tasks_enabled(paths, store)?;
+        Ok(Self { settled, pinned, titles, added_cwds, pi_tasks_enabled })
     }
 }
 
@@ -361,16 +427,17 @@ fn cached_thread_view(
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let bytes = meta.len();
-    if let Some(cached) = threads.get(path) {
-        if cached.modified == modified && cached.bytes == bytes {
-            return Some(cached.view.clone());
-        }
+    if let Some(cached) = threads.get(path)
+        && cached.modified == modified
+        && cached.bytes == bytes
+    {
+        return Some(Arc::clone(&cached.view));
     }
     let view = Arc::new(parse_thread(path).ok()?);
     if threads.len() >= THREAD_CACHE_CAP {
         threads.clear();
     }
-    threads.insert(path.to_path_buf(), CachedThread { modified, bytes, view: view.clone() });
+    threads.insert(path.to_path_buf(), CachedThread { modified, bytes, view: Arc::clone(&view) });
     Some(view)
 }
 
@@ -404,7 +471,7 @@ pub(crate) struct App {
     /// Latest index snapshot.
     pub(crate) snapshot: Arc<tokio::sync::RwLock<Arc<IndexSnapshot>>>,
     /// Fan-out channel for [`ServerEvent`]s.
-    pub(crate) events: broadcast::Sender<ServerEvent>,
+    pub(crate) events: super::event_log::EventLog,
     /// Latest title-generation request number per session.
     pub(crate) title_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// Serializes checkout-wide Ship mutations so two browser clients cannot race.
@@ -419,6 +486,14 @@ pub(crate) struct App {
     pub(crate) ship_token: Arc<str>,
     /// Optional single-session boundary for embedded clients.
     pub(crate) session_scope: Option<SessionScope>,
+    /// Replay-safe results for retried mutations.
+    pub(crate) idempotency: super::idempotency::Idempotency,
+    /// Cached `pi` readiness probe.
+    pub(crate) health: super::health::HealthCache,
+    /// Device pairing and request authentication.
+    pub(crate) auth: super::auth::Auth,
+    /// Web push to devices that are not watching.
+    pub(crate) push: super::push::Push,
 }
 
 impl std::fmt::Debug for App {
@@ -463,21 +538,43 @@ impl App {
     /// Returns errors from snapshot construction.
     pub(crate) async fn refresh(&self) -> pecan_core::Result<()> {
         let paths = self.paths.clone();
-        let store = self.store.clone();
         let scope = self.session_scope.clone();
-        let scans = self.scan_cache.clone();
-        let threads = self.thread_cache.clone();
+        let scans = Arc::clone(&self.scan_cache);
+        let threads = Arc::clone(&self.thread_cache);
+        // Captures store data under a short-lived lock, released before the
+        // (potentially slow) filesystem scan and transcript parsing below.
+        let store_data = {
+            let store = self.store.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
+            StoreData::capture(&paths, &store, scope.as_ref())?
+        };
         let built = tokio::task::spawn_blocking(move || {
-            let store = store.lock().map_err(|_| CoreError::LockPoisoned)?;
-            let mut scans = scans.lock().map_err(|_| CoreError::LockPoisoned)?;
-            let mut threads = threads.lock().map_err(|_| CoreError::LockPoisoned)?;
-            IndexSnapshot::build(&paths, &store, scope.as_ref(), &mut scans, &mut threads)
+            let mut scans = scans.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
+            let mut threads = threads.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
+            IndexSnapshot::build(&paths, &store_data, scope.as_ref(), &mut scans, &mut threads)
         })
         .await
-        .map_err(|_| CoreError::Join)??;
+        .map_err(|_join| CoreError::Join)??;
         *self.snapshot.write().await = Arc::new(built);
-        let _ = self.events.send(ServerEvent::IndexChanged);
+        self.events.send(ServerEvent::IndexChanged);
         Ok(())
+    }
+
+    /// Returns cached transcript paths that reference any of `run_ids`.
+    ///
+    /// Only already-parsed threads are considered: a thread nobody has opened
+    /// has no client to refresh.
+    pub(crate) fn threads_with_workflow_runs(
+        &self,
+        run_ids: &HashSet<String>,
+    ) -> pecan_core::Result<Vec<std::path::PathBuf>> {
+        let cache = self.thread_cache.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
+        Ok(cache
+            .iter()
+            .filter(|(_, cached)| {
+                cached.view.workflow_run_ids.iter().any(|id| run_ids.contains(id))
+            })
+            .map(|(path, _)| path.clone())
+            .collect())
     }
 
     /// Returns the parsed transcript at `path`, reusing the cache when the
@@ -495,24 +592,26 @@ impl App {
             meta.modified().map_err(|source| CoreError::Io { path: path.clone(), source })?;
         let bytes = meta.len();
         {
-            let cache = self.thread_cache.lock().map_err(|_| CoreError::LockPoisoned)?;
-            if let Some(cached) = cache.get(&path) {
-                if cached.modified == modified && cached.bytes == bytes {
-                    return Ok(cached.view.clone());
-                }
+            let cache = self.thread_cache.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
+            if let Some(cached) = cache.get(&path)
+                && cached.modified == modified
+                && cached.bytes == bytes
+            {
+                return Ok(Arc::clone(&cached.view));
             }
         }
         let parse_path = path.clone();
         let view = tokio::task::spawn_blocking(move || parse_thread(&parse_path))
             .await
-            .map_err(|_| CoreError::Join)??;
+            .map_err(|_join| CoreError::Join)??;
         let view = Arc::new(view);
         {
-            let mut cache = self.thread_cache.lock().map_err(|_| CoreError::LockPoisoned)?;
+            let mut cache =
+                self.thread_cache.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
             if cache.len() >= THREAD_CACHE_CAP {
                 cache.clear();
             }
-            cache.insert(path, CachedThread { modified, bytes, view: view.clone() });
+            cache.insert(path, CachedThread { modified, bytes, view: Arc::clone(&view) });
         }
         Ok(view)
     }
@@ -547,7 +646,6 @@ mod tests {
                 preview: None,
                 title: None,
                 kind,
-                parent_id: None,
                 agent_name: None,
             },
             settled: false,
@@ -630,9 +728,9 @@ mod tests {
 
         let ids: Vec<&str> = rows.iter().map(|candidate| candidate.summary.id.as_str()).collect();
         assert_eq!(ids, vec!["child", "main"]);
-        let _ = std::fs::remove_file(parent_path);
-        let _ = std::fs::remove_file(child_path);
-        let _ = std::fs::remove_file(unrelated_path);
+        std::fs::remove_file(parent_path).unwrap_or_default();
+        std::fs::remove_file(child_path).unwrap_or_default();
+        std::fs::remove_file(unrelated_path).unwrap_or_default();
     }
 
     #[test]
@@ -652,8 +750,8 @@ mod tests {
         super::link_parent_sessions(&mut rows);
 
         assert_eq!(rows[1].parent_session_id, None);
-        let _ = std::fs::remove_file(parent_path);
-        let _ = std::fs::remove_file(child_path);
+        std::fs::remove_file(parent_path).unwrap_or_default();
+        std::fs::remove_file(child_path).unwrap_or_default();
     }
 
     #[test]
@@ -667,8 +765,47 @@ mod tests {
         super::link_parent_sessions(&mut rows);
 
         assert_eq!(rows[1].parent_session_id.as_deref(), Some("main"));
-        let _ = std::fs::remove_file(parent_path);
-        let _ = std::fs::remove_file(child_path);
+        std::fs::remove_file(parent_path).unwrap_or_default();
+        std::fs::remove_file(child_path).unwrap_or_default();
+    }
+
+    #[test]
+    fn links_workflow_children_by_run_id_only() {
+        let mut parent = row("main", "/project", "2026-01-01T00:00:00Z", SessionKind::Normal);
+        let parent_path = std::env::temp_dir().join(format!(
+            "pecan-workflow-parent-{}-{:?}.jsonl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let result = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolName": "workflow",
+                "details": { "runId": "wf-1" }
+            }
+        });
+        std::fs::write(&parent_path, format!("{result}\n")).expect("write parent fixture");
+        parent.summary.path = parent_path.clone();
+        let mut owned = row("owned", "/project", "2026-01-02T00:00:00Z", SessionKind::Subagent);
+        owned.summary.agent_name = Some("workflow:wf-1: Build".to_owned());
+        let mut foreign = row("foreign", "/project", "2026-01-02T00:00:00Z", SessionKind::Subagent);
+        foreign.summary.agent_name = Some("workflow:wf-2: Build".to_owned());
+        let mut rows = vec![parent, owned, foreign];
+
+        super::link_parent_sessions(&mut rows);
+
+        assert_eq!(rows[1].parent_session_id.as_deref(), Some("main"));
+        assert_eq!(rows[2].parent_session_id, None);
+        std::fs::remove_file(parent_path).unwrap_or_default();
+    }
+
+    #[test]
+    fn normalizes_owner_prefixed_agent_names() {
+        assert_eq!(super::normalize_agent_name("subagents: scout"), "scout");
+        assert_eq!(super::normalize_agent_name("workflow:wf-1: Build: api"), "Build: api");
+        assert_eq!(super::normalize_agent_name("fix the bug: now"), "fix the bug: now");
+        assert_eq!(super::normalize_agent_name("scout"), "scout");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 /** Compact settings surface built only from behavior Pecan actually owns. */
 import {
+  BellIcon,
   FolderGit2Icon,
   PanelsTopLeftIcon,
   MoonIcon,
@@ -17,6 +18,7 @@ import {
   saveTitleModelPreset,
   type TitleModelPreset,
 } from "~/api/client";
+import type { Bootstrap } from "~/api/types";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Switch } from "~/components/ui/switch";
@@ -27,6 +29,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "~/components/ui/select";
+import {
+  notificationPermission,
+  pushSupported,
+  readNotifyEnabled,
+  readSoundEnabled,
+  saveNotifyEnabled,
+  saveSoundEnabled,
+} from "~/lib/attention";
+import { reportError } from "~/lib/errors";
 import { cn } from "~/lib/utils";
 import { useApp, type ThemeName } from "~/store";
 import {
@@ -51,6 +62,9 @@ import {
 } from "~/fonts";
 
 const EMPTY_PROJECTS: Array<{ cwd: string; name: string }> = [];
+// Selectors must return a stable value: a fresh `[]` per read makes zustand
+// re-render forever (React #185) whenever bootstrap is null.
+const EMPTY_PLUGINS: Bootstrap["uiPlugins"] = [];
 const DEFAULT_TITLE_MODEL = {
   value: "luna-low",
   label: "Luna · Low",
@@ -81,7 +95,7 @@ export function SettingsPage() {
   const connected = useApp((state) => state.connected);
   const sessions = useApp((state) => state.sessions);
   const projects = useApp((state) => state.bootstrap?.projects ?? EMPTY_PROJECTS);
-  const uiPlugins = useApp((state) => state.bootstrap?.uiPlugins ?? []);
+  const uiPlugins = useApp((state) => state.bootstrap?.uiPlugins ?? EMPTY_PLUGINS);
   const [removing, setRemoving] = useState<string | null>(null);
   const [changingPlugin, setChangingPlugin] = useState<string | null>(null);
   const [aiTitlesEnabled, setAiTitlesEnabled] = useState(
@@ -158,6 +172,7 @@ export function SettingsPage() {
               setUiTextSize(size);
               saveUiTextSize(size);
             }}
+            description="Scales interface text: sidebar, messages and controls."
             title="Interface text size"
             value={uiTextSize}
           />
@@ -166,10 +181,13 @@ export function SettingsPage() {
               setCodeTextSize(size);
               saveCodeTextSize(size);
             }}
+            description="Scales code blocks, inline code and diffs."
             title="Code text size"
             value={codeTextSize}
           />
         </SettingsSection>
+
+        <AttentionSettings />
 
         <SettingsSection icon={<SparklesIcon />} title="Thread titles">
           <SettingsRow
@@ -353,6 +371,83 @@ function TitleModelControl({
   );
 }
 
+/** Background-tab alerts for finished turns and waiting dialogs. */
+function AttentionSettings() {
+  const [notify, setNotify] = useState(readNotifyEnabled);
+  const [sound, setSound] = useState(readSoundEnabled);
+  const [testing, setTesting] = useState(false);
+  const permission = notificationPermission();
+  const canPush = pushSupported();
+
+  async function sendTest() {
+    setTesting(true);
+    try {
+      const report = await api.pushTest();
+      if (report.sent === 0) {
+        reportError(
+          report.failed > 0 ? "The push service refused the test notification." : "This device is not subscribed to push yet.",
+        );
+      }
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  const notifyHelp =
+    permission === "unsupported"
+      ? "This browser cannot show notifications here. On iPhone, add Pecan to the Home Screen and open it over HTTPS."
+      : permission === "denied"
+        ? "Blocked in browser settings. Allow notifications for this site to turn this on."
+        : canPush
+          ? "System notification when a turn finishes or Pi asks for input, even with Pecan closed."
+          : "System notification when a turn finishes or Pi asks for input while Pecan is in the background.";
+  return (
+    <SettingsSection icon={<BellIcon />} title="Notifications">
+      <SettingsRow
+        control={
+          <Switch
+            aria-label="System notifications"
+            checked={notify}
+            disabled={permission === "unsupported" || permission === "denied"}
+            onCheckedChange={(enabled) => {
+              void saveNotifyEnabled(enabled).then(setNotify);
+            }}
+          />
+        }
+        description={notifyHelp}
+        title="System notifications"
+      />
+      {notify && canPush ? (
+        <SettingsRow
+          control={
+            <Button className="min-h-11 md:min-h-8" disabled={testing} onClick={() => void sendTest()} size="xs" variant="outline">
+              {testing ? "Sending\u2026" : "Send test"}
+            </Button>
+          }
+          description="Sends a push notification to this device through its push service."
+          title="Test push"
+        />
+      ) : null}
+      <SettingsRow
+        control={
+          <Switch
+            aria-label="Sound"
+            checked={sound}
+            onCheckedChange={(enabled) => {
+              setSound(enabled);
+              saveSoundEnabled(enabled);
+            }}
+          />
+        }
+        description="A short chime with the tab-title badge when Pecan is in the background."
+        title="Sound"
+      />
+    </SettingsSection>
+  );
+}
+
 function SettingsSection({
   title,
   icon,
@@ -448,10 +543,12 @@ function ThemeButton({
 
 function TextSizeControl({
   title,
+  description,
   value,
   onChange,
 }: {
   title: string;
+  description: string;
   value: TextSize;
   onChange: (size: TextSize) => void;
 }) {
@@ -461,29 +558,31 @@ function TextSizeControl({
     { value: "large", label: "Large" },
   ];
   return (
-    <div aria-label={title} className="flex rounded-lg bg-muted p-0.5" role="group">
-      {options.map((option) => (
-        <button
-          aria-pressed={value === option.value}
-          className={cn(
-            "min-h-8 rounded-md px-2.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            value === option.value
-              ? "bg-background font-medium text-foreground shadow-xs"
-              : "text-muted-foreground hover:text-foreground",
-          )}
-          key={option.value}
-          onClick={() => onChange(option.value)}
-          type="button"
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
+    <SettingsRow
+      control={
+        <div aria-label={title} className="flex rounded-lg bg-muted p-0.5" role="group">
+          {options.map((option) => (
+            <button
+              aria-pressed={value === option.value}
+              className={cn(
+                "min-h-11 rounded-md px-2.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-8",
+                value === option.value
+                  ? "bg-background font-medium text-foreground shadow-xs"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              key={option.value}
+              onClick={() => onChange(option.value)}
+              type="button"
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      }
+      description={description}
+      title={title}
+    />
   );
-}
-
-function reportError(message: string) {
-  window.dispatchEvent(new CustomEvent("pecan:error", { detail: message }));
 }
 
 function sectionId(title: string) {
@@ -508,6 +607,7 @@ function FontControl({
     kind === "ui" ? readCustomUiFonts() : readCustomCodeFonts(),
   );
   const [customFont, setCustomFont] = useState("");
+  const [adding, setAdding] = useState(false);
   const systemLabel = kind === "ui" ? "System default (SF Pro)" : "System default (SF Mono)";
   const curated = kind === "ui" ? CURATED_UI_FONTS : CURATED_CODE_FONTS;
   const options = [...new Set([
@@ -535,30 +635,13 @@ function FontControl({
     setCustomFonts(next);
     onChange(value);
     setCustomFont("");
+    setAdding(false);
   }
 
   return (
     <SettingsRow
       control={
-        <div className="flex w-[min(17rem,calc(100vw-2.5rem))] flex-col items-stretch gap-1.5 sm:w-64">
-          <div className="flex gap-1.5">
-            <Input
-              aria-label={`Add ${title}`}
-              className="h-8 min-w-0 flex-1 text-[13px]"
-              onChange={(event) => setCustomFont(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  addFont();
-                }
-              }}
-              placeholder="Add a font family…"
-              value={customFont}
-            />
-            <Button disabled={!customFont.trim()} onClick={addFont} size="xs" variant="ghost">
-              Add
-            </Button>
-          </div>
+        <div className="flex w-[min(17rem,calc(100vw-2.5rem))] flex-col items-stretch gap-1 sm:w-64">
           <Select
             onValueChange={(next) => {
               if (!next) return;
@@ -566,10 +649,7 @@ function FontControl({
             }}
             value={code}
           >
-            <SelectTrigger
-              aria-label={title}
-              className="min-h-11 w-[min(17rem,calc(100vw-2.5rem))] sm:min-h-9 sm:w-64"
-            >
+            <SelectTrigger aria-label={title} className="min-h-11 w-full sm:min-h-9">
               <SelectValue>
                 <span
                   className="truncate"
@@ -595,17 +675,49 @@ function FontControl({
               ))}
             </SelectContent>
           </Select>
-          {canScan && installed.length === 0 ? (
-            <Button
-              className="self-start text-xs"
-              disabled={scanning}
-              onClick={() => void scan()}
-              size="xs"
-              variant="ghost"
-            >
-              {scanning ? "Scanning…" : "Scan installed fonts"}
-            </Button>
-          ) : null}
+          {adding ? (
+            <div className="flex gap-1.5">
+              <Input
+                aria-label={`Add ${title}`}
+                autoFocus
+                className="h-8 min-w-0 flex-1 text-[13px]"
+                onChange={(event) => setCustomFont(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    addFont();
+                  } else if (event.key === "Escape") {
+                    setAdding(false);
+                  }
+                }}
+                placeholder="Font family name"
+                value={customFont}
+              />
+              <Button disabled={!customFont.trim()} onClick={addFont} size="xs" variant="outline">
+                Add
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-end gap-3 text-xs text-muted-foreground">
+              <button
+                className="min-h-8 rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => setAdding(true)}
+                type="button"
+              >
+                Add font{"\u2026"}
+              </button>
+              {canScan && installed.length === 0 ? (
+                <button
+                  className="min-h-8 rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                  disabled={scanning}
+                  onClick={() => void scan()}
+                  type="button"
+                >
+                  {scanning ? "Scanning\u2026" : "Scan installed"}
+                </button>
+              ) : null}
+            </div>
+          )}
         </div>
       }
       description={

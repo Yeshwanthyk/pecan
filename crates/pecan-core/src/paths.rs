@@ -33,8 +33,8 @@ impl PiPaths {
                 return Ok(Self::from_agent_dir(dir));
             }
         }
-        let home = std::env::var("HOME").map_err(|_| CoreError::HomeMissing)?;
-        Ok(Self::from_agent_dir(Path::new(&home).join(".pi").join("agent")))
+        let home = std::env::home_dir().ok_or(CoreError::HomeMissing)?;
+        Ok(Self::from_agent_dir(home.join(".pi").join("agent")))
     }
 
     /// The pi agent directory root.
@@ -69,18 +69,26 @@ impl PiPaths {
 
     /// Directory pecan persists its own state into (`~/.pi/agent/pecan`).
     #[must_use]
-    pub fn state_dir(&self) -> PathBuf {
+    pub(crate) fn state_dir(&self) -> PathBuf {
         self.agent_dir.join("pecan")
     }
 
-    /// Path of pecan's state file.
-    /// Path of pecan's legacy JSON state file (imported once by the SQLite store).
+    /// Secret the local CLI presents to the server (`Authorization: Bearer`).
+    /// Created by `pecan serve` with owner-only permissions.
     #[must_use]
-    pub fn state_file(&self) -> PathBuf {
-        self.state_dir().join("state.json")
+    pub fn cli_token_file(&self) -> PathBuf {
+        self.state_dir().join("cli-token")
     }
 
-    /// Path of pecan's SQLite state database.
+    /// Private key (base64url P-256 scalar) that signs this server's web push
+    /// requests. Created by `pecan serve` with owner-only permissions;
+    /// replacing it invalidates every browser's push subscription.
+    #[must_use]
+    pub fn vapid_key_file(&self) -> PathBuf {
+        self.state_dir().join("vapid-key")
+    }
+
+    /// Path of pecan's `SQLite` state database.
     #[must_use]
     pub fn state_db(&self) -> PathBuf {
         self.state_dir().join("pecan.db")
@@ -98,6 +106,7 @@ mod tests {
         assert_eq!(paths.settings_file(), PathBuf::from("/tmp/fake-agent/settings.json"));
         assert_eq!(paths.workflows_dir(), PathBuf::from("/tmp/fake-agent/workflows"));
         assert_eq!(paths.tasks_dir(), PathBuf::from("/tmp/tasks"));
-        assert_eq!(paths.state_file(), PathBuf::from("/tmp/fake-agent/pecan/state.json"));
+        assert_eq!(paths.state_db(), PathBuf::from("/tmp/fake-agent/pecan/pecan.db"));
+        assert_eq!(paths.cli_token_file(), PathBuf::from("/tmp/fake-agent/pecan/cli-token"));
     }
 }

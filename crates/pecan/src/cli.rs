@@ -4,7 +4,7 @@
 //! tree (see [`seed`]) instead of touching the real `~/.pi`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use jiff::Timestamp;
 use pecan_core::scan::ScanCache;
@@ -12,7 +12,7 @@ use pecan_core::session::{SessionKind, SessionSummary};
 use pecan_core::store::StateStore;
 use pecan_core::tasks::{self, TaskList};
 use pecan_core::thread::{self, ThreadEntry};
-use pecan_core::workflows::{self, WorkflowRun};
+use pecan_core::workflows;
 use pecan_core::{CoreError, PiPaths};
 
 /// Errors surfaced by the CLI layer.
@@ -27,6 +27,12 @@ pub(crate) enum CliError {
     /// The command refused to run for safety reasons.
     #[error("refused: {0}")]
     Refused(String),
+    /// A server failed to start or crashed at runtime; not a usage mistake.
+    #[error("{0}")]
+    Startup(String),
+    /// Talking to a running server failed.
+    #[error(transparent)]
+    Control(#[from] crate::control::ControlError),
 }
 
 /// Dispatches one CLI invocation.
@@ -39,13 +45,26 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         Some((cmd, rest)) if cmd == "settle" => set_unsettle(rest, true),
         Some((cmd, rest)) if cmd == "reopen" => set_unsettle(rest, false),
         Some((cmd, rest)) if cmd == "serve" => crate::server::run(rest),
+        Some((cmd, rest)) if cmd == "session" => match rest.split_first() {
+            Some((verb, rest)) => crate::session_cmd::run_session(verb, rest),
+            None => crate::session_cmd::run_session("", &[]),
+        },
+        Some((cmd, rest)) if cmd == "events" => crate::session_cmd::run_events(rest),
+        Some((cmd, rest)) if cmd == "health" => crate::session_cmd::run_health(rest),
+        Some((cmd, rest)) if cmd == "pair" => crate::session_cmd::run_pair(rest),
+        Some((cmd, rest)) if cmd == "devices" => crate::session_cmd::run_devices(rest),
+        Some((cmd, rest)) if cmd == "remote" => crate::remote_cmd::run(rest),
+        Some((cmd, rest)) if cmd == "push" => crate::session_cmd::run_push(rest),
         Some((cmd, _rest)) if cmd == "seed-init" => seed_init(),
         Some((cmd, rest)) if cmd == "thread" => show_thread(arg(rest, "<session-id>")?),
         _ => Err(CliError::Usage(
             "expected one of: seed <dir> | seed-init | index [--all] [--json] [--project <cwd>] \
              | add <cwd> | remove <cwd> | settle <id> | reopen <id> | thread <id> \
              | serve [--host <ipv4>] [--port <port>] [--no-open] \
-               [--session <main-session-id>|latest [--cwd <absolute>]]"
+               [--session <main-session-id>|latest [--cwd <absolute>]] \
+             | session <new|send|wait|respond|abort|state|asks> \u{2026} | events [--session <id>] \
+             | health [--refresh] [--json] | pair [--url <base>] [--json] \
+             | devices [revoke <id>] [--json] | remote [--port <n>] [--enable] [--json] | push [test] [--json]"
                 .to_owned(),
         )),
     }
@@ -54,6 +73,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
 /// Builds a usage error from a message fragment.
 pub(crate) fn usage(message: &str) -> CliError {
     CliError::Usage(message.to_owned())
+}
+
+/// Builds a startup/runtime error from a message fragment (bind failures,
+/// missing directories, and other non-usage server faults).
+pub(crate) fn startup(message: &str) -> CliError {
+    CliError::Startup(message.to_owned())
 }
 
 fn arg<'a>(rest: &'a [String], what: &str) -> Result<&'a String, CliError> {
@@ -71,11 +96,7 @@ fn seed_init() -> Result<(), CliError> {
     let store = open_store(&paths)?;
     let before = store.projects()?.len();
     store.ensure_seeded(
-        sessions
-            .iter()
-            .filter(|s| s.kind == SessionKind::Normal)
-            .map(|s| s.cwd.clone())
-            .collect::<Vec<_>>(),
+        sessions.iter().filter(|s| s.kind == SessionKind::Normal).map(|s| s.cwd.clone()),
     )?;
     let added_now = store.projects()?.len() - before;
     println!("seeded allowlist: {added_now} projects added");
@@ -102,7 +123,6 @@ fn index(rest: &[String]) -> Result<(), CliError> {
     let filtered_by_allowlist = seeded && !show_all;
     sessions.retain(|s| project.is_none_or(|p| s.cwd == *p));
     let tasks_by_session = tasks::load_all(&paths.tasks_dir());
-    let workflows_by_session = workflows::load_all(&paths.workflows_dir());
     let settled_map = store.settled()?;
 
     if json {
@@ -128,7 +148,7 @@ fn index(rest: &[String]) -> Result<(), CliError> {
         println!("project   : (none added yet)");
     }
     if !seeded {
-        println!("(state not seeded yet — run `pecan seed-init` or start the server)");
+        println!("(state not seeded yet \u{2014} run `pecan seed-init` or start the server)");
     }
 
     let visible: Vec<SessionSummary> = if filtered_by_allowlist {
@@ -147,9 +167,9 @@ fn index(rest: &[String]) -> Result<(), CliError> {
     let mut settled: Vec<&SessionSummary> = visible.iter().filter(|s| is_settled(&s.id)).collect();
 
     println!("\nACTIVE ({})", active.len());
-    print_rows(&mut active, &settled_map, &tasks_by_session, &workflows_by_session);
+    print_rows(&mut active, &settled_map, &tasks_by_session);
     println!("\n-- settled -- ({})", settled.len());
-    print_rows(&mut settled, &settled_map, &tasks_by_session, &workflows_by_session);
+    print_rows(&mut settled, &settled_map, &tasks_by_session);
     Ok(())
 }
 
@@ -157,7 +177,6 @@ fn print_rows(
     rows: &mut [&SessionSummary],
     settled_map: &HashMap<String, i64>,
     tasks_by_session: &HashMap<String, Vec<TaskList>>,
-    workflows_by_session: &HashMap<String, Vec<WorkflowRun>>,
 ) {
     for s in rows.iter() {
         let mut tags: Vec<String> = Vec::new();
@@ -166,9 +185,6 @@ fn print_rows(
         }
         if tasks_by_session.contains_key(&s.id) {
             tags.push("tasks".to_owned());
-        }
-        if workflows_by_session.contains_key(&s.id) {
-            tags.push("workflows".to_owned());
         }
         if settled_map.contains_key(&s.id) {
             tags.push("settled".to_owned());
@@ -193,11 +209,9 @@ fn with_store(f: impl FnOnce(&StateStore) -> pecan_core::Result<()>) -> Result<(
     Ok(())
 }
 
-/// Opens the SQLite state store, importing any legacy `state.json` once.
+/// Opens the `SQLite` state store.
 pub(crate) fn open_store(paths: &PiPaths) -> pecan_core::Result<StateStore> {
-    let store = StateStore::open(&paths.state_db())?;
-    let _ = store.import_legacy_json(&paths.state_file());
-    Ok(store)
+    StateStore::open(&paths.state_db())
 }
 
 fn add_remove(rest: &[String], add: bool) -> Result<(), CliError> {
@@ -234,7 +248,10 @@ fn show_thread(session_id: &String) -> Result<(), CliError> {
             ThreadEntry::User { text, truncated, .. } => {
                 println!("[{clock}] USER   {}{}", first_line(text), ellipsis_flag(*truncated))
             }
-            ThreadEntry::Assistant { text, truncated, thinking, tools, model } => {
+            ThreadEntry::Assistant { text, truncated, thinking, tools, model, error } => {
+                if let Some(error) = error {
+                    println!("[{clock}] ERROR  {}", first_line(error));
+                }
                 println!(
                     "[{clock}] AI({}) {}{}",
                     model.as_deref().unwrap_or("?"),
@@ -260,6 +277,22 @@ fn show_thread(session_id: &String) -> Result<(), CliError> {
             }
             ThreadEntry::ToolError { text, truncated } => {
                 println!("[{clock}] ERROR  {}{}", first_line(text), ellipsis_flag(*truncated))
+            }
+            ThreadEntry::ChildQuestions { questions } => {
+                for q in questions {
+                    println!(
+                        "[{clock}] CHILD  {} asks ({}, {}): {}",
+                        q.child_id,
+                        q.request_id,
+                        if q.answered { "answered" } else { "UNANSWERED" },
+                        first_line(&q.question)
+                    );
+                }
+            }
+            ThreadEntry::ChildResults { results, .. } => {
+                for r in results {
+                    println!("[{clock}] CHILD  {} {:?} {}", r.id, r.title, r.status);
+                }
             }
         }
     }
@@ -291,9 +324,9 @@ fn seed(dir: &Path) -> Result<(), CliError> {
     let sessions_root = agent_dir.join("sessions");
     let tasks_root = dir.join("tasks");
     let workflows_root = agent_dir.join("workflows");
-    let _ = std::fs::remove_dir_all(&sessions_root);
-    let _ = std::fs::remove_dir_all(&tasks_root);
-    let _ = std::fs::remove_dir_all(&workflows_root);
+    std::fs::remove_dir_all(&sessions_root).unwrap_or_default();
+    std::fs::remove_dir_all(&tasks_root).unwrap_or_default();
+    std::fs::remove_dir_all(&workflows_root).unwrap_or_default();
     std::fs::create_dir_all(&sessions_root)
         .map_err(|source| CoreError::Io { path: sessions_root.clone(), source })?;
 
@@ -306,7 +339,6 @@ fn seed(dir: &Path) -> Result<(), CliError> {
 
     struct Spec {
         uuid: String,
-        project_dir: PathBuf,
         cwd: String,
         title: String,
         hours_ago: i64,
@@ -317,12 +349,12 @@ fn seed(dir: &Path) -> Result<(), CliError> {
         WithBash,
         WithOpenAskUser,
         Scout,
+        WorkflowChild,
     }
 
-    let specs = vec![
+    let specs = [
         Spec {
             uuid: "00000000-0000-4000-8000-000000000001".to_owned(),
-            project_dir: projects[0].1.clone(),
             cwd: projects[0].1.display().to_string(),
             title: "Fix flaky retry queue test in worker pool".to_owned(),
             hours_ago: 2,
@@ -330,7 +362,6 @@ fn seed(dir: &Path) -> Result<(), CliError> {
         },
         Spec {
             uuid: "00000000-0000-4000-8000-000000000002".to_owned(),
-            project_dir: projects[0].1.clone(),
             cwd: projects[0].1.display().to_string(),
             title: "Add tailscale serve detection".to_owned(),
             hours_ago: 120,
@@ -338,7 +369,6 @@ fn seed(dir: &Path) -> Result<(), CliError> {
         },
         Spec {
             uuid: "00000000-0000-4000-8000-000000000003".to_owned(),
-            project_dir: projects[1].1.clone(),
             cwd: projects[1].1.display().to_string(),
             title: "Design checkout sidebar states".to_owned(),
             hours_ago: 26,
@@ -346,7 +376,6 @@ fn seed(dir: &Path) -> Result<(), CliError> {
         },
         Spec {
             uuid: "00000000-0000-4000-8000-000000000004".to_owned(),
-            project_dir: projects[1].1.clone(),
             cwd: projects[1].1.display().to_string(),
             title: "Migrate product images to CDN".to_owned(),
             hours_ago: 200,
@@ -354,7 +383,6 @@ fn seed(dir: &Path) -> Result<(), CliError> {
         },
         Spec {
             uuid: "00000000-0000-4000-8000-000000000005".to_owned(),
-            project_dir: projects[2].1.clone(),
             cwd: projects[2].1.display().to_string(),
             title: "Notes on io_uring batching".to_owned(),
             hours_ago: 720,
@@ -362,18 +390,24 @@ fn seed(dir: &Path) -> Result<(), CliError> {
         },
         Spec {
             uuid: "00000000-0000-4000-8000-000000000006".to_owned(),
-            project_dir: sessions_root.join("--tmp-pi-subagent-codex-scout-src--"),
             cwd: "/tmp/pi-subagent-codex-scout/src".to_owned(),
             title: "scout: survey rpc docs".to_owned(),
             hours_ago: 2,
             body: Body::Scout,
+        },
+        Spec {
+            uuid: "00000000-0000-4000-8000-000000000007".to_owned(),
+            cwd: projects[0].1.display().to_string(),
+            title: "Fix queue race".to_owned(),
+            hours_ago: 1,
+            body: Body::WorkflowChild,
         },
     ];
 
     let mut seeded_ids: Vec<(String, String)> = Vec::new();
     for spec in specs.iter() {
         let opened = now - jiff::Span::new().hours(spec.hours_ago);
-        let munged = munge_cwd(&spec.project_dir, &spec.cwd);
+        let munged = munge_cwd(&spec.cwd);
         let target = sessions_root.join(&munged);
         std::fs::create_dir_all(&target)
             .map_err(|source| CoreError::Io { path: target.clone(), source })?;
@@ -389,6 +423,19 @@ fn seed(dir: &Path) -> Result<(), CliError> {
             "modelId": "claude-sonnet-4-5",
         });
         let mut lines = vec![header.to_string()];
+        if matches!(spec.body, Body::WorkflowChild) {
+            // pi-subagents names a workflow child `workflow:<runId>: <task label>`
+            // before its first message.
+            lines.push(
+                serde_json::json!({
+                    "type": "session_info",
+                    "id": "seedinfo",
+                    "timestamp": opened.to_string(),
+                    "name": format!("workflow:{SEED_WORKFLOW_RUN}: {}", spec.title),
+                })
+                .to_string(),
+            );
+        }
         let t1 = opened + jiff::Span::new().seconds(30);
         lines.push(message_line(
             &t1,
@@ -397,9 +444,9 @@ fn seed(dir: &Path) -> Result<(), CliError> {
             }),
         ));
         match spec.body {
-            Body::Plain => {
+            Body::Plain | Body::WorkflowChild => {
                 let t2 = t1 + jiff::Span::new().seconds(20);
-                lines.push(message_line(&t2, assistant_text("On it — will report back.")));
+                lines.push(message_line(&t2, assistant_text("On it \u{2014} will report back.")));
             }
             Body::WithBash | Body::Scout => {
                 let t2 = t1 + jiff::Span::new().seconds(5);
@@ -424,7 +471,66 @@ fn seed(dir: &Path) -> Result<(), CliError> {
                         "content": [{"type": "text", "text": "test result: ok. 42 passed"}],
                     }),
                 ));
-                let t4 = t3 + jiff::Span::new().seconds(15);
+                let mut t4 = t3 + jiff::Span::new().seconds(15);
+                if matches!(spec.body, Body::WithBash) {
+                    lines.push(message_line(
+                        &t4,
+                        serde_json::json!({
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-5",
+                            "content": [
+                                {"type": "toolCall", "id": "call_seed_wf", "name": "workflow",
+                                 "arguments": {"draftId": "draft_seed0001"}},
+                            ],
+                        }),
+                    ));
+                    lines.push(message_line(
+                        &(t4 + jiff::Span::new().seconds(1)),
+                        serde_json::json!({
+                            "role": "toolResult", "toolCallId": "call_seed_wf",
+                            "toolName": "workflow", "isError": false,
+                            "details": {"kind": "run", "draftId": "draft_seed0001",
+                                        "runId": SEED_WORKFLOW_RUN, "status": "running"},
+                            "content": [{"type": "text", "text": "Workflow started"}],
+                        }),
+                    ));
+                    t4 += jiff::Span::new().seconds(5);
+                    // A child `ask_parent` question, the parent's reply, and
+                    // the child's result handoff (pi-subagents notices).
+                    let deadline = (t4 + jiff::Span::new().minutes(5)).as_millisecond();
+                    lines.push(custom_line(
+                        &t4,
+                        "subagent-question-batch",
+                        "Child sa-1 asks (request pq-1): Keep the retry cap at 3?",
+                        serde_json::json!({"questions": [
+                            {"childId": "sa-1", "requestId": "pq-1",
+                             "question": "Keep the retry cap at 3, or raise it to 5?",
+                             "context": "Raising it hides the race instead of fixing it.",
+                             "deadlineAt": deadline},
+                        ]}),
+                    ));
+                    lines.push(message_line(
+                        &(t4 + jiff::Span::new().seconds(2)),
+                        serde_json::json!({
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-5",
+                            "content": [
+                                {"type": "toolCall", "id": "call_seed_reply", "name": "subagent_send",
+                                 "arguments": {"id": "sa-1", "mode": "reply", "requestId": "pq-1",
+                                               "message": "Keep 3; fix the race."}},
+                            ],
+                        }),
+                    ));
+                    lines.push(custom_line(
+                        &(t4 + jiff::Span::new().seconds(4)),
+                        "subagent-result-batch",
+                        "Subagent sa-1 \"scout\" finished.\n\nRetry cap stays at 3; the race is in `drain()`.",
+                        serde_json::json!({"results": [
+                            {"id": "sa-1", "title": "scout", "status": "done"},
+                        ]}),
+                    ));
+                    t4 += jiff::Span::new().seconds(5);
+                }
                 let text = if matches!(spec.body, Body::Scout) {
                     "Surveyed RPC docs; steering contract confirmed."
                 } else {
@@ -477,22 +583,38 @@ fn seed(dir: &Path) -> Result<(), CliError> {
     std::fs::write(&task_file, format!("{task_doc:#}\n"))
         .map_err(|source| CoreError::Io { path: task_file.clone(), source })?;
 
-    // Workflow run attached to the same session.
-    let wf_dir = workflows_root.join("wf_seed0001");
-    std::fs::create_dir_all(&wf_dir)
-        .map_err(|source| CoreError::Io { path: wf_dir.clone(), source })?;
-    let wf_doc = serde_json::json!({
-        "runId": "wf_seed0001",
-        "sessionId": "00000000-0000-4000-8000-000000000001",
-        "name": "parallel-fix-review",
-        "status": "completed",
-        "agents": [
-            {"label": "fixer", "phase": "Fix", "state": "done"},
-            {"label": "reviewer", "phase": "Review", "state": "done"},
-        ],
-    });
-    std::fs::write(wf_dir.join("workflow.json"), format!("{wf_doc:#}\n"))
-        .map_err(|source| CoreError::Io { path: wf_dir.clone(), source })?;
+    // pi-subagents workflow journal referenced by the live pecan session.
+    let journal = workflows::journal_path(
+        &workflows_root,
+        &projects[0].1.display().to_string(),
+        SEED_WORKFLOW_RUN,
+    );
+    let at = now.as_millisecond();
+    let run = SEED_WORKFLOW_RUN;
+    let events = serde_json::json!([
+        {"_tag": "WorkflowCreated", "runId": run, "at": at - 60_000, "definition": {
+            "name": "parallel-fix-review",
+            "description": "Fix the queue race, then review the patch",
+            "tasks": [
+                {"id": "fix", "label": "Fix queue race", "kind": "writer", "prompt": "fix",
+                 "owns": ["src/queue.rs"]},
+                {"id": "review", "label": "Review patch", "kind": "review", "prompt": "review",
+                 "needs": ["fix"], "readOnly": true},
+            ]}},
+        {"_tag": "WorkflowStarted", "runId": run, "at": at - 59_000},
+        {"_tag": "TaskQueued", "runId": run, "at": at - 58_000, "taskId": "fix", "childId": "sa-1"},
+        {"_tag": "TaskStarted", "runId": run, "at": at - 57_000, "taskId": "fix"},
+        {"_tag": "TaskCompleted", "runId": run, "at": at - 20_000, "taskId": "fix",
+         "resultPreview": "Guarded the retry queue with a single owner; test green."},
+        {"_tag": "TaskQueued", "runId": run, "at": at - 19_000, "taskId": "review", "childId": "sa-2"},
+        {"_tag": "TaskStarted", "runId": run, "at": at - 18_000, "taskId": "review"},
+    ]);
+    if let Some(dir) = journal.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|source| CoreError::Io { path: dir.to_owned(), source })?;
+    }
+    std::fs::write(&journal, format!("{events:#}\n"))
+        .map_err(|source| CoreError::Io { path: journal.clone(), source })?;
 
     println!(
         "seeded {} sessions across {} projects under {}",
@@ -506,8 +628,11 @@ fn seed(dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Workflow run the fixture seed links to its live pecan session.
+const SEED_WORKFLOW_RUN: &str = "wf-seed0001";
+
 /// Builds the munged per-project directory name exactly as pi stores it.
-fn munge_cwd(_project_dir: &Path, cwd: &str) -> String {
+fn munge_cwd(cwd: &str) -> String {
     format!("-{}-", cwd.replace('/', "-"))
 }
 
@@ -536,6 +661,24 @@ fn message_line(ts: &Timestamp, message: serde_json::Value) -> String {
     .to_string()
 }
 
+/// One displayed extension `custom_message` transcript line.
+fn custom_line(
+    ts: &Timestamp,
+    custom_type: &str,
+    content: &str,
+    details: serde_json::Value,
+) -> String {
+    serde_json::json!({
+        "type": "custom_message",
+        "customType": custom_type,
+        "content": content,
+        "display": true,
+        "details": details,
+        "timestamp": ts.to_string(),
+    })
+    .to_string()
+}
+
 /// Assistant message payload with plain text content.
 fn assistant_text(text: &str) -> serde_json::Value {
     serde_json::json!({
@@ -560,5 +703,5 @@ fn first_line(text: &str) -> String {
 }
 
 fn ellipsis_flag(truncated: bool) -> &'static str {
-    if truncated { " …" } else { "" }
+    if truncated { " \u{2026}" } else { "" }
 }

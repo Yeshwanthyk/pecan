@@ -11,12 +11,17 @@
 //! pecan settle|reopen <id>    fold/unfold a thread
 //! pecan thread <id>           dump a parsed transcript
 //! pecan serve [--port N]      run the local web UI
+//! pecan session <verb> …      drive live sessions on a running server
+//! pecan events [--session id] stream server events as JSONL
 //! ```
 #![allow(clippy::print_stdout, reason = "binary entrypoint CLI output")]
 #![allow(clippy::print_stderr, reason = "binary entrypoint CLI diagnostics")]
 
 mod cli;
+mod control;
+mod remote_cmd;
 mod server;
+mod session_cmd;
 
 use std::process::ExitCode;
 

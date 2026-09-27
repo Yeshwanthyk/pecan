@@ -1,16 +1,19 @@
 /**
- * Grouped app sidebar: brand header, Projects group, recent Sessions group,
- * settled shelf, footer. Docked on desktop, Sheet on mobile (via `Sidebar`).
- * Session rows are capped — the full index can hold thousands.
+ * App sidebar: brand header, pinned sessions, a project tree with each
+ * project's open sessions nested under it, the Done shelf, and the footer.
+ * Docked on desktop, Sheet on mobile (via `Sidebar`). Rows per project are
+ * capped — the full index can hold thousands.
  */
 import {
   ChevronRightIcon,
   SettingsIcon,
+  SquarePenIcon,
   LoaderCircleIcon,
   PinIcon,
   PinOffIcon,
   PlusIcon,
   RefreshCwIcon,
+  type LucideIcon,
 } from "lucide-react";
 import {
   useEffect,
@@ -22,12 +25,7 @@ import {
 
 import { api, readAiTitleGenerationEnabled } from "~/api/client";
 import type { SessionRow as SessionRowData } from "~/api/types";
-import { Button } from "~/components/ui/button";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "~/components/ui/popover";
+import { reportError } from "~/lib/errors";
 import {
   Sidebar,
   SidebarContent,
@@ -40,28 +38,51 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "~/components/ui/sidebar";
-import { ProjectsGroup } from "~/components/projects-group";
+import {
+  AddProjectForm,
+  Collapse,
+  ProjectFolder,
+  useCollapsedProjects,
+} from "~/components/projects-group";
+import { Spinner } from "~/components/ui/spinner";
 import { useApp } from "~/store";
+import { startSession } from "~/lib/sessions";
 import { cn } from "~/lib/utils";
 
-const MAX_ACTIVE_ROWS = 30;
+const MAX_PROJECT_ROWS = 6;
 const MAX_SETTLED_ROWS = 50;
 
 export function AppSidebar() {
   return (
     <Sidebar collapsible="offcanvas">
-      <SidebarHeader className="min-h-12 flex-row items-center border-b border-sidebar-border px-3 py-2">
+      <SidebarHeader className="min-h-12 flex-row items-center gap-2 px-4 pt-3 pb-1">
+        <BrandMark />
         <span className="text-sm font-semibold tracking-[-0.01em]">Pecan</span>
         <ConnectionStatus />
       </SidebarHeader>
-      <SidebarContent className="gap-0">
-        <ProjectsGroup />
-        <SessionsGroup />
+      <SidebarContent className="gap-0 px-1">
+        <PrimaryNav />
+        <SessionTree />
       </SidebarContent>
-      <SidebarFooter className="border-t border-sidebar-border p-2">
+      <SidebarFooter className="p-2">
         <SettingsLink />
       </SidebarFooter>
     </Sidebar>
+  );
+}
+
+/** Rounded pecan-coloured monogram; the only brand colour in the chrome. */
+export function BrandMark({ className }: { className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "flex size-5 shrink-0 items-center justify-center rounded-[6px] bg-brand text-[11px] font-bold leading-none text-white dark:text-black",
+        className,
+      )}
+    >
+      p
+    </span>
   );
 }
 
@@ -70,17 +91,47 @@ function ConnectionStatus() {
   return (
     <span
       className="ml-auto flex items-center gap-1.5 text-[11px] font-medium text-sidebar-muted-foreground"
+      role="status"
       title={connected ? "Live updates connected" : "Reconnecting…"}
     >
       <span
         aria-hidden
         className={cn(
-          "size-1.5 rounded-full",
-          connected ? "bg-success" : "animate-pulse bg-warning",
+          "size-2 rounded-full",
+          connected ? "bg-success/80" : "animate-pulse bg-warning",
         )}
       />
-      {connected ? "Live" : "Reconnecting"}
+      <span className={connected ? "sr-only" : undefined}>
+        {connected ? "Live" : "Reconnecting"}
+      </span>
     </span>
+  );
+}
+
+/** Top-level actions, styled as quiet icon rows. */
+function PrimaryNav() {
+  const projects = useApp((state) => state.bootstrap)?.projects ?? [];
+  const openCwd = useApp((state) => state.thread?.summary.cwd);
+  const startingCwd = useApp((state) => state.startingCwd);
+  const onlyProject =
+    projects.find((project) => project.cwd === openCwd) ??
+    (projects.length === 1 ? projects[0] : undefined);
+  return (
+    <SidebarMenu className="px-1 pt-1 pb-2">
+      {onlyProject ? (
+        <SidebarMenuItem>
+          <SidebarMenuButton
+            className="h-9 text-sidebar-muted-foreground md:h-8 md:text-[13px]"
+            data-testid="nav-new-session"
+            disabled={startingCwd !== null}
+            onClick={() => void startSession(onlyProject.cwd)}
+          >
+            {startingCwd ? <Spinner className="size-4" /> : <SquarePenIcon />}
+            <span>New session</span>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      ) : null}
+    </SidebarMenu>
   );
 }
 
@@ -91,7 +142,7 @@ function SettingsLink() {
       render={<NavHashLink href="#/settings" />}
       isActive={active}
       tooltip="Settings"
-      className="min-h-11 w-full px-2.5 md:min-h-8"
+      className="min-h-10 w-full px-2.5 text-sidebar-muted-foreground md:min-h-8 md:text-[13px]"
     >
       <SettingsIcon />
       <span>Settings</span>
@@ -99,167 +150,151 @@ function SettingsLink() {
   );
 }
 
-function SessionsGroup() {
+function SessionTree() {
   const sessions = useApp((state) => state.sessions);
-  const bootstrap = useApp((state) => state.bootstrap);
-  const activeRoute = useActiveSessionRoute();
-  const activeId = activeRoute?.sessionId ?? null;
-  const activeProject = useActiveProjectPath();
+  const projects = useApp((state) => state.bootstrap)?.projects ?? [];
+  const activeId = useActiveSessionRoute()?.sessionId ?? null;
+  const { collapsed, toggle } = useCollapsedProjects();
+  const [adding, setAdding] = useState(false);
 
-  // Only sessions belonging to projects the user explicitly linked are
-  // tracked, matching pican's curated-sidebar model.
-  const addedCwds = useMemo(
-    () => new Set(bootstrap?.projects.map((project) => project.cwd)),
-    [bootstrap],
-  );
-
-  const { pinned, active, settled } = useMemo(() => {
-    const scoped = sessions.filter(
-      (row) => addedCwds.has(row.cwd) || row.kind === "subagent",
-    );
-    const byRecency = [...scoped].sort(
-      (a, b) => Date.parse(b.lastActivity) - Date.parse(a.lastActivity),
-    );
+  const { pinned, byProject, settled } = useMemo(() => {
+    const cwds = new Set(projects.map((project) => project.cwd));
+    // Child threads are navigated from their parent's agent rail, where the
+    // exact parent route is available; only linked projects are tracked.
+    const rows = sessions
+      .filter((row) => row.kind !== "subagent" && cwds.has(row.cwd))
+      .sort((a, b) => Date.parse(b.lastActivity) - Date.parse(a.lastActivity));
+    const grouped = new Map<string, SessionRowData[]>();
+    for (const row of rows) {
+      if (row.settled || row.pinned) continue;
+      const list = grouped.get(row.cwd);
+      if (list) list.push(row);
+      else grouped.set(row.cwd, [row]);
+    }
     return {
-      // Child threads are navigated from their parent's bottom agent rail,
-      // where the exact parent route is available.
-      pinned: byRecency.filter(
-        (row) => row.kind !== "subagent" && !row.settled && row.pinned,
-      ),
-      active: byRecency.filter((row) => row.kind !== "subagent" && !row.settled),
-      settled: byRecency.filter((row) => row.kind !== "subagent" && row.settled),
+      pinned: rows.filter((row) => !row.settled && row.pinned),
+      byProject: grouped,
+      settled: rows.filter((row) => row.settled),
     };
-  }, [sessions, addedCwds]);
-
-  const visible = activeProject
-    ? active.filter((row) => row.cwd === activeProject)
-    : active.filter((row) => !row.pinned);
+  }, [sessions, projects]);
 
   return (
-    <SidebarGroup className="flex-1 border-t border-sidebar-border pt-1.5">
-      <div className="flex min-h-9 items-center px-2">
-        <SidebarGroupLabel className="h-auto flex-1 px-0 text-xs font-semibold">
-          {activeProject ? projectName(activeProject) : "Sessions"}
-        </SidebarGroupLabel>
-        <NewSessionMenu projects={bootstrap?.projects ?? []} />
-      </div>
-      <SidebarGroupContent>
-        <SidebarMenu>
-          {pinned.length > 0 && !activeProject ? (
-            <>
-              <ListSectionLabel count={pinned.length}>Pinned</ListSectionLabel>
-              {pinned.map((row) => (
-                <SessionRow key={row.id} active={row.id === activeId} row={row} />
-              ))}
-              {visible.length > 0 ? <ListSectionLabel>Recent</ListSectionLabel> : null}
-            </>
-          ) : null}
-          {visible.slice(0, MAX_ACTIVE_ROWS).map((row) => (
-            <SessionRow key={row.id} active={row.id === activeId} row={row} />
-          ))}
-          {visible.length > MAX_ACTIVE_ROWS ? (
-            <li className="px-2 py-2 text-xs text-sidebar-muted-foreground">
-              {visible.length - MAX_ACTIVE_ROWS} older sessions not shown
-            </li>
-          ) : null}
-          {visible.length === 0 && (activeProject !== null || pinned.length === 0) ? (
-            <li className="px-2 py-2 text-xs leading-5 text-sidebar-muted-foreground">
-              {addedCwds.size === 0
-                ? "Link a project to see its sessions."
-                : "No unsettled sessions"}
-            </li>
-          ) : null}
-        </SidebarMenu>
-        {activeProject ? null : (
+    <>
+      {pinned.length > 0 ? (
+        <SidebarGroup className="py-1">
+          <GroupHeading>Pinned</GroupHeading>
+          <SidebarMenu>
+            {pinned.map((row, index) => (
+              <SessionRow key={row.id} active={row.id === activeId} index={index} row={row} />
+            ))}
+          </SidebarMenu>
+        </SidebarGroup>
+      ) : null}
+      <SidebarGroup className="flex-1 py-1">
+        <GroupHeading
+          action={{
+            icon: PlusIcon,
+            label: "Add project",
+            pressed: adding,
+            onClick: () => setAdding((value) => !value),
+          }}
+        >
+          Projects
+        </GroupHeading>
+        <SidebarGroupContent>
+          <Collapse open={adding}>
+            <div className="px-1 pt-1 pb-2">
+              {adding ? <AddProjectForm onDone={() => setAdding(false)} /> : null}
+            </div>
+          </Collapse>
+          <SidebarMenu className="gap-0.5">
+            {projects.map((project) => (
+              <ProjectFolder
+                key={project.cwd}
+                onToggle={() => toggle(project.cwd)}
+                open={!collapsed.has(project.cwd)}
+                project={project}
+              >
+                <ProjectSessions activeId={activeId} rows={byProject.get(project.cwd) ?? []} />
+              </ProjectFolder>
+            ))}
+            {projects.length === 0 && !adding ? (
+              <li className="px-2 py-1 text-xs leading-5 text-sidebar-muted-foreground">
+                No projects yet. Tap + and paste a folder path.
+              </li>
+            ) : null}
+          </SidebarMenu>
           <SettledShelf activeId={activeId} rows={settled} />
-        )}
-      </SidebarGroupContent>
-    </SidebarGroup>
+        </SidebarGroupContent>
+      </SidebarGroup>
+    </>
   );
 }
 
-function ListSectionLabel({
+function GroupHeading({
   children,
-  count,
+  action,
 }: {
   children: ReactNode;
-  count?: number;
+  action?: { icon: LucideIcon; label: string; pressed: boolean; onClick: () => void };
 }) {
   return (
-    <li className="flex h-7 items-center gap-1 px-2 text-[11px] font-medium text-sidebar-muted-foreground">
-      <span>{children}</span>
-      {count === undefined ? null : (
-        <span className="tabular-nums opacity-80">{count}</span>
-      )}
-    </li>
+    <div className="flex min-h-9 items-center px-2">
+      <SidebarGroupLabel className="h-auto flex-1 px-0 text-xs font-normal text-sidebar-muted-foreground">
+        {children}
+      </SidebarGroupLabel>
+      {action ? (
+        <button
+          aria-label={action.label}
+          aria-pressed={action.pressed}
+          className="-me-1 flex size-11 items-center justify-center rounded-md text-sidebar-muted-foreground outline-none transition-[color,background-color,rotate] duration-200 hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring aria-pressed:rotate-45 md:size-6"
+          onClick={action.onClick}
+          title={action.label}
+          type="button"
+        >
+          <action.icon className="size-3.5" />
+        </button>
+      ) : null}
+    </div>
   );
 }
 
-function NewSessionMenu({
-  projects,
+/** A project's open sessions, indented so titles align with the folder name. */
+function ProjectSessions({
+  rows,
+  activeId,
 }: {
-  projects: Array<{ cwd: string; name: string }>;
+  rows: SessionRowData[];
+  activeId: string | null;
 }) {
-  const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function create(cwd: string) {
-    setBusy(true);
-    setError(null);
-    try {
-      const { id } = await api.newSession(cwd);
-      setOpen(false);
-      location.hash = `#/s/${id}`;
-      window.dispatchEvent(new CustomEvent("pecan:refresh"));
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (projects.length === 0) return null;
+  const [expanded, setExpanded] = useState(false);
+  // Keep the open session visible even when it sits past the cap.
+  const activeIndex = rows.findIndex((row) => row.id === activeId);
+  const limit = expanded ? rows.length : Math.max(MAX_PROJECT_ROWS, activeIndex + 1);
+  const hidden = rows.length - limit;
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        aria-label="New session"
-        className="size-11 md:size-7"
-        render={<Button size="icon-xs" variant="ghost" />}
-      >
-        <PlusIcon />
-      </PopoverTrigger>
-      <PopoverContent align="end" className="w-60 p-1" side="bottom">
-        <p className="px-2 py-1 text-[11px] text-muted-foreground">
-          Start a session in
-        </p>
-        {projects.map((project) => (
+    <SidebarMenu className="ps-2.5 pt-0.5 pb-1.5">
+      {rows.slice(0, limit).map((row, index) => (
+        <SessionRow key={row.id} active={row.id === activeId} index={index} row={row} />
+      ))}
+      {rows.length === 0 ? (
+        <li className="px-[var(--sidebar-row-content-inset)] py-1 ps-[calc(var(--sidebar-row-content-inset)+14px)] text-xs text-sidebar-muted-foreground/80">
+          No open sessions
+        </li>
+      ) : null}
+      {hidden > 0 || expanded ? (
+        <li>
           <button
-            className="flex min-h-11 w-full items-center gap-2 rounded-md px-2.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-8 md:text-[13px]"
-            disabled={busy}
-            key={project.cwd}
-            onClick={() => void create(project.cwd)}
+            className="flex min-h-9 w-full items-center rounded-[var(--control-radius)] ps-[calc(var(--sidebar-row-content-inset)+14px)] text-xs text-sidebar-muted-foreground outline-none transition-colors hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-7"
+            onClick={() => setExpanded((value) => !value)}
             type="button"
           >
-            <span className="truncate">{project.name}</span>
+            {expanded ? "Show less" : `Show ${hidden} more`}
           </button>
-        ))}
-        {error ? (
-          <p className="px-2 py-1 text-[11px] text-destructive">{error}</p>
-        ) : null}
-      </PopoverContent>
-    </Popover>
+        </li>
+      ) : null}
+    </SidebarMenu>
   );
-}
-
-function useActiveProjectPath(): string | null {
-  const hash = useHash();
-  if (!hash.startsWith("#/p/")) return null;
-  try {
-    return decodeURIComponent(hash.slice(4));
-  } catch {
-    return null;
-  }
 }
 
 function SettledShelf({
@@ -273,7 +308,7 @@ function SettledShelf({
   const toggle = useApp((state) => state.toggleSettledFold);
   if (rows.length === 0) return null;
   return (
-    <div className="mt-1.5 border-t border-sidebar-border pt-1.5">
+    <div className="mt-2 pt-1">
       <button
         aria-expanded={open}
         className="flex min-h-11 w-full items-center gap-1.5 rounded-[var(--control-radius)] px-2 text-xs font-medium text-sidebar-muted-foreground outline-none hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
@@ -281,18 +316,21 @@ function SettledShelf({
         type="button"
       >
         <ChevronRightIcon
-          className={cn("size-3.5 transition-transform", open && "rotate-90")}
+          className={cn(
+            "size-3.5 transition-transform duration-200 ease-[cubic-bezier(0.2,0,0,1)]",
+            open && "rotate-90",
+          )}
         />
-        Settled
+        Done
         <span className="ms-auto tabular-nums opacity-80">{rows.length}</span>
       </button>
-      {open ? (
+      <Collapse open={open}>
         <SidebarMenu>
           {rows.slice(0, MAX_SETTLED_ROWS).map((row) => (
             <SessionRow key={row.id} active={row.id === activeId} row={row} />
           ))}
         </SidebarMenu>
-      ) : null}
+      </Collapse>
     </div>
   );
 }
@@ -300,10 +338,18 @@ function SettledShelf({
 function SessionRow({
   row,
   active,
+  index = 0,
 }: {
   row: SessionRowData;
   active: boolean;
+  index?: number;
 }) {
+  const waiting = useApp(
+    (state) => row.waitingAskuser || (state.pendingAsks[row.id]?.length ?? 0) > 0,
+  );
+  const running = useApp(
+    (state) => !waiting && state.streaming && state.thread?.summary.id === row.id,
+  );
   const [titlePending, setTitlePending] = useState(false);
   const [aiTitlesEnabled, setAiTitlesEnabled] = useState(
     readAiTitleGenerationEnabled,
@@ -323,8 +369,8 @@ function SessionRow({
       if (row.pinned) await api.unpin(row.id);
       else await api.pin(row.id);
       window.dispatchEvent(new CustomEvent("pecan:refresh"));
-    } catch {
-      /* transient */
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : "Failed to update pin.");
     }
   }
 
@@ -354,36 +400,43 @@ function SessionRow({
 
   return (
     <SidebarMenuItem
-      className="group/row flex min-h-11 items-stretch rounded-[var(--control-radius)] outline-none ring-ring hover:bg-sidebar-row-hover focus-within:ring-2 data-[active=true]:bg-sidebar-row-selected md:min-h-9"
+      className="group/row flex min-h-11 animate-row-in items-stretch rounded-[var(--control-radius)] outline-none ring-ring transition-colors duration-150 hover:bg-sidebar-row-hover focus-within:ring-2 data-[active=true]:bg-sidebar-row-selected md:min-h-8"
       data-active={active}
+      style={{ animationDelay: `${Math.min(index, 8) * 24}ms` }}
     >
       <NavHashLink
         aria-current={active ? "page" : undefined}
-        className="flex min-w-0 flex-1 flex-col justify-center px-[var(--sidebar-row-content-inset)] py-1 outline-none"
+        className="flex min-w-0 flex-1 flex-col justify-center px-[var(--sidebar-row-content-inset)] outline-none transition-transform duration-100 active:scale-[0.985]"
         href={`#/s/${row.id}`}
       >
-        <span className="flex w-full items-center gap-1.5">
-          {row.waitingAskuser ? (
-            <span
-              className="size-1.5 shrink-0 rounded-full bg-warning"
-              title="Waiting for your answer"
-            />
-          ) : (
-            <span className="size-1.5 shrink-0" />
-          )}
-          <span className="truncate text-sm font-medium leading-4 text-sidebar-foreground md:text-[13px]">
+        <span className="flex w-full items-center gap-2">
+          <StatusDot running={running} waiting={waiting} />
+          <span
+            className={cn(
+              "truncate text-sm leading-5 transition-colors md:text-[13px]",
+              running
+                ? "text-shimmer"
+                : active
+                  ? "text-sidebar-foreground"
+                  : "text-sidebar-foreground/80",
+            )}
+          >
             {row.title ?? row.preview ?? row.id.slice(0, 8)}
           </span>
-          <span className="ms-auto shrink-0 ps-1 text-[11px] tabular-nums text-sidebar-muted-foreground">
+          {waiting ? <span className="sr-only">Waiting for your answer</span> : null}
+          {running ? <span className="sr-only">Working</span> : null}
+          <span
+            className={cn(
+              "ms-auto shrink-0 ps-1 text-[11px] tabular-nums text-sidebar-muted-foreground/80 transition-opacity md:group-hover/row:opacity-0 md:group-focus-within/row:opacity-0",
+              row.pinned && "md:opacity-0",
+            )}
+          >
             {timeLabel(row.lastActivity)}
+            {row.kind === "subagent" ? " · sub" : ""}
           </span>
         </span>
-        <span className="ps-3 text-xs leading-3.5 text-sidebar-muted-foreground md:text-[10px]">
-          {projectName(row.cwd)}
-          {row.kind === "subagent" ? " · sub" : ""}
-        </span>
       </NavHashLink>
-      <span className="flex shrink-0 items-center pe-0.5 md:pe-1">
+      <span className="flex shrink-0 items-center pe-0.5 md:absolute md:inset-y-0 md:end-0 md:pe-1">
         {aiTitlesEnabled ? (
           <button
             aria-label={titleAction}
@@ -409,7 +462,7 @@ function SessionRow({
             "flex size-11 items-center justify-center rounded-md text-sidebar-muted-foreground outline-none hover:bg-sidebar-row-active hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring md:size-7",
             row.pinned
               ? "text-sidebar-foreground"
-              : "md:pointer-events-none md:opacity-0 md:group-focus-within/row:pointer-events-auto md:group-focus-within/row:opacity-100 md:group-hover/row:pointer-events-auto md:group-hover/row:opacity-100",
+              : "text-sidebar-muted-foreground/50 md:pointer-events-none md:opacity-0 md:group-focus-within/row:pointer-events-auto md:group-focus-within/row:opacity-100 md:group-hover/row:pointer-events-auto md:group-hover/row:opacity-100",
           )}
           onClick={() => void togglePin()}
           title={row.pinned ? "Unpin" : "Pin"}
@@ -423,6 +476,28 @@ function SessionRow({
         </button>
       </span>
     </SidebarMenuItem>
+  );
+}
+
+/** Pulsing green while Pi works, amber while it waits on you, quiet otherwise. */
+function StatusDot({ running, waiting }: { running: boolean; waiting: boolean }) {
+  return (
+    <span aria-hidden className="relative flex size-1.5 shrink-0">
+      {running || waiting ? (
+        <span
+          className={cn(
+            "absolute inset-0 animate-ping rounded-full opacity-60 motion-reduce:hidden",
+            running ? "bg-success" : "bg-warning",
+          )}
+        />
+      ) : null}
+      <span
+        className={cn(
+          "relative size-1.5 rounded-full transition-colors duration-300",
+          running ? "bg-success" : waiting ? "bg-warning" : "bg-sidebar-muted-foreground/35",
+        )}
+      />
+    </span>
   );
 }
 
@@ -462,10 +537,6 @@ export function useHash(): string {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   return hash;
-}
-
-function projectName(cwd: string) {
-  return cwd.split("/").findLast((segment) => segment.length > 0) ?? cwd;
 }
 
 function timeLabel(iso: string) {

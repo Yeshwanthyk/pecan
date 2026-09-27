@@ -1,222 +1,424 @@
-//! Workflow run metadata written by pi-workflows (`~/.pi/agent/workflows/wf_*`).
+//! Workflow runs written by pi-subagents.
+//!
+//! Each run is an append-only event journal at
+//! `<workflows>/runs/project-<sha256(cwd)>/<runId>/journal.json`. The journal
+//! carries no owning session id, so callers pass the run ids a session's
+//! `workflow*` tool results referenced and this module folds each journal
+//! into a compact read model.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
-const MAX_WORKFLOW_FILE_BYTES: u64 = 1024 * 1024;
+/// Mirrors the extension's own `MAX_WORKFLOW_ARTIFACT_BYTES` bound.
+const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TEXT_CHARS: usize = 600;
+const MAX_TASKS: usize = 64;
+const MAX_RUN_ID_CHARS: usize = 128;
 
-/// Lightweight view of one workflow run.
+/// Folded view of one workflow run.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowRun {
-    /// Run id (`wf_...`); also the artifact directory name.
-    #[serde(rename = "runId")]
+    /// Run id (`wf-...`); also the journal directory name.
     pub run_id: String,
-    /// Owning pi session id, when recorded.
-    #[serde(rename = "sessionId")]
-    pub session_id: Option<String>,
     /// Author-chosen workflow name.
     pub name: Option<String>,
     /// Human-readable purpose of the workflow.
     pub description: Option<String>,
-    /// Whether the run was launched as a background workflow.
-    pub background: bool,
+    /// `pending_approval`, `running`, `paused`, `completed`, `failed`, `cancelled`.
+    pub status: String,
+    /// Epoch-millisecond creation time.
+    pub created_at: Option<i64>,
     /// Epoch-millisecond start time.
     pub started_at: Option<i64>,
-    /// Epoch-millisecond completion time.
+    /// Epoch-millisecond terminal time.
     pub finished_at: Option<i64>,
-    /// `running`, `completed`, `failed`, `aborted`, ...
-    pub status: Option<String>,
-    /// Currently executing phase, when the run is active.
-    pub current_phase: Option<String>,
-    /// Declared workflow phases.
-    pub phases: Vec<WorkflowPhase>,
-    /// Terminal error, when one was recorded.
+    /// Epoch-millisecond time of the latest event.
+    pub last_activity_at: Option<i64>,
+    /// Completion summary, failure error, or cancellation reason.
+    pub outcome: Option<String>,
+    /// Declared tasks in definition order, with their folded state.
+    pub tasks: Vec<WorkflowTask>,
+}
+
+/// One task of a workflow run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowTask {
+    /// Task id, unique within the run.
+    pub id: String,
+    /// Author-chosen label.
+    pub label: String,
+    /// `scout`, `writer`, `proof`, `review`, `repair`.
+    pub kind: Option<String>,
+    /// Task ids this task waits for.
+    pub needs: Vec<String>,
+    /// `pending`, `queued`, `running`, `completed`, `failed`, `cancelled`, `skipped`.
+    pub status: String,
+    /// Current attempt number; zero before the first admission.
+    pub attempt: u32,
+    /// Subagent id running the current attempt.
+    pub child_id: Option<String>,
+    /// Epoch-millisecond start of the current attempt.
+    pub started_at: Option<i64>,
+    /// Epoch-millisecond terminal time.
+    pub finished_at: Option<i64>,
+    /// Bounded result preview on completion.
+    pub result: Option<String>,
+    /// Failure error, cancellation or skip reason.
     pub error: Option<String>,
-    /// Name of the persisted result sidecar.
-    pub result_artifact: Option<String>,
-    /// Name of the persisted transcript sidecar.
-    pub transcript_artifact: Option<String>,
-    /// Agent labels participating in the run.
-    pub agents: Vec<WorkflowAgentSummary>,
+    /// Pi session id of the newest child transcript for this task; resolved
+    /// by the server from the session index, never read from the journal.
+    pub session_id: Option<String>,
 }
 
-/// One declared phase in a workflow run.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkflowPhase {
-    /// Phase title.
-    pub title: String,
-    /// Optional phase description.
-    pub detail: Option<String>,
+/// Returns whether `id` is safe to use as a journal directory name.
+#[must_use]
+pub fn is_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= MAX_RUN_ID_CHARS
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Minimal per-agent info surfaced in lists.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkflowAgentSummary {
-    /// Author-chosen agent label.
-    pub label: Option<String>,
-    /// Phase the agent belonged to.
-    pub phase: Option<String>,
-    /// `queued`, `running`, `done`, `error`, ...
-    pub state: Option<String>,
-    /// Model id used by the agent.
-    pub model: Option<String>,
-    /// Provider id used by the agent.
-    pub provider: Option<String>,
-    /// Number of completed tool operations.
-    pub completed_operations: Option<u64>,
-}
-
-/// Loads all parseable workflow runs under `workflows_dir`.
-///
-/// Only each run's `workflow.json` is read; result/transcript artifacts are
-/// never touched at index time.
-pub fn load_all(workflows_dir: &Path) -> HashMap<String, Vec<WorkflowRun>> {
-    let mut out: HashMap<String, Vec<WorkflowRun>> = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(workflows_dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let dir_path = entry.path();
-        if !dir_path.is_dir() {
-            continue;
-        }
-        let Some(meta) = read_run(&dir_path) else { continue };
-        if let Some(session_id) = meta.session_id.clone() {
-            out.entry(session_id).or_default().push(meta);
-        }
-    }
-    for runs in out.values_mut() {
-        runs.sort_by(|left, right| {
-            right.started_at.cmp(&left.started_at).then_with(|| left.run_id.cmp(&right.run_id))
-        });
-    }
-    out
-}
-
-/// Reads one run directory's `workflow.json`.
-fn read_run(run_dir: &Path) -> Option<WorkflowRun> {
-    let file = run_dir.join("workflow.json");
-    if std::fs::metadata(&file).ok()?.len() > MAX_WORKFLOW_FILE_BYTES {
+/// Returns the validated `details.runId` of a `workflow*` tool-result message,
+/// the only persisted link from a session transcript to its workflow runs.
+#[must_use]
+pub fn tool_result_run_id(message: &serde_json::Value) -> Option<&str> {
+    let tool = message.get("toolName").and_then(serde_json::Value::as_str)?;
+    if tool != "workflow" && !tool.starts_with("workflow_") {
         return None;
     }
-    let bytes = std::fs::read(&file).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let run_id = value
-        .get("runId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| run_dir.file_name().and_then(|n| n.to_str()).map(str::to_owned))?;
-    let agents = value
-        .get("agents")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|a| WorkflowAgentSummary {
-                    label: a.get("label").and_then(serde_json::Value::as_str).map(str::to_owned),
-                    phase: a.get("phase").and_then(serde_json::Value::as_str).map(str::to_owned),
-                    state: a.get("state").and_then(serde_json::Value::as_str).map(str::to_owned),
-                    model: a.get("model").and_then(serde_json::Value::as_str).map(str::to_owned),
-                    provider: a
-                        .get("provider")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    completed_operations: a
-                        .get("completedOperations")
-                        .and_then(serde_json::Value::as_u64),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(WorkflowRun {
-        run_id,
-        session_id: value.get("sessionId").and_then(serde_json::Value::as_str).map(str::to_owned),
-        name: value.get("name").and_then(serde_json::Value::as_str).map(str::to_owned),
-        description: value
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        background: value.get("background").and_then(serde_json::Value::as_bool).unwrap_or(false),
-        started_at: epoch_ms(&value, "startedAt"),
-        finished_at: epoch_ms(&value, "finishedAt"),
-        status: value.get("status").and_then(serde_json::Value::as_str).map(str::to_owned),
-        current_phase: value
-            .get("currentPhase")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        phases: parse_phases(&value),
-        error: value.get("error").and_then(serde_json::Value::as_str).map(str::to_owned),
-        result_artifact: value
-            .get("resultArtifact")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        transcript_artifact: value
-            .get("transcriptArtifact")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        agents,
+    let run_id = message.pointer("/details/runId").and_then(serde_json::Value::as_str)?;
+    is_run_id(run_id).then_some(run_id)
+}
+
+/// Splits a workflow child session name (`workflow:<runId>: <task label>`)
+/// into its run id and task label.
+#[must_use]
+pub fn child_session_task(agent_name: &str) -> Option<(&str, &str)> {
+    let (run_id, label) = agent_name.strip_prefix("workflow:")?.split_once(": ")?;
+    let label = label.trim();
+    (is_run_id(run_id) && !label.is_empty()).then_some((run_id, label))
+}
+
+/// Loads the runs among `run_ids` that have a readable journal for `cwd`,
+/// newest first. Unknown or malformed journals are skipped.
+pub fn load_runs(workflows_dir: &Path, cwd: &str, run_ids: &[String]) -> Vec<WorkflowRun> {
+    let mut runs: Vec<WorkflowRun> = run_ids
+        .iter()
+        .filter(|id| is_run_id(id))
+        .filter_map(|id| read_journal(&journal_path(workflows_dir, cwd, id), id))
+        .collect();
+    runs.sort_by(|left, right| {
+        right.created_at.cmp(&left.created_at).then_with(|| left.run_id.cmp(&right.run_id))
+    });
+    runs
+}
+
+/// Journal location pi-subagents uses for `run_id` launched from `cwd`.
+#[must_use]
+pub fn journal_path(workflows_dir: &Path, cwd: &str, run_id: &str) -> PathBuf {
+    project_dir(workflows_dir, cwd).join(run_id).join("journal.json")
+}
+
+fn project_dir(workflows_dir: &Path, cwd: &str) -> PathBuf {
+    let digest = Sha256::digest(cwd.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    workflows_dir.join("runs").join(format!("project-{hex}"))
+}
+
+fn read_journal(file: &Path, run_id: &str) -> Option<WorkflowRun> {
+    if std::fs::metadata(file).ok()?.len() > MAX_JOURNAL_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(file).ok()?;
+    let events: Vec<serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    fold(run_id, &events)
+}
+
+/// Folds journal events into a [`WorkflowRun`]; `None` without a creation event.
+fn fold(run_id: &str, events: &[serde_json::Value]) -> Option<WorkflowRun> {
+    let mut run: Option<WorkflowRun> = None;
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for event in events {
+        if str_of(event, "runId").as_deref() != Some(run_id) {
+            continue;
+        }
+        let at = event.get("at").and_then(serde_json::Value::as_i64);
+        let tag = str_of(event, "_tag").unwrap_or_default();
+        if tag == "WorkflowCreated" {
+            let definition = event.get("definition");
+            let tasks: Vec<WorkflowTask> = definition
+                .and_then(|d| d.get("tasks"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(declared_task)
+                .take(MAX_TASKS)
+                .collect();
+            index = tasks.iter().enumerate().map(|(i, task)| (task.id.clone(), i)).collect();
+            run = Some(WorkflowRun {
+                run_id: run_id.to_owned(),
+                name: definition.and_then(|d| str_of(d, "name")),
+                description: definition.and_then(|d| str_of(d, "description")),
+                status: "pending_approval".to_owned(),
+                created_at: at,
+                started_at: None,
+                finished_at: None,
+                last_activity_at: at,
+                outcome: None,
+                tasks,
+            });
+            continue;
+        }
+        let Some(run) = run.as_mut() else { continue };
+        run.last_activity_at = at.or(run.last_activity_at);
+        match tag.as_str() {
+            "WorkflowStarted" => {
+                run.status = "running".to_owned();
+                run.started_at = at;
+            }
+            "WorkflowPaused" => "paused".clone_into(&mut run.status),
+            "WorkflowResumed" => "running".clone_into(&mut run.status),
+            "WorkflowCompleted" | "WorkflowFailed" | "WorkflowCancelled" => {
+                let (status, key) = match tag.as_str() {
+                    "WorkflowCompleted" => ("completed", "summary"),
+                    "WorkflowFailed" => ("failed", "error"),
+                    _ => ("cancelled", "reason"),
+                };
+                status.clone_into(&mut run.status);
+                run.finished_at = at;
+                run.outcome = bounded(event, key);
+            }
+            _ => {
+                let Some(task) = str_of(event, "taskId")
+                    .and_then(|id| index.get(&id).copied())
+                    .and_then(|i| run.tasks.get_mut(i))
+                else {
+                    continue;
+                };
+                apply_task_event(task, &tag, event, at);
+            }
+        }
+    }
+    run
+}
+
+fn apply_task_event(
+    task: &mut WorkflowTask,
+    tag: &str,
+    event: &serde_json::Value,
+    at: Option<i64>,
+) {
+    match tag {
+        "TaskQueued" => {
+            task.status = "queued".to_owned();
+            task.attempt = task.attempt.saturating_add(1);
+            task.child_id = str_of(event, "childId");
+            task.started_at = None;
+            task.finished_at = None;
+            task.result = None;
+            task.error = None;
+        }
+        "TaskStarted" | "TaskEvaluationStarted" => {
+            task.status = "running".to_owned();
+            task.started_at = at;
+        }
+        "TaskRetryRequested" => "pending".clone_into(&mut task.status),
+        "TaskCompleted" => {
+            task.status = "completed".to_owned();
+            task.finished_at = at;
+            task.result = bounded(event, "resultPreview");
+        }
+        "TaskFailed" | "TaskCancelled" | "TaskSkipped" => {
+            let (status, key) = match tag {
+                "TaskFailed" => ("failed", "error"),
+                "TaskCancelled" => ("cancelled", "reason"),
+                _ => ("skipped", "reason"),
+            };
+            status.clone_into(&mut task.status);
+            task.finished_at = at;
+            task.error = bounded(event, key);
+        }
+        _ => {}
+    }
+}
+
+fn declared_task(value: &serde_json::Value) -> Option<WorkflowTask> {
+    let id = str_of(value, "id")?;
+    Some(WorkflowTask {
+        label: str_of(value, "label").unwrap_or_else(|| id.clone()),
+        id,
+        kind: str_of(value, "kind"),
+        needs: value
+            .get("needs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .take(MAX_TASKS)
+            .collect(),
+        status: "pending".to_owned(),
+        attempt: 0,
+        child_id: None,
+        started_at: None,
+        finished_at: None,
+        result: None,
+        error: None,
+        session_id: None,
     })
 }
 
-fn epoch_ms(value: &serde_json::Value, key: &str) -> Option<i64> {
-    value.get(key).and_then(serde_json::Value::as_i64).filter(|value| *value >= 0)
+fn str_of(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
 }
 
-fn parse_phases(value: &serde_json::Value) -> Vec<WorkflowPhase> {
-    value
-        .get("phases")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|phase| {
-            Some(WorkflowPhase {
-                title: phase.get("title").and_then(serde_json::Value::as_str)?.to_owned(),
-                detail: phase.get("detail").and_then(serde_json::Value::as_str).map(str::to_owned),
-            })
-        })
-        .take(64)
-        .collect()
+fn bounded(value: &serde_json::Value, key: &str) -> Option<String> {
+    let text = value.get(key).and_then(serde_json::Value::as_str)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out: String = text.chars().take(MAX_TEXT_CHARS).collect();
+    if text.chars().nth(MAX_TEXT_CHARS).is_some() {
+        out.push('\u{2026}');
+    }
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn groups_runs_by_session() {
-        let root = std::env::temp_dir().join(format!("pecan-wf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let run_dir = root.join("wf_test123");
-        std::fs::create_dir_all(&run_dir).expect("mkdir run");
-        std::fs::write(
-            run_dir.join("workflow.json"),
-            r#"{"runId":"wf_test123","sessionId":"sess-9","name":"review","status":"completed","phases":[{"title":"P1","detail":"inspect"}],"resultArtifact":"result.json","transcriptArtifact":"transcripts.json",
-                "agents":[{"label":"a1","phase":"P1","state":"done","model":"m1","provider":"p1","completedOperations":3}]}"#,
-        )
-        .expect("write wf");
+    const CWD: &str = "/work/demo";
 
-        let all = load_all(&root);
-        let runs = all.get("sess-9").expect("grouped by session");
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].run_id, "wf_test123");
-        assert_eq!(runs[0].agents.len(), 1);
-        assert_eq!(runs[0].status.as_deref(), Some("completed"));
-        assert_eq!(runs[0].agents[0].model.as_deref(), Some("m1"));
-        assert_eq!(runs[0].phases[0].title, "P1");
-        assert_eq!(runs[0].result_artifact.as_deref(), Some("result.json"));
-        let _ = std::fs::remove_dir_all(&root);
+    fn write_journal(root: &Path, run_id: &str, events: &str) {
+        let dir = project_dir(root, CWD).join(run_id);
+        std::fs::create_dir_all(&dir).expect("mkdir run");
+        std::fs::write(dir.join("journal.json"), events).expect("write journal");
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("pecan-wf-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).unwrap_or_default();
+        root
     }
 
     #[test]
-    fn skips_dirs_without_metadata() {
-        let root = std::env::temp_dir().join(format!("pecan-wf-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let run_dir = root.join("wf_nope");
-        std::fs::create_dir_all(&run_dir).expect("mkdir run");
-        assert!(load_all(&root).is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+    fn project_dir_matches_extension_hash() {
+        // sha256("/work/demo"), as `createHash("sha256")` in the extension.
+        let dir = project_dir(Path::new("/w"), CWD);
+        let name = dir.file_name().and_then(|n| n.to_str()).expect("name");
+        assert!(name.starts_with("project-"));
+        assert_eq!(name.len(), "project-".len() + 64);
+    }
+
+    #[test]
+    fn folds_graph_with_retry_and_failure() {
+        let root = temp_root("fold");
+        write_journal(
+            &root,
+            "wf-1",
+            r#"[
+              {"_tag":"WorkflowCreated","runId":"wf-1","at":10,"definition":{"name":"ship","description":"do it","tasks":[
+                {"id":"a","label":"Build","kind":"writer","prompt":"p"},
+                {"id":"b","label":"Review","kind":"review","prompt":"p","needs":["a"]},
+                {"id":"c","label":"Docs","kind":"writer","prompt":"p","needs":["b"]}]}},
+              {"_tag":"WorkflowStarted","runId":"wf-1","at":11},
+              {"_tag":"TaskQueued","runId":"wf-1","at":12,"taskId":"a","childId":"sa-1"},
+              {"_tag":"TaskStarted","runId":"wf-1","at":13,"taskId":"a"},
+              {"_tag":"TaskFailed","runId":"wf-1","at":14,"taskId":"a","error":"boom"},
+              {"_tag":"TaskRetryRequested","runId":"wf-1","at":15,"taskId":"a"},
+              {"_tag":"TaskQueued","runId":"wf-1","at":16,"taskId":"a","childId":"sa-2"},
+              {"_tag":"TaskStarted","runId":"wf-1","at":17,"taskId":"a"},
+              {"_tag":"TaskCompleted","runId":"wf-1","at":18,"taskId":"a","resultPreview":"built"},
+              {"_tag":"TaskQueued","runId":"wf-1","at":19,"taskId":"b","childId":"sa-3"},
+              {"_tag":"TaskStarted","runId":"wf-1","at":20,"taskId":"b"},
+              {"_tag":"TaskFailed","runId":"wf-1","at":21,"taskId":"b","error":"rejected"},
+              {"_tag":"TaskSkipped","runId":"wf-1","at":22,"taskId":"c","reason":"dependency failed"},
+              {"_tag":"TaskCompleted","runId":"other","at":23,"taskId":"b"},
+              {"_tag":"WorkflowFailed","runId":"wf-1","at":24,"error":"task b failed"}
+            ]"#,
+        );
+        let runs = load_runs(&root, CWD, &["wf-1".to_owned()]);
+        let run = runs.first().expect("run");
+        assert_eq!(run.name.as_deref(), Some("ship"));
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.outcome.as_deref(), Some("task b failed"));
+        assert_eq!(
+            (run.started_at, run.finished_at, run.last_activity_at),
+            (Some(11), Some(24), Some(24))
+        );
+        assert_eq!(run.tasks.len(), 3);
+        let (a, b, c) = (&run.tasks[0], &run.tasks[1], &run.tasks[2]);
+        assert_eq!(
+            (a.status.as_str(), a.attempt, a.child_id.as_deref()),
+            ("completed", 2, Some("sa-2"))
+        );
+        assert_eq!((a.result.as_deref(), a.error.as_deref()), (Some("built"), None));
+        assert_eq!((b.status.as_str(), b.error.as_deref()), ("failed", Some("rejected")));
+        assert_eq!(b.needs, vec!["a".to_owned()]);
+        assert_eq!((c.status.as_str(), c.attempt), ("skipped", 0));
+        std::fs::remove_dir_all(&root).unwrap_or_default();
+    }
+
+    #[test]
+    fn pause_and_pending_approval_states() {
+        let root = temp_root("pause");
+        write_journal(
+            &root,
+            "wf-p",
+            r#"[{"_tag":"WorkflowCreated","runId":"wf-p","at":1,"definition":{"tasks":[{"id":"a","label":"A","kind":"scout","prompt":"p"}]}},
+                {"_tag":"WorkflowStarted","runId":"wf-p","at":2},
+                {"_tag":"WorkflowPaused","runId":"wf-p","at":3,"reason":"user"}]"#,
+        );
+        write_journal(
+            &root,
+            "wf-q",
+            r#"[{"_tag":"WorkflowCreated","runId":"wf-q","at":5,"definition":{"tasks":[]}}]"#,
+        );
+        let runs = load_runs(&root, CWD, &["wf-p".to_owned(), "wf-q".to_owned()]);
+        let statuses: Vec<_> =
+            runs.iter().map(|r| (r.run_id.as_str(), r.status.as_str())).collect();
+        assert_eq!(statuses, vec![("wf-q", "pending_approval"), ("wf-p", "paused")]);
+        std::fs::remove_dir_all(&root).unwrap_or_default();
+    }
+
+    #[test]
+    fn links_tool_results_and_child_names_to_runs() {
+        let result =
+            serde_json::json!({"toolName": "workflow_control", "details": {"runId": "wf-1"}});
+        assert_eq!(tool_result_run_id(&result), Some("wf-1"));
+        let other = serde_json::json!({"toolName": "subagent_spawn", "details": {"runId": "wf-1"}});
+        assert_eq!(tool_result_run_id(&other), None);
+        let unsafe_id = serde_json::json!({"toolName": "workflow", "details": {"runId": "../x"}});
+        assert_eq!(tool_result_run_id(&unsafe_id), None);
+
+        assert_eq!(child_session_task("workflow:wf-1: Build: api"), Some(("wf-1", "Build: api")));
+        assert_eq!(child_session_task("subagents: scout"), None);
+        assert_eq!(child_session_task("workflow:../x: Build"), None);
+        assert_eq!(child_session_task("workflow:wf-1:  "), None);
+    }
+
+    #[test]
+    fn rejects_unsafe_ids_malformed_and_foreign_journals() {
+        let root = temp_root("bad");
+        write_journal(&root, "wf-bad", "{not json");
+        write_journal(&root, "wf-empty", "[]");
+        let ids = ["../escape", "wf-bad", "wf-empty", "wf-missing", ""].map(str::to_owned);
+        assert!(load_runs(&root, CWD, &ids).is_empty());
+        // A journal for another project is not visible from this cwd.
+        write_journal(
+            &root,
+            "wf-x",
+            r#"[{"_tag":"WorkflowCreated","runId":"wf-x","at":1,"definition":{"tasks":[]}}]"#,
+        );
+        assert!(load_runs(&root, "/elsewhere", &["wf-x".to_owned()]).is_empty());
+        assert!(!is_run_id("a/b"));
+        assert!(is_run_id("wf-60370e06-6733-49a4-83ed-07ed01ae3a0e"));
+        std::fs::remove_dir_all(&root).unwrap_or_default();
     }
 }

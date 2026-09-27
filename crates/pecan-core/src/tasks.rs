@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn groups_legacy_lists_by_session() {
         let root = std::env::temp_dir().join(format!("pecan-tasks-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap_or_default();
         std::fs::create_dir_all(&root).expect("mkdir tasks");
         std::fs::write(
             root.join("tasks-sess7.json"),
@@ -249,14 +249,14 @@ mod tests {
         assert_eq!(lists[0].tasks[0].status, "completed");
         assert_eq!(lists[0].tasks[1].owner.as_deref(), Some("agent-1"));
         assert_eq!(lists[0].tasks[1].blocked_by, ["1"]);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap_or_default();
     }
 
     #[test]
     fn resolves_default_project_local_session_store() {
         let root = std::env::temp_dir().join(format!("pecan-tasks-project-{}", std::process::id()));
         let tasks = root.join(".pi/tasks");
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap_or_default();
         std::fs::create_dir_all(&tasks).expect("mkdir tasks");
         std::fs::write(
             tasks.join("tasks-sess-local.json"),
@@ -268,16 +268,16 @@ mod tests {
             &root.join("global"),
         );
         assert_eq!(loaded.get("sess-local").map(Vec::len), Some(1));
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap_or_default();
     }
 
     #[test]
     fn ignores_non_task_files() {
         let root = std::env::temp_dir().join(format!("pecan-tasks-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap_or_default();
         std::fs::create_dir_all(&root).expect("mkdir tasks");
         std::fs::write(root.join("other.json"), "{}").expect("write other");
         assert!(load_all(&root).is_empty());
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap_or_default();
     }
 }

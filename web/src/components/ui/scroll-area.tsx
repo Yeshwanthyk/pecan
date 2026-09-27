@@ -4,23 +4,6 @@ import { ScrollArea as ScrollAreaPrimitive } from "@base-ui/react/scroll-area";
 
 import { cn } from "~/lib/utils";
 
-function getVirtualizedScrollFadeClassName({ top, bottom }: { top: boolean; bottom: boolean }) {
-  if (!top && !bottom) return undefined;
-
-  return cn(
-    "virtualized-scroll-fade [--fade-size:1.5rem]",
-    top &&
-      bottom &&
-      "[--virtualized-scroll-fade-mask:linear-gradient(to_bottom,transparent,black_var(--fade-size),black_calc(100%-var(--fade-size)),transparent)]",
-    top &&
-      !bottom &&
-      "[--virtualized-scroll-fade-mask:linear-gradient(to_bottom,transparent,black_var(--fade-size))]",
-    !top &&
-      bottom &&
-      "[--virtualized-scroll-fade-mask:linear-gradient(to_bottom,black_calc(100%-var(--fade-size)),transparent)]",
-  );
-}
-
 function ScrollArea({
   className,
   children,
@@ -88,4 +71,4 @@ function ScrollBar({
   );
 }
 
-export { getVirtualizedScrollFadeClassName, ScrollArea, ScrollBar };
+export { ScrollArea };

@@ -10,14 +10,6 @@ const Sheet = SheetPrimitive.Root;
 
 const SheetPortal = SheetPrimitive.Portal;
 
-function SheetTrigger(props: SheetPrimitive.Trigger.Props) {
-  return <SheetPrimitive.Trigger data-slot="sheet-trigger" {...props} />;
-}
-
-function SheetClose(props: SheetPrimitive.Close.Props) {
-  return <SheetPrimitive.Close data-slot="sheet-close" {...props} />;
-}
-
 function SheetBackdrop({ className, ...props }: SheetPrimitive.Backdrop.Props) {
   return (
     <SheetPrimitive.Backdrop
@@ -185,11 +177,8 @@ function SheetPanel({
 
 export {
   Sheet,
-  SheetTrigger,
   SheetPortal,
-  SheetClose,
   SheetBackdrop,
-  SheetBackdrop as SheetOverlay,
   SheetPopup,
   SheetPopup as SheetContent,
   SheetHeader,

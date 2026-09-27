@@ -1,17 +1,15 @@
 //! Confirmation-gated Git commit, push, and GitHub pull-request workflow.
 
-use std::process::{Output, Stdio};
+use std::process::Output;
 use std::time::Duration;
 use std::{hash::Hash, hash::Hasher};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
 
 use super::api_errors::ApiError;
+use super::git::{self, ACTION_TIMEOUT, STATUS_TIMEOUT};
 
-const STATUS_TIMEOUT: Duration = Duration::from_secs(8);
-const ACTION_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_FIELD_BYTES: usize = 8 * 1024;
 const MAX_COMMAND_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_STDERR_BYTES: usize = 64 * 1024;
@@ -469,75 +467,35 @@ async fn run_git(
     Ok(())
 }
 
+/// Runs `program` bounded and timed via [`git::run_bounded`], turning a
+/// truncated stream into a hard failure: Ship's mutation path would rather
+/// error out than act on a command whose output was cut off.
 async fn command_output(
     program: &str,
     cwd: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<Output, ApiError> {
-    let mut child = Command::new(program)
-        .current_dir(cwd)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| ApiError::bad_gateway(format!("could not run {program}: {error}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ApiError::internal(format!("{program} stdout pipe was unavailable")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ApiError::internal(format!("{program} stderr pipe was unavailable")))?;
-    let collect = async move {
-        let (stdout, stderr, status) = futures::future::join3(
-            read_bounded(stdout, MAX_COMMAND_STDOUT_BYTES),
-            read_bounded(stderr, MAX_COMMAND_STDERR_BYTES),
-            child.wait(),
-        )
-        .await;
-        Ok(Output {
-            status: status.map_err(|error| {
-                ApiError::bad_gateway(format!("could not wait for {program}: {error}"))
-            })?,
-            stdout: stdout.map_err(|error| {
-                ApiError::bad_gateway(format!("could not read {program} output: {error}"))
-            })?,
-            stderr: stderr.map_err(|error| {
-                ApiError::bad_gateway(format!("could not read {program} error: {error}"))
-            })?,
-        })
-    };
-    tokio::time::timeout(timeout, collect)
-        .await
-        .map_err(|_elapsed| ApiError::bad_gateway(format!("{program} command timed out")))?
-}
-
-async fn read_bounded(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut chunk = vec![0_u8; 8 * 1024];
-    let mut exceeded = false;
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            if exceeded {
-                return Err(std::io::Error::other("command output exceeded the safety limit"));
-            }
-            return Ok(output);
-        }
-        let remaining = limit.saturating_sub(output.len());
-        if remaining > 0
-            && let Some(bytes) = chunk.get(..read.min(remaining))
-        {
-            output.extend_from_slice(bytes);
-        }
-        exceeded |= read > remaining;
+    let bounded = git::run_bounded(
+        program,
+        cwd,
+        args,
+        timeout,
+        MAX_COMMAND_STDOUT_BYTES,
+        MAX_COMMAND_STDERR_BYTES,
+    )
+    .await?;
+    if bounded.stdout_truncated {
+        return Err(ApiError::bad_gateway(format!(
+            "could not read {program} output: command output exceeded the safety limit"
+        )));
     }
+    if bounded.stderr_truncated {
+        return Err(ApiError::bad_gateway(format!(
+            "could not read {program} error: command output exceeded the safety limit"
+        )));
+    }
+    Ok(Output { status: bounded.status, stdout: bounded.stdout, stderr: bounded.stderr })
 }
 
 async fn ensure_clean(cwd: &str) -> Result<(), ApiError> {

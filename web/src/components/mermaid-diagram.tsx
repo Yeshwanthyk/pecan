@@ -20,6 +20,36 @@ type RenderState =
   | { status: "ready" }
   | { status: "error"; message: string };
 
+const DIAGRAM_FONT =
+  '-apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, "Segoe UI", Roboto, sans-serif';
+
+/** Quiet node palette matching the app's neutral surfaces. */
+const LIGHT_DIAGRAM = {
+  fontFamily: DIAGRAM_FONT,
+  fontSize: "14px",
+  primaryColor: "#f7f7f5",
+  primaryBorderColor: "#dcdcd8",
+  primaryTextColor: "#1c1c1c",
+  secondaryColor: "#f0efec",
+  tertiaryColor: "#ffffff",
+  lineColor: "#a8a8a4",
+  edgeLabelBackground: "#ffffff",
+};
+
+const DARK_DIAGRAM = {
+  fontFamily: DIAGRAM_FONT,
+  fontSize: "14px",
+  darkMode: true,
+  background: "#131313",
+  primaryColor: "#1c1c1c",
+  primaryBorderColor: "#333333",
+  primaryTextColor: "#f2f2f2",
+  secondaryColor: "#222222",
+  tertiaryColor: "#131313",
+  lineColor: "#6b6b6b",
+  edgeLabelBackground: "#131313",
+};
+
 export function MermaidDiagram({ source }: { source: string }) {
   const theme = useApp((state) => state.theme);
   const reactId = useId();
@@ -49,7 +79,9 @@ export function MermaidDiagram({ source }: { source: string }) {
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: theme === "one-dark" ? "dark" : "neutral",
+          theme: "base",
+          themeVariables: theme === "one-dark" ? DARK_DIAGRAM : LIGHT_DIAGRAM,
+          themeCSS: ".node rect { rx: 8px; ry: 8px; } .edgeLabel { font-size: 12px; }",
           maxTextSize: MAX_SOURCE_LENGTH,
         });
         const { svg, bindFunctions } = await mermaid.render(diagramId, source);
@@ -70,9 +102,13 @@ export function MermaidDiagram({ source }: { source: string }) {
   }, [diagramId, source, theme]);
 
   return (
-    <div className="my-3 overflow-hidden rounded-lg border bg-card">
-      <div className="flex items-center border-b bg-muted/50 px-3 py-1">
-        <span className="font-mono text-[11px] text-muted-foreground">mermaid</span>
+    <div
+      className="not-prose my-3 overflow-hidden rounded-xl border bg-card"
+      data-state={renderState.status}
+      data-testid="mermaid"
+    >
+      <div className="flex h-8 items-center ps-3.5 pe-1">
+        <span className="text-[11px] font-medium text-muted-foreground">diagram</span>
         <div className="ml-auto flex items-center gap-0.5">
           {renderState.status === "ready" ? (
             <button

@@ -1,0 +1,32 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pecan-fixture",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "set -e; ROOT=\"$PWD\"; S=\"${TMPDIR:-/tmp}/pecan-dev\"; mkdir -p \"$S/agent/sessions\" \"$S/project\"; export PECAN_AGENT_DIR=\"$S/agent\"; export PECAN_PI_ARGS=\"--no-extensions --extension $ROOT/scripts/fixture-model.ts --provider pecan-fixture --model fixture-v1\"; cargo build --quiet -p pecan; ./target/debug/pecan add \"$S/project\" >/dev/null; exec ./target/debug/pecan serve --port 7615 --no-open"
+      ],
+      "port": 7615
+    },
+    {
+      "name": "pecan-web-dev",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd web && PECAN_API_TARGET=http://127.0.0.1:7615 exec npx vite --port 5714 --strictPort"
+      ],
+      "port": 5714
+    },
+    {
+      "name": "pecan-seeded",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "set -e; S=\"${TMPDIR:-/tmp}/pecan-test-ground\"; cargo build --quiet -p pecan; ./target/debug/pecan seed \"$S\" >/dev/null; export PECAN_AGENT_DIR=\"$S/agent\"; for p in \"$S\"/repos/*; do mkdir -p \"$p\"; ./target/debug/pecan add \"$p\" >/dev/null; done; exec ./target/debug/pecan serve --port 7616 --no-open"
+      ],
+      "port": 7616
+    }
+  ]
+}

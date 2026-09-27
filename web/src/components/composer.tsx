@@ -21,9 +21,20 @@ import {
   PopoverTrigger,
 } from "~/components/ui/popover";
 import { useApp } from "~/store";
+import { clearDraft, readDraft, writeDraft } from "~/lib/drafts";
+import { reportError } from "~/lib/errors";
+import { shortModel } from "~/lib/format";
+import { compressImageForUpload } from "~/lib/image";
+import { readPromptHistory, recordPrompt } from "~/lib/prompt-history";
 import { cn } from "~/lib/utils";
 
-const BASE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
+const BASE_THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+] as const;
 const EXTENDED_THINKING_LEVELS = ["xhigh", "max"] as const;
 
 /** One staged image attachment awaiting send. */
@@ -39,50 +50,58 @@ const MAX_ATTACHMENTS = 4;
 /// Reject files over ~8 MB before reading them.
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-/** Reads image files into staged attachments (base64 + object-URL preview). */
+/** Reads image files into staged attachments (base64 + object-URL preview), downscaling oversized photos first. */
 function readImageFiles(
   files: FileList | File[] | null,
   onError: (message: string) => void,
 ): Promise<ComposerImage[]> {
-  const incoming = Array.from(files ?? []).filter((file) => file.type.startsWith("image/"));
+  const incoming = Array.from(files ?? []).filter((file) =>
+    file.type.startsWith("image/"),
+  );
   if (incoming.length === 0) return Promise.resolve([]);
   return Promise.all(
-    incoming.slice(0, MAX_ATTACHMENTS).map(
-      (file) =>
-        new Promise<ComposerImage | null>((resolve) => {
-          if (file.size > MAX_FILE_BYTES) {
-            onError(`${file.name}: image too large (max 8 MB)`);
+    incoming.slice(0, MAX_ATTACHMENTS).map(async (file) => {
+      const staged = await compressImageForUpload(file);
+      if (staged.size > MAX_FILE_BYTES) {
+        onError(`${file.name}: image too large (max 8 MB)`);
+        return null;
+      }
+      return new Promise<ComposerImage | null>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl =
+            typeof reader.result === "string" ? reader.result : "";
+          const comma = dataUrl.indexOf(",");
+          if (comma < 0) {
             resolve(null);
             return;
           }
-          const reader = new FileReader();
-          reader.onload = () => {
-            const dataUrl = typeof reader.result === "string" ? reader.result : "";
-            const comma = dataUrl.indexOf(",");
-            if (comma < 0) {
-              resolve(null);
-              return;
-            }
-            resolve({
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              data: dataUrl.slice(comma + 1),
-              mimeType: file.type || "image/png",
-              previewUrl: URL.createObjectURL(file),
-            });
-          };
-          reader.onerror = () => resolve(null);
-          reader.readAsDataURL(file);
-        }),
-    ),
-  ).then((images) => images.filter((image): image is ComposerImage => image !== null));
+          resolve({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            data: dataUrl.slice(comma + 1),
+            mimeType: staged.type || "image/png",
+            previewUrl: URL.createObjectURL(staged),
+          });
+        };
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(staged);
+      });
+    }),
+  ).then((images) =>
+    images.filter((image): image is ComposerImage => image !== null),
+  );
 }
 
 /** Extended levels are model-gated: pi exposes them in `thinkingLevelMap`. */
-function availableThinkingLevels(model: { thinkingLevelMap?: unknown } | undefined | null): string[] {
+function availableThinkingLevels(
+  model: { thinkingLevelMap?: unknown } | undefined | null,
+): string[] {
   const supported = model?.thinkingLevelMap;
   const extended =
     supported !== null && typeof supported === "object"
-      ? EXTENDED_THINKING_LEVELS.filter((level) => level in (supported as object))
+      ? EXTENDED_THINKING_LEVELS.filter(
+          (level) => level in (supported as object),
+        )
       : [];
   return [...BASE_THINKING_LEVELS, ...extended];
 }
@@ -104,12 +123,27 @@ export function Composer({
   const contextPercent = useApp((state) =>
     state.agent?.sessionId === sessionId ? state.contextPercent : null,
   );
-  const extensionEditorText = useApp((state) => state.extensionEditorText[sessionId]);
+  const extensionEditorText = useApp(
+    (state) => state.extensionEditorText[sessionId],
+  );
   const appliedEditorRevision = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [images, setImages] = useState<ComposerImage[]>([]);
+  const draftTimerRef = useRef<number | null>(null);
+  // -1 = not browsing prompt history; otherwise an index into readPromptHistory() (0 = most recent).
+  const historyIndexRef = useRef(-1);
+  const historyDraftRef = useRef("");
+
+  const scheduleDraftSave = useCallback(() => {
+    if (draftTimerRef.current !== null)
+      window.clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = window.setTimeout(() => {
+      draftTimerRef.current = null;
+      writeDraft(sessionId, textareaRef.current?.value ?? "");
+    }, 300);
+  }, [sessionId]);
 
   const addFiles = useCallback((files: FileList | File[] | null) => {
     void readImageFiles(files, reportError).then((staged) => {
@@ -150,15 +184,28 @@ export function Composer({
         }
       })
       .catch(() => undefined);
+    // Restore a persisted draft before the extension-prefill effect below runs,
+    // so set_editor_text still wins whenever it actually fires.
+    const draft = readDraft(sessionId);
+    if (draft && textareaRef.current) {
+      textareaRef.current.value = draft;
+      setExpanded(true);
+    }
     autogrow();
     return () => {
       cancelled = true;
+      if (draftTimerRef.current !== null)
+        window.clearTimeout(draftTimerRef.current);
     };
   }, [sessionId, autogrow]);
 
   // Pi extensions can replace the composer text through set_editor_text.
   useEffect(() => {
-    if (!extensionEditorText || extensionEditorText.revision <= appliedEditorRevision.current) return;
+    if (
+      !extensionEditorText ||
+      extensionEditorText.revision <= appliedEditorRevision.current
+    )
+      return;
     appliedEditorRevision.current = extensionEditorText.revision;
     if (!textareaRef.current) return;
     textareaRef.current.value = extensionEditorText.text;
@@ -182,19 +229,47 @@ export function Composer({
     if (!el || (!text && images.length === 0)) return;
     el.value = "";
     autogrow();
-    const attachments = images.map(({ data, mimeType }) => ({ data, mimeType }));
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    historyIndexRef.current = -1;
+    if (text) recordPrompt(text);
+    const attachments = images.map(({ data, mimeType }) => ({
+      data,
+      mimeType,
+    }));
     for (const image of images) URL.revokeObjectURL(image.previewUrl);
     setImages([]);
     void api
       .sendImages(sessionId, text, streaming ? sendMode : "send", attachments)
       .then(() => {
+        clearDraft(sessionId);
         if (isCurrentSession(sessionId)) {
           useApp.getState().setStreaming(true);
         }
       })
-      .catch((error: Error) =>
-        reportError(error.message),
-      );
+      .catch((error: Error) => {
+        reportError(error.message);
+        // Give the words back rather than losing them.
+        const current = textareaRef.current;
+        if (isCurrentSession(sessionId) && current && !current.value.trim()) {
+          current.value = text;
+          autogrow();
+          setExpanded(true);
+        }
+      });
+  }
+
+  function abort() {
+    void api
+      .abort(sessionId)
+      .then(() => {
+        if (!isCurrentSession(sessionId)) return;
+        useApp.getState().setStreaming(false);
+        refreshAgent(sessionId);
+      })
+      .catch((error: Error) => reportError(error.message));
   }
 
   async function setThinking(next: string) {
@@ -212,22 +287,34 @@ export function Composer({
       <div className="mx-auto w-full max-w-[46rem] px-2 py-2 sm:px-3 sm:py-2.5 md:px-6">
         <div
           className={cn(
-            "min-w-0 cursor-text rounded-lg border bg-card shadow-xs transition-colors focus-within:border-input sm:rounded-xl",
+            "min-w-0 cursor-text rounded-2xl border bg-card shadow-[0_1px_2px_rgb(0_0_0/4%),0_6px_24px_-8px_rgb(0_0_0/10%)] transition-colors focus-within:border-input",
             expanded && "border-input",
           )}
           onClick={openEditor}
           onFocusCapture={() => setExpanded(true)}
           onBlurCapture={collapseIfEmpty}
         >
-          <div className="flex min-w-0 items-center gap-1.5 px-3 pt-2 text-[11px] leading-4 text-muted-foreground sm:px-3.5 sm:pt-2.5">
-            <span>To</span>
-            <span className="truncate font-medium text-foreground">{targetLabel}</span>
-          </div>
+          {targetLabel === "main thread" ? null : (
+            <div className="flex min-w-0 items-center gap-1.5 px-3 pt-2 text-[11px] leading-4 text-muted-foreground sm:px-3.5 sm:pt-2.5">
+              <span>To</span>
+              <span className="truncate font-medium text-foreground">
+                {targetLabel}
+              </span>
+            </div>
+          )}
           <textarea
             aria-label={`Message ${targetLabel}`}
+            data-testid="composer-input"
             className="block max-h-32 min-h-11 w-full resize-none bg-transparent px-3 py-2 text-base leading-6 outline-none placeholder:text-muted-foreground sm:max-h-[240px] sm:px-3.5 sm:pt-3 sm:pb-1 sm:text-[15px] sm:leading-relaxed"
             data-expanded={expanded}
-            onChange={autogrow}
+            onChange={() => {
+              // A genuine edit exits any in-progress history browse; a
+              // programmatic value set (recall, extension prefill, draft
+              // restore) never fires a React change event.
+              historyIndexRef.current = -1;
+              autogrow();
+              scheduleDraftSave();
+            }}
             onPaste={(event) => {
               const files = event.clipboardData?.files;
               if (files && files.length > 0) {
@@ -236,6 +323,11 @@ export function Composer({
               }
             }}
             onKeyDown={(event) => {
+              if (event.key === "Escape" && streaming) {
+                event.preventDefault();
+                abort();
+                return;
+              }
               if (
                 event.key === "Enter" &&
                 !event.shiftKey &&
@@ -244,9 +336,49 @@ export function Composer({
               ) {
                 event.preventDefault();
                 submit();
+                return;
+              }
+              if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                const el = event.currentTarget;
+                const browsing = historyIndexRef.current >= 0;
+                const atEmptyStart =
+                  el.value.length === 0 &&
+                  el.selectionStart === 0 &&
+                  el.selectionEnd === 0;
+                if (!browsing && !atEmptyStart) return;
+                const history = readPromptHistory();
+                if (event.key === "ArrowUp") {
+                  if (history.length === 0) return;
+                  event.preventDefault();
+                  if (!browsing) historyDraftRef.current = el.value;
+                  historyIndexRef.current = Math.min(
+                    historyIndexRef.current + 1,
+                    history.length - 1,
+                  );
+                  el.value = history[historyIndexRef.current] ?? "";
+                } else {
+                  if (!browsing) return;
+                  event.preventDefault();
+                  historyIndexRef.current -= 1;
+                  el.value =
+                    historyIndexRef.current >= 0
+                      ? (history[historyIndexRef.current] ?? "")
+                      : historyDraftRef.current;
+                }
+                autogrow();
+                setExpanded(true);
+                el.setSelectionRange(el.value.length, el.value.length);
               }
             }}
-            placeholder={streaming ? `Steer ${targetLabel}…` : `Message ${targetLabel}…`}
+            placeholder={
+              targetLabel === "main thread"
+                ? streaming
+                  ? "Steer Pi…"
+                  : "Ask Pi anything…"
+                : streaming
+                  ? `Steer ${targetLabel}…`
+                  : `Message ${targetLabel}…`
+            }
             ref={(el) => {
               textareaRef.current = el;
               if (el && !expanded) el.style.height = "auto";
@@ -278,6 +410,7 @@ export function Composer({
               </Button>
               <ModelPicker
                 models={agent?.models ?? []}
+                favorites={agent?.favorites ?? []}
                 sessionId={sessionId}
                 current={model ?? null}
               />
@@ -288,12 +421,12 @@ export function Composer({
                     <Button
                       size="xs"
                       variant="ghost"
-                      className="min-w-0 gap-1 rounded-[var(--control-radius)] px-1.5 sm:px-2"
+                      className="min-w-0 gap-1 rounded-[var(--control-radius)] px-1.5 font-normal text-muted-foreground hover:text-foreground sm:px-2"
                     />
                   }
                 >
                   <span className="truncate">
-                    <span className="hidden sm:inline">thinking: </span>
+                    <span className="hidden sm:inline">Thinking </span>
                     {thinking}
                   </span>
                   <ChevronDownIcon className="size-3 opacity-60" />
@@ -316,10 +449,11 @@ export function Composer({
                     </button>
                   ))}
                 </PopoverContent>
-
               </Popover>
 
-              {contextPercent !== null ? <ContextMeter percent={contextPercent} /> : null}
+              {contextPercent !== null && contextPercent >= 1 ? (
+                <ContextMeter percent={contextPercent} />
+              ) : null}
               {pendingCount > 0 ? (
                 <span className="hidden shrink-0 tabular-nums sm:inline">
                   {pendingCount} queued
@@ -330,49 +464,49 @@ export function Composer({
             <div className="ms-auto flex shrink-0 items-center gap-0.5">
               {streaming ? (
                 <>
-                <SendModeChip active={sendMode === "steer"} mode="steer" />
-                <SendModeChip active={sendMode === "queue"} mode="queue" />
-                <Button
-                  aria-label={sendMode === "steer" ? "Steer agent" : "Queue message"}
-                  className="shrink-0"
-                  onClick={submit}
-                  size="icon-sm"
-                  title={sendMode === "steer" ? "Steer agent" : "Queue message"}
-                >
-                  <ArrowUpIcon />
-                </Button>
-                <Button
-                  aria-label="Abort"
-                  className="text-destructive"
-                  onClick={() =>
-                    void api
-                      .abort(sessionId)
-                      .then(() => {
-                        if (!isCurrentSession(sessionId)) return;
-                        useApp.getState().setStreaming(false);
-                        refreshAgent(sessionId);
-                      })
-                      .catch((error: Error) => reportError(error.message))
-                  }
-                  size="icon-sm"
-                  title="Abort"
-                  variant="ghost"
-                >
-                  <CircleStopIcon />
-                </Button>
+                  <SendModeChip active={sendMode === "steer"} mode="steer" />
+                  <SendModeChip active={sendMode === "queue"} mode="queue" />
+                  <Button
+                    aria-label={
+                      sendMode === "steer" ? "Steer agent" : "Queue message"
+                    }
+                    className="shrink-0"
+                    data-testid="send"
+                    onClick={submit}
+                    size="icon-sm"
+                    title={
+                      sendMode === "steer" ? "Steer agent" : "Queue message"
+                    }
+                  >
+                    <ArrowUpIcon />
+                  </Button>
+                  <Button
+                    aria-label="Abort"
+                    className="text-destructive"
+                    data-testid="abort"
+                    onClick={abort}
+                    size="icon-sm"
+                    title="Stop (Esc)"
+                    variant="ghost"
+                  >
+                    <CircleStopIcon />
+                  </Button>
                 </>
               ) : (
                 <>
-                  <span className="hidden pr-1 sm:inline">↵ send</span>
-                <Button
-                  aria-label="Send"
-                  className="shrink-0"
-                  onClick={submit}
-                  size="icon-sm"
-                  title="Send"
-                >
-                  <ArrowUpIcon />
-                </Button>
+                  <span className="hidden pr-1 text-[11px] opacity-70 lg:inline">
+                    ↵ send
+                  </span>
+                  <Button
+                    aria-label="Send"
+                    className="shrink-0"
+                    data-testid="send"
+                    onClick={submit}
+                    size="icon-sm"
+                    title="Send"
+                  >
+                    <ArrowUpIcon />
+                  </Button>
                 </>
               )}
             </div>
@@ -407,16 +541,54 @@ export function Composer({
   );
 }
 
+type PickerModel = { id: string; name?: string | null; provider: string };
+
+/**
+ * Resolves pi `enabledModels` patterns (`provider/id` or bare `id`, with an
+ * optional `:thinking` suffix) to available models, keeping pattern order.
+ * Glob patterns are skipped.
+ */
+function favoriteModels(
+  models: PickerModel[],
+  patterns: string[],
+): PickerModel[] {
+  const picked: PickerModel[] = [];
+  for (const raw of patterns) {
+    const pattern = raw.replace(
+      /:(off|minimal|low|medium|high|xhigh|max)$/,
+      "",
+    );
+    if (/[*?]/.test(pattern)) continue;
+    const slash = pattern.indexOf("/");
+    const match =
+      slash > 0
+        ? models.find(
+            (m) =>
+              m.provider === pattern.slice(0, slash) &&
+              m.id === pattern.slice(slash + 1),
+          )
+        : models.find((m) => m.id === pattern);
+    if (match && !picked.includes(match)) picked.push(match);
+  }
+  return picked;
+}
+
 function ModelPicker({
   models,
+  favorites,
   sessionId,
   current,
 }: {
-  models: Array<{ id: string; name?: string | null; provider: string }>;
+  models: PickerModel[];
+  favorites: string[];
   sessionId: string;
   current: { id: string; provider: string; displayName?: string | null } | null;
 }) {
   const [query, setQuery] = useState("");
+  const favs = useMemo(
+    () => favoriteModels(models, favorites),
+    [models, favorites],
+  );
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     const list = q
@@ -425,9 +597,16 @@ function ModelPicker({
             .toLowerCase()
             .includes(q),
         )
-      : models;
+      : models.filter((model) => !favs.includes(model));
     return list.slice(0, 60);
-  }, [models, query]);
+  }, [models, favs, query]);
+  const sections: Array<{ label: string | null; items: PickerModel[] }> =
+    query.trim() || favs.length === 0
+      ? [{ label: null, items: filtered }]
+      : [
+          { label: "Favorites", items: favs },
+          { label: "All models", items: filtered },
+        ];
 
   async function pick(candidate: { id: string; provider: string }) {
     await api.setModel(sessionId, candidate.provider, candidate.id);
@@ -441,7 +620,7 @@ function ModelPicker({
           <Button
             size="xs"
             variant="ghost"
-            className="min-w-0 max-w-[8.5rem] gap-1 rounded-[var(--control-radius)] px-1.5 sm:max-w-none sm:px-2"
+            className="min-w-0 max-w-[8.5rem] gap-1 rounded-[var(--control-radius)] px-1.5 font-normal text-muted-foreground hover:text-foreground sm:max-w-none sm:px-2"
           />
         }
       >
@@ -461,26 +640,40 @@ function ModelPicker({
           />
         </div>
         <div className="max-h-64 overflow-y-auto">
-          {filtered.map((candidate) => (
-            <button
-              className="flex w-full items-baseline gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent"
-              key={`${candidate.provider}:${candidate.id}`}
-              onClick={() => void pick(candidate)}
-              type="button"
-            >
-              <span
-                className={cn(
-                  "size-1.5 shrink-0 translate-y-[-1px] rounded-full",
-                  candidate.id === current?.id ? "bg-primary" : "bg-transparent",
-                )}
-              />
-              <span className="truncate">{candidate.name ?? candidate.id}</span>
-              <span className="ms-auto shrink-0 text-[11px] text-muted-foreground">
-                {candidate.provider}
-              </span>
-            </button>
+          {sections.map((section) => (
+            <div key={section.label ?? "all"}>
+              {section.label ? (
+                <p className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                  {section.label}
+                </p>
+              ) : null}
+              {section.items.map((candidate) => (
+                <button
+                  className="flex w-full items-baseline gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent"
+                  key={`${candidate.provider}:${candidate.id}`}
+                  onClick={() => void pick(candidate)}
+                  type="button"
+                >
+                  <span
+                    className={cn(
+                      "size-1.5 shrink-0 translate-y-[-1px] rounded-full",
+                      candidate.id === current?.id &&
+                        candidate.provider === current?.provider
+                        ? "bg-primary"
+                        : "bg-transparent",
+                    )}
+                  />
+                  <span className="truncate">
+                    {candidate.name ?? candidate.id}
+                  </span>
+                  <span className="ms-auto shrink-0 text-[11px] text-muted-foreground">
+                    {candidate.provider}
+                  </span>
+                </button>
+              ))}
+            </div>
           ))}
-          {filtered.length === 0 ? (
+          {query.trim() && filtered.length === 0 ? (
             <p className="px-2 py-3 text-center text-xs text-muted-foreground">
               No models match “{query}”
             </p>
@@ -535,21 +728,15 @@ function SendModeChip({
 }
 
 function refreshAgent(sessionId: string) {
-  window.dispatchEvent(new CustomEvent("pecan:agent-refresh", { detail: sessionId }));
+  window.dispatchEvent(
+    new CustomEvent("pecan:agent-refresh", { detail: sessionId }),
+  );
 }
 
 function isCurrentSession(sessionId: string) {
   const state = useApp.getState();
   return (
-    state.thread?.summary.id === sessionId && state.agent?.sessionId === sessionId
+    state.thread?.summary.id === sessionId &&
+    state.agent?.sessionId === sessionId
   );
-}
-
-function reportError(message: string) {
-  window.dispatchEvent(new CustomEvent("pecan:error", { detail: message }));
-}
-
-/** "anthropic/claude-sonnet-4" → "claude-sonnet-4". */
-function shortModel(model: string) {
-  return model.split("/").at(-1) ?? model;
 }

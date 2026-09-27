@@ -41,7 +41,7 @@ pub(crate) fn spawn(
             }
         }
         if !touched.is_empty() {
-            let _ = tx.try_send(touched);
+            tx.try_send(touched).unwrap_or_default();
         }
     })
     .map_err(std::io::Error::other)?;
@@ -49,12 +49,12 @@ pub(crate) fn spawn(
     let watched = [
         (paths.sessions_dir(), RecursiveMode::Recursive),
         (paths.tasks_dir(), RecursiveMode::NonRecursive),
-        // Workflow runs are directories containing workflow.json and sidecars.
+        // Workflow runs are `runs/project-<hash>/<runId>/journal.json`.
         (paths.workflows_dir(), RecursiveMode::Recursive),
     ];
     for (dir, mode) in &watched {
         if dir.exists() {
-            debouncer.watch(dir, mode.clone()).map_err(std::io::Error::other)?;
+            debouncer.watch(dir, *mode).map_err(std::io::Error::other)?;
         }
     }
     for root in project_roots {
@@ -96,18 +96,35 @@ fn is_relevant(path: &Path) -> bool {
         || name.starts_with("tasks-")
         || name == "tasks.json"
         || name == "tasks-config.json"
-        || name == "workflow.json"
-        || name == "result.json"
+        || name == "journal.json"
 }
 
 /// Emits `thread-changed` for changed transcript files present in the index.
 async fn notify_threads(app: &Arc<crate::server::snapshot::App>, changed: &HashSet<PathBuf>) {
     use crate::server::snapshot::ServerEvent;
     let snap = app.snapshot().await;
+    let run_ids: HashSet<String> = changed
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "journal.json"))
+        .filter_map(|path| path.parent()?.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    let workflow_threads: HashSet<PathBuf> = if run_ids.is_empty() {
+        HashSet::new()
+    } else {
+        app.threads_with_workflow_runs(&run_ids)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "workflow thread lookup failed");
+                Vec::new()
+            })
+            .into_iter()
+            .collect()
+    };
     let mut seen: HashSet<&str> = HashSet::new();
     for row in snap.sessions.iter() {
-        if changed.contains(&row.summary.path) && seen.insert(row.summary.id.as_str()) {
-            let _ = app.events.send(ServerEvent::ThreadChanged { id: row.summary.id.clone() });
+        let touched =
+            changed.contains(&row.summary.path) || workflow_threads.contains(&row.summary.path);
+        if touched && seen.insert(row.summary.id.as_str()) {
+            app.events.send(ServerEvent::ThreadChanged { id: row.summary.id.clone() });
         }
     }
 }

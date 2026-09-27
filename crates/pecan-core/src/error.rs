@@ -17,7 +17,7 @@ pub enum CoreError {
         #[source]
         source: std::io::Error,
     },
-    /// A SQLite state-store operation failed.
+    /// A `SQLite` state-store operation failed.
     #[error("database error: {0}")]
     Sql(#[from] rusqlite::Error),
     /// A shared-state mutex was poisoned by a panicking writer.

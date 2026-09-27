@@ -220,6 +220,7 @@ mod tests {
             entries: entries.into_iter().map(|entry| Dated { ts: None, entry }).collect(),
             omitted: 0,
             waiting_askuser: false,
+            workflow_run_ids: Vec::new(),
         }
     }
 
@@ -229,7 +230,7 @@ mod tests {
             sanitize_thread_title("  `Fix session recovery`\nextra"),
             "Fix session recovery"
         );
-        let long = format!("\"{}\"", "é".repeat(60));
+        let long = format!("\"{}\"", "\u{e9}".repeat(60));
         let sanitized = sanitize_thread_title(&long);
         assert_eq!(sanitized.chars().count(), 50);
         assert!(sanitized.ends_with("..."), "long title should end in ellipsis");
@@ -250,6 +251,7 @@ mod tests {
                 thinking: None,
                 tools: Vec::new(),
                 model: None,
+                error: None,
             },
         ]);
         let initial = build_prompt(&view, None);

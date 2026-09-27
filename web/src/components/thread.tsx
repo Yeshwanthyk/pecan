@@ -9,19 +9,19 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   CircleAlertIcon,
+  CornerDownLeftIcon,
+  MessageCircleQuestionIcon,
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { DatedEntry, ThreadEntry, ThreadView, ToolCall } from "~/api/types";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "~/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/components/ui/collapsible";
 import { Spinner } from "~/components/ui/spinner";
-import { ChatMarkdown, DiffBlock } from "~/components/chat-markdown";
+import { DiffBlock } from "~/components/diff-block";
+import { ChatMarkdown } from "~/components/markdown";
 import { CopyButton } from "~/components/copy-button";
 import { TaskListPanel, WorkflowListPanel } from "~/components/extension-ui";
 import { useApp } from "~/store";
+import { shortModel } from "~/lib/format";
 import { cn } from "~/lib/utils";
 
 const OPEN_TURNS = 3;
@@ -63,15 +63,17 @@ export function Thread({ data }: { data: ThreadView }) {
 
   return (
     <div
-      className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto"
+      aria-label="Conversation"
+      className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto [mask-image:linear-gradient(to_bottom,transparent,black_20px,black_calc(100%-20px),transparent)]"
+      data-testid="thread"
       onScroll={(event) => {
         const el = event.currentTarget;
-        pinnedRef.current =
-          el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+        pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
       }}
       ref={scrollRef}
     >
-      <div className="mx-auto w-full max-w-[46rem] px-4 pt-4 pb-6 md:px-6">
+      <div className="mx-auto w-full max-w-[46rem] px-4 pt-4 pb-6 md:px-6" role="log">
+        {turns.length === 0 ? <BlankThread cwd={data.summary.cwd} /> : null}
         {foldCount > 0 ? <FoldedTurns turns={turns.slice(0, foldCount)} /> : null}
         {openTurns.map((turn) => (
           <TurnBlock key={turn.key} turn={turn} />
@@ -94,17 +96,42 @@ function StreamingDraft({ sessionId }: { sessionId: string }) {
       ? (state.agent.state.model?.displayName ?? state.agent.state.model?.id)
       : null,
   );
-  if (!draft || draft.text.length === 0) return null;
+  const working = useApp((state) => state.streaming && state.thread?.summary.id === sessionId);
+  if (!draft || draft.text.length === 0) {
+    if (!working) return null;
+    return (
+      <div
+        className="flex h-8 items-center gap-2 text-[11px] font-medium text-muted-foreground/80"
+        data-testid="working"
+      >
+        <Spinner className="size-3" />
+        Working
+        {model ? <span className="font-normal">· {shortModel(model)}</span> : null}
+      </div>
+    );
+  }
   return (
     <div className="py-2">
-      <div className="mb-1 flex h-5 items-center gap-2 text-[11px] font-medium text-muted-foreground/80">
-        pecan
-        {model ? <span className="font-normal">{shortModel(model)}</span> : null}
+      <div className="mb-1 flex h-5 items-center gap-1.5 text-[11px] text-muted-foreground/70">
+        <span>Pi{model ? ` · ${shortModel(model)}` : ""}</span>
         <Spinner className="size-3" />
       </div>
       <div className="chat-md prose prose-sm break-words">
         <ChatMarkdown text={draft.text} />
       </div>
+    </div>
+  );
+}
+
+/** First-run hint for a session with no turns yet. */
+function BlankThread({ cwd }: { cwd: string }) {
+  return (
+    <div className="flex flex-col items-center py-[18vh] text-center text-muted-foreground">
+      <p className="text-sm font-medium text-foreground">New session</p>
+      <p className="mt-1 max-w-xs truncate font-mono text-[11px]" title={cwd}>
+        {cwd}
+      </p>
+      <p className="mt-3 text-xs">Ask anything below. Esc stops a running turn.</p>
     </div>
   );
 }
@@ -152,13 +179,14 @@ function TurnBlock({ turn }: { turn: Turn }) {
 }
 
 /** Groups consecutive tool-loop entries into one quiet activity block. */
-const ToolRunBlock = memo(function ToolRunBlock({
-  entries,
-}: {
-  entries: DatedEntry[];
-}) {
+const ToolRunBlock = memo(function ToolRunBlock({ entries }: { entries: DatedEntry[] }) {
   const blocks: Array<
-    | { kind: "run"; tools: ToolCall[]; thoughts: string[]; model: string | null }
+    | {
+        kind: "run";
+        tools: ToolCall[];
+        thoughts: string[];
+        model: string | null;
+      }
     | { kind: "entry"; dated: DatedEntry }
   > = [];
   for (const dated of entries) {
@@ -166,6 +194,7 @@ const ToolRunBlock = memo(function ToolRunBlock({
     const isRunPart =
       entry.kind === "assistant" &&
       !entry.text &&
+      !entry.error &&
       ((entry.tools?.length ?? 0) > 0 || Boolean(entry.thinking));
     if (!isRunPart) {
       blocks.push({ kind: "entry", dated });
@@ -236,26 +265,23 @@ function ToolActivity({ tools }: { tools: ToolCall[] }) {
   const title =
     tools.length === 1
       ? (firstSummary ?? "Tool activity")
-      : firstSummary
-        ? `${firstSummary} + ${tools.length - 1} more actions`
-        : "Tool activity";
+      : `${tools.length} actions${firstSummary ? ` · ${firstSummary}` : ""}`;
+  const only = tools.length === 1 ? tools[0] : undefined;
+  if (only) return <ToolAction lead tool={only} />;
   return (
-    <Collapsible className="my-1 min-w-0" defaultOpen={false}>
+    <Collapsible className="my-0.5 min-w-0" defaultOpen={false}>
       <CollapsibleTrigger
         aria-label={`Show ${tools.length} tool ${tools.length === 1 ? "action" : "actions"}`}
-        className="group flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-1.5 text-left text-[12px] text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
+        className="group -ms-1.5 flex min-h-11 max-w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-7"
       >
         <ActivityIcon className="size-3.5 shrink-0 opacity-70" />
-        <span className="min-w-0 flex-1 truncate font-medium">{title}</span>
-        <span className="shrink-0 tabular-nums text-[11px] opacity-70">
-          {tools.length} {tools.length === 1 ? "action" : "actions"}
-        </span>
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[panel-open]:rotate-90" />
+        <span className="min-w-0 truncate">{title}</span>
+        <ChevronRightIcon className="size-3.5 shrink-0 opacity-0 transition-[rotate,opacity] duration-200 group-hover:opacity-70 group-focus-visible:opacity-70 group-data-[panel-open]:rotate-90 group-data-[panel-open]:opacity-70 max-md:opacity-70" />
       </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="mt-0.5 border-t ps-1 sm:ps-4">
+      <CollapsibleContent className="ease-[cubic-bezier(0.2,0,0,1)]">
+        <div className="ms-[5px] mt-0.5 mb-1 border-s ps-3">
           {groups.map((group) => (
-            <ToolActivityGroup group={group} key={group.category} />
+            <ToolActivityGroup group={group} key={group.category} labelled={groups.length > 1} />
           ))}
         </div>
       </CollapsibleContent>
@@ -276,40 +302,42 @@ function groupTools(tools: ToolCall[]): ToolGroup[] {
   });
 }
 
-function ToolActivityGroup({ group }: { group: ToolGroup }) {
-  const isTaskPlan = group.category === "task";
+/** Tools of one category; a caption only when a run mixes categories. */
+function ToolActivityGroup({ group, labelled }: { group: ToolGroup; labelled: boolean }) {
   return (
-    <Collapsible defaultOpen={!isTaskPlan}>
-      <CollapsibleTrigger className="group flex min-h-11 w-full items-center gap-2 px-1.5 text-[11px] font-medium text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-8">
-        <ChevronRightIcon className="size-3 shrink-0 transition-transform group-data-[panel-open]:rotate-90" />
-        <span>{TOOL_CATEGORY_LABELS[group.category]}</span>
-        <span className="ms-auto tabular-nums opacity-70">{group.tools.length}</span>
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="pb-1">
-          {group.tools.map((tool, index) => (
-            <ToolAction key={`${tool.toolCallId}-${index}`} tool={tool} />
-          ))}
+    <div className="py-0.5">
+      {labelled ? (
+        <div className="flex h-7 items-center gap-1.5 text-[11px] text-muted-foreground/80">
+          <span>{TOOL_CATEGORY_LABELS[group.category]}</span>
+          <span className="tabular-nums">{group.tools.length}</span>
         </div>
-      </CollapsibleContent>
-    </Collapsible>
+      ) : null}
+      {group.tools.map((tool, index) => (
+        <ToolAction key={`${tool.toolCallId}-${index}`} tool={tool} />
+      ))}
+    </div>
   );
 }
 
-function ToolAction({ tool }: { tool: ToolCall }) {
+/** One tool call; `lead` styles it as a run's only activity row. */
+function ToolAction({ tool, lead = false }: { tool: ToolCall; lead?: boolean }) {
   const body = previewBody(tool.argsPreview);
   const diff = looksLikeDiff(body);
   return (
-    <Collapsible>
+    <Collapsible className={lead ? "my-0.5 min-w-0" : undefined}>
       <CollapsibleTrigger
-        className="group flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-1.5 text-left text-[12px] text-foreground/85 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
+        className={cn(
+          "group flex min-h-11 max-w-full min-w-0 items-center gap-1.5 rounded-md text-left text-[13px] outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-7",
+          lead ? "text-muted-foreground" : "text-foreground/80",
+        )}
         title={tool.summary}
       >
-        <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground transition-transform group-data-[panel-open]:rotate-90" />
-        <span className="min-w-0 flex-1 truncate">{tool.summary}</span>
+        {lead ? <ActivityIcon className="size-3.5 shrink-0 opacity-70" /> : null}
+        <span className="min-w-0 truncate">{tool.summary}</span>
+        <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground transition-transform duration-200 group-data-[panel-open]:rotate-90" />
       </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="pb-2 ps-5 pe-1 sm:ps-6">
+      <CollapsibleContent className="ease-[cubic-bezier(0.2,0,0,1)]">
+        <div className={cn("pb-2 pe-1", lead && "ms-[5px] mt-0.5 border-s ps-3")}>
           {tool.targetCount > 0 ? (
             <div className="mb-1 text-[11px] text-muted-foreground">
               Targets ({tool.targetCount}): {tool.targets.join(", ") || "not retained"}
@@ -329,8 +357,80 @@ const EntryRow = memo(function EntryRow({ dated }: { dated: DatedEntry }) {
   if (entry.kind === "user") return <UserMessage entry={entry} />;
   if (entry.kind === "assistant") return <AssistantMessage entry={entry} />;
   if (entry.kind === "toolError") return <ToolErrorNote text={entry.text} />;
+  if (entry.kind === "childQuestions") return <ChildQuestionsCard entry={entry} />;
+  if (entry.kind === "childResults") return <ChildResultsNote entry={entry} />;
   return <AskUserCard entry={entry} />;
 });
+
+type ChildQuestionsEntry = Extract<ThreadEntry, { kind: "childQuestions" }>;
+
+/** `ask_parent` questions from subagents; the parent agent replies by request id. */
+function ChildQuestionsCard({ entry }: { entry: ChildQuestionsEntry }) {
+  return (
+    <div className="my-2 flex flex-col gap-2">
+      {entry.questions.map((q) => {
+        const expired =
+          !q.answered && typeof q.deadlineAt === "number" && q.deadlineAt < Date.now();
+        return (
+          <div
+            key={q.requestId}
+            className="animate-row-in rounded-xl border border-border/70 bg-muted/30 px-3 py-2.5"
+          >
+            <div className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+              <MessageCircleQuestionIcon className="size-3.5 text-primary" />
+              <span className="font-medium text-foreground/90">{q.childId} asks</span>
+              <span className="ml-auto tabular-nums">
+                {q.answered ? "Replied" : expired ? "Expired" : "Waiting for reply"}
+              </span>
+            </div>
+            <div className="mt-1 text-[13.5px] leading-relaxed whitespace-pre-wrap">
+              {q.question}
+            </div>
+            {q.context ? (
+              <div className="mt-1 text-[12px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+                {q.context}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+type ChildResultsEntry = Extract<ThreadEntry, { kind: "childResults" }>;
+
+/** Settled subagents handed back to this session; the report stays collapsed. */
+function ChildResultsNote({ entry }: { entry: ChildResultsEntry }) {
+  const [open, setOpen] = useState(false);
+  const label =
+    entry.results.length > 0
+      ? entry.results
+          .map((r) => `${r.title || r.id} ${r.status === "done" ? "finished" : r.status}`)
+          .join(" · ")
+      : "Subagent results";
+  const failed = entry.results.some((r) => r.status !== "done");
+  return (
+    <div className="my-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full min-w-0 items-center gap-1.5 text-left text-[12px] text-muted-foreground hover:text-foreground"
+      >
+        <CornerDownLeftIcon className={cn("size-3.5 shrink-0", failed && "text-destructive")} />
+        <span className="truncate">{label}</span>
+        <ChevronRightIcon
+          className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")}
+        />
+      </button>
+      {open ? (
+        <div className="mt-1.5 rounded-lg border border-border/60 bg-muted/20 px-3 py-2 text-[12.5px]">
+          <ChatMarkdown text={entry.text} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 /** Quiet inline note for failed tool results — never styled as a user prompt. */
 function ToolErrorNote({ text }: { text: string }) {
@@ -356,7 +456,7 @@ function UserMessage({ entry }: { entry: UserEntry }) {
   const shown = expanded || !overflows ? text : lines.slice(0, USER_COLLAPSE_LINES).join("\n");
   return (
     <div className="flex justify-end py-2">
-      <div className="chat-md prose prose-sm relative min-w-0 max-w-[85%] break-words rounded-xl rounded-br-sm border border-bubble-border bg-bubble px-3.5 py-2">
+      <div className="chat-md prose prose-sm relative min-w-0 max-w-[85%] break-words rounded-2xl rounded-br-md bg-bubble px-3.5 py-2 [&_:where(p,ul,ol,pre)]:my-1.5 [&_:where(p,ul,ol,pre):first-child]:mt-0 [&_:where(p,ul,ol,pre):last-child]:mb-0">
         {text ? (
           <div className={cn(!expanded && overflows && "relative overflow-hidden")}>
             <ChatMarkdown text={shown} />
@@ -414,7 +514,7 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
   return (
     <div className="py-2">
       <AssistantByline
-        loading={!entry.text && tools.length === 0 && !entry.thinking}
+        loading={!entry.text && tools.length === 0 && !entry.thinking && !entry.error}
         model={entry.model ?? null}
       />
       {entry.thinking ? <ThinkingLine text={entry.thinking} /> : null}
@@ -431,15 +531,31 @@ function AssistantMessage({ entry }: { entry: AssistantEntry }) {
         </div>
       ) : null}
       {tools.length > 0 ? <ToolActivity tools={tools} /> : null}
+      {entry.error ? <TurnError reason={entry.error} /> : null}
+    </div>
+  );
+}
+
+/** A turn that ended early: a quiet note for user aborts, an error otherwise. */
+function TurnError({ reason }: { reason: string }) {
+  if (reason === "Stopped") {
+    return (
+      <p className="mt-1 text-[12px] text-muted-foreground" data-testid="turn-stopped">
+        Stopped
+      </p>
+    );
+  }
+  return (
+    <div data-testid="turn-error">
+      <ToolErrorNote text={reason} />
     </div>
   );
 }
 
 function AssistantByline({ model, loading = false }: { model: string | null; loading?: boolean }) {
   return (
-    <div className="mb-1 flex h-5 items-center gap-2 text-[11px] font-medium text-muted-foreground/80">
-      pecan
-      {model ? <span className="font-normal">{shortModel(model)}</span> : null}
+    <div className="mb-1 flex h-5 items-center gap-1.5 text-[11px] text-muted-foreground/70">
+      <span>Pi{model ? ` · ${shortModel(model)}` : ""}</span>
       {loading ? <Spinner className="size-3" /> : null}
     </div>
   );
@@ -447,7 +563,7 @@ function AssistantByline({ model, loading = false }: { model: string | null; loa
 
 function ThinkingLine({ text }: { text: string }) {
   return (
-    <p className="mb-1.5 line-clamp-2 text-[12px] font-semibold italic leading-relaxed text-muted-foreground/65">
+    <p className="mb-1.5 line-clamp-2 text-[12px] italic leading-relaxed text-muted-foreground/65">
       {plainThought(text)}
     </p>
   );
@@ -489,14 +605,18 @@ function ToolBody({ tool, showArguments = true }: { tool: ToolCall; showArgument
 function ToolDetails({ details }: { details: unknown }) {
   if (details === null || typeof details !== "object") return null;
   const record = details as Record<string, unknown>;
-  const artifactPaths = [record.artifactPath, record.resultArtifact, record.transcriptArtifact]
-    .filter((value): value is string => typeof value === "string" && value.length > 0);
-  let text: string;
+  const artifactPaths = [
+    record.artifactPath,
+    record.resultArtifact,
+    record.transcriptArtifact,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  let text: string | null = null;
   try {
     text = JSON.stringify(details, null, 2);
   } catch {
-    return null;
+    // Circular or non-serializable tool result; nothing safe to render.
   }
+  if (text === null) return null;
   const lines = text.split("\n");
   return (
     <div className="mt-1">
@@ -506,11 +626,7 @@ function ToolDetails({ details }: { details: unknown }) {
         </div>
       ) : null}
       <div className="relative">
-        <CopyButton
-          className="absolute top-1 right-1 z-10"
-          label="Copy tool result"
-          text={text}
-        />
+        <CopyButton className="absolute top-1 right-1 z-10" label="Copy tool result" text={text} />
         <pre className="max-h-72 overflow-auto rounded-md border bg-card p-2.5 pe-10 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
           {lines.slice(0, 80).join("\n")}
           {lines.length > 80 ? `\n… ${lines.length - 80} more lines` : ""}
@@ -601,10 +717,7 @@ function AskUserCard({ entry }: { entry: AskUserEntry }) {
       )}
     >
       <div
-        className={cn(
-          "mb-1 text-[11px] font-medium",
-          answered ? "text-success" : "text-warning",
-        )}
+        className={cn("mb-1 text-[11px] font-medium", answered ? "text-success" : "text-warning")}
       >
         {answered ? "Answered" : "Question"}
       </div>
@@ -612,16 +725,14 @@ function AskUserCard({ entry }: { entry: AskUserEntry }) {
         <div key={question.question ?? qIndex}>
           <p className="mt-1.5 text-sm font-medium">{question.question}</p>
           <ul className="mt-1 flex flex-col gap-0.5">
-            {((question.options ?? []) as Array<{ label?: string }>).map(
-              (option, oIndex) => (
-                <li
-                  className="rounded-md bg-accent/60 px-2.5 py-1 text-[13px] text-muted-foreground"
-                  key={option.label ?? oIndex}
-                >
-                  {option.label ?? "…"}
-                </li>
-              ),
-            )}
+            {((question.options ?? []) as Array<{ label?: string }>).map((option, oIndex) => (
+              <li
+                className="rounded-md bg-accent/60 px-2.5 py-1 text-[13px] text-muted-foreground"
+                key={option.label ?? oIndex}
+              >
+                {option.label ?? "…"}
+              </li>
+            ))}
           </ul>
         </div>
       ))}
@@ -635,15 +746,14 @@ function AskUserCard({ entry }: { entry: AskUserEntry }) {
 }
 
 function Panels({ data }: { data: ThreadView }) {
-  const taskCount = data.tasks.reduce(
-    (total, list) => total + list.tasks.length,
-    0,
-  );
+  const taskCount = data.tasks.reduce((total, list) => total + list.tasks.length, 0);
   if (taskCount === 0 && data.workflows.length === 0) return null;
   return (
     <div className="mt-6 flex flex-col gap-2 border-t pt-3">
       {taskCount > 0 ? <TaskListPanel groups={data.tasks} /> : null}
-      {data.workflows.length > 0 ? <WorkflowListPanel runs={data.workflows} /> : null}
+      {data.workflows.length > 0 ? (
+        <WorkflowListPanel parentId={data.summary.id} runs={data.workflows} />
+      ) : null}
     </div>
   );
 }
@@ -664,9 +774,7 @@ function buildTurns(entries: DatedEntry[]): Turn[] {
         key: entryKey(dated),
         entries: [dated],
         firstLine:
-          dated.entry.kind === "user"
-            ? (dated.entry.text.split("\n")[0]?.slice(0, 90) ?? "")
-            : "",
+          dated.entry.kind === "user" ? (dated.entry.text.split("\n")[0]?.slice(0, 90) ?? "") : "",
       });
     } else {
       turns.at(-1)?.entries.push(dated);
@@ -676,15 +784,11 @@ function buildTurns(entries: DatedEntry[]): Turn[] {
 }
 
 function entryKey(dated: DatedEntry): string {
-  const head =
-    dated.entry.kind === "user" ? dated.entry.text.slice(0, 24) : "";
+  const head = dated.entry.kind === "user" ? dated.entry.text.slice(0, 24) : "";
   return `${dated.ts ?? "t"}:${dated.entry.kind}:${head}`;
 }
 
-
-function readQuestions(
-  questions: unknown,
-): Array<{ question?: string; options?: unknown[] }> {
+function readQuestions(questions: unknown): Array<{ question?: string; options?: unknown[] }> {
   if (typeof questions === "object" && questions !== null && "questions" in questions) {
     const inner = (questions as { questions: unknown }).questions;
     if (!Array.isArray(inner)) return [];
@@ -707,9 +811,4 @@ function readText(answer: unknown): string {
       .slice(0, 200);
   }
   return JSON.stringify(answer).slice(0, 200);
-}
-
-/** "anthropic/claude-sonnet-4" → "claude-sonnet-4". */
-function shortModel(model: string) {
-  return model.split("/").at(-1) ?? model;
 }

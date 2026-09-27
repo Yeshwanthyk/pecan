@@ -6,23 +6,22 @@ use axum::http::HeaderMap;
 use axum::response::Sse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use pecan_core::thread;
 use serde::Deserialize;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio_stream::wrappers::BroadcastStream;
 
+use super::auth::{self, Principal};
+use super::git;
+use super::push;
 use super::ship;
 use super::snapshot::{App, IndexSnapshot, ServerEvent, SessionRow};
 use super::title;
 use super::ui_plugins;
 use super::worker::Workers;
-use crate::server::api_errors::ApiError;
+use crate::server::api_errors::{ApiError, json_body};
 
 /// Builds the `/api` router.
-#[must_use]
 pub(crate) fn router(app: App, workers: Workers) -> Router {
     let with_workers = Router::new()
         // Image attachments ride in the message JSON body.
@@ -32,12 +31,14 @@ pub(crate) fn router(app: App, workers: Workers) -> Router {
         .route("/session/{id}/message", post(message))
         .route("/session/{id}/respond", post(respond))
         .route("/session/{id}/abort", post(abort))
+        .route("/session/{id}/status", get(session_status))
         .route("/session/{id}/agent-attach", post(agent_attach))
         .route("/session/{id}/set-model", post(set_model))
         .route("/session/{id}/set-thinking", post(set_thinking))
         .with_state((app.clone(), workers));
     let base = Router::new()
         .route("/bootstrap", get(bootstrap))
+        .route("/health", get(health))
         .route("/sessions", get(sessions))
         .route("/session/{id}/git", get(session_git))
         .route("/session/{id}/diff", get(session_diff))
@@ -46,14 +47,25 @@ pub(crate) fn router(app: App, workers: Workers) -> Router {
         .route("/session/{id}/pin", post(pin).delete(unpin))
         .route("/session/{id}/asks", get(pending_asks))
         .route("/session/{id}/title/regenerate", post(regenerate_title))
-        .route("/projects/settle-stale", post(settle_stale))
         .route("/projects", post(add_project).delete(remove_project))
         .route("/ui-plugins/{id}", post(set_ui_plugin))
-        .route("/state/seed-init", post(seed_init))
         .route("/events", get(events))
+        .route("/pair/code", post(auth::mint_code))
+        .route("/devices", get(auth::list_devices))
+        .route("/devices/{id}", axum::routing::delete(auth::revoke_device))
+        .route("/push/key", get(push::key))
+        .route("/push/subscription", axum::routing::put(push::subscribe).delete(push::unsubscribe))
+        .route("/push/subscriptions", get(push::subscriptions))
+        .route("/push/pending", get(push::pending))
+        .route("/push/test", post(push::test))
+        .with_state(app.clone())
+        .merge(with_workers)
+        .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth::require));
+    Router::new()
+        .route("/pair", post(auth::pair))
         .with_state(app)
-        .merge(with_workers);
-    base.fallback(api_not_found)
+        .merge(base)
+        .fallback(api_not_found)
 }
 
 async fn api_not_found() -> ApiError {
@@ -65,26 +77,21 @@ async fn api_not_found() -> ApiError {
 async fn bootstrap(State(app): State<App>) -> Result<Json<serde_json::Value>, ApiError> {
     let snap = app.snapshot().await;
     let store = lock(&app)?;
-    let seeded = store.is_seeded().map_err(ApiError::internal)?;
-    let ui_plugins = ui_plugins::catalog(&app.paths, &store).map_err(ApiError::internal)?;
+    let seeded = store.is_seeded()?;
+    let ui_plugins = ui_plugins::catalog(&app.paths, &store)?;
     let project_rows = if app.session_scope.is_some() {
         Vec::new()
     } else {
-        store
-            .projects()
-            .map_err(ApiError::internal)?
-            .into_iter()
-            .filter(|(_, pref)| pref.added)
-            .collect::<Vec<_>>()
+        store.projects()?.into_iter().filter(|(_, pref)| pref.added).collect::<Vec<_>>()
     };
     let projects: Vec<serde_json::Value> = project_rows
         .iter()
         .map(|(cwd, _)| {
             serde_json::json!({
                 "cwd": cwd,
-                "name": display_name(&cwd),
-                "sessionCount": session_count(&snap, &cwd),
-                "lastActivity": last_activity(&snap, &cwd),
+                "name": display_name(cwd),
+                "sessionCount": session_count(&snap, cwd),
+                "lastActivity": last_activity(&snap, cwd),
             })
         })
         .collect();
@@ -122,27 +129,23 @@ async fn set_ui_plugin(
     if id != ui_plugins::PI_TASKS_ID {
         return Err(ApiError::not_found("unknown UI plugin"));
     }
-    let Json(body) = body.map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let body = json_body(body)?;
     let descriptor = {
         let store = lock(&app)?;
-        let current = ui_plugins::catalog(&app.paths, &store)
-            .map_err(ApiError::internal)?
+        let current = ui_plugins::catalog(&app.paths, &store)?
             .into_iter()
             .next()
             .ok_or_else(|| ApiError::not_found("unknown UI plugin"))?;
         if body.enabled && (!current.detected || !current.source_enabled) {
             return Err(ApiError::conflict("Pi Tasks must be installed and enabled in Pi first"));
         }
-        store
-            .set_ui_plugin_enabled(ui_plugins::PI_TASKS_ID, body.enabled)
-            .map_err(ApiError::internal)?;
-        ui_plugins::catalog(&app.paths, &store)
-            .map_err(ApiError::internal)?
+        store.set_ui_plugin_enabled(ui_plugins::PI_TASKS_ID, body.enabled)?;
+        ui_plugins::catalog(&app.paths, &store)?
             .into_iter()
             .next()
             .ok_or_else(|| ApiError::not_found("unknown UI plugin"))?
     };
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(descriptor))
 }
 
@@ -161,6 +164,21 @@ fn last_activity(snap: &IndexSnapshot, cwd: &str) -> Option<String> {
 
 fn display_name(cwd: &str) -> String {
     cwd.rsplit('/').next().unwrap_or(cwd).to_owned()
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct HealthQuery {
+    /// Skip the cache and probe `pi` again.
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// Whether `pi` is runnable, so clients can explain a broken setup up front.
+async fn health(
+    State(app): State<App>,
+    axum::extract::Query(query): axum::extract::Query<HealthQuery>,
+) -> Json<super::health::Health> {
+    Json(app.health.get(app.paths.agent_dir(), query.refresh).await)
 }
 
 // -------------------------------------------------------------- sessions ----
@@ -186,8 +204,7 @@ async fn sessions(
         let store = lock(&app)?;
         Some(
             store
-                .projects()
-                .map_err(ApiError::internal)?
+                .projects()?
                 .into_iter()
                 .filter(|(_, preference)| preference.added)
                 .map(|(cwd, _)| cwd)
@@ -219,7 +236,10 @@ async fn thread_view(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snap = app.snapshot().await;
     if let Some(row) = snap.sessions.iter().find(|row| row.summary.id == id) {
-        let view = app.thread_view(row.summary.path.clone()).await.map_err(ApiError::internal)?;
+        let view = app.thread_view(row.summary.path.clone()).await?;
+        let mut workflows =
+            load_workflow_runs(&app, &row.summary.cwd, &view.workflow_run_ids).await;
+        link_task_sessions(&mut workflows, &row.summary.cwd, &snap.sessions);
         return Ok(Json(serde_json::json!({
             "summary": row.summary,
             "settled": row.settled,
@@ -227,7 +247,7 @@ async fn thread_view(
             "omitted": view.omitted,
             "entries": view.entries,
             "tasks": snap.tasks.get(&id).cloned().unwrap_or_default(),
-            "workflows": snap.workflows.get(&id).cloned().unwrap_or_default(),
+            "workflows": workflows,
         })));
     }
 
@@ -235,8 +255,7 @@ async fn thread_view(
     // transcript until the first assistant message. Serve that live session
     // so the client can render the composer before the first prompt.
     let worker = workers.get(&id).await.ok_or_else(|| ApiError::not_found("no such session"))?;
-    let state =
-        worker.get_state().await.map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+    let state = worker.get_state().await?;
     let now = jiff::Timestamp::now().to_string();
     let model = state.get("model");
     Ok(Json(serde_json::json!({
@@ -252,7 +271,6 @@ async fn thread_view(
             "preview": null,
             "title": null,
             "kind": "normal",
-            "parentId": null,
             "agentName": null,
         },
         "settled": false,
@@ -262,6 +280,56 @@ async fn thread_view(
         "tasks": [],
         "workflows": [],
     })))
+}
+
+/// Folds the workflow journals a transcript referenced; read failures degrade
+/// to an empty list so the thread itself still renders.
+async fn load_workflow_runs(
+    app: &App,
+    cwd: &str,
+    run_ids: &[String],
+) -> Vec<pecan_core::workflows::WorkflowRun> {
+    if run_ids.is_empty() {
+        return Vec::new();
+    }
+    let dir = app.paths.workflows_dir();
+    let cwd = cwd.to_owned();
+    let run_ids = run_ids.to_vec();
+    tokio::task::spawn_blocking(move || pecan_core::workflows::load_runs(&dir, &cwd, &run_ids))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "workflow journal load failed");
+            Vec::new()
+        })
+}
+
+/// Points each workflow task at its newest child transcript, matched by the
+/// `workflow:<runId>: <label>` session name the extension writes.
+fn link_task_sessions(
+    runs: &mut [pecan_core::workflows::WorkflowRun],
+    cwd: &str,
+    sessions: &[SessionRow],
+) {
+    if runs.is_empty() {
+        return;
+    }
+    // Rows are sorted newest first, so the first match is the latest attempt.
+    let mut children: std::collections::HashMap<(&str, &str), &str> =
+        std::collections::HashMap::new();
+    for row in sessions.iter().filter(|row| row.summary.cwd == cwd) {
+        if let Some(task) =
+            row.summary.agent_name.as_deref().and_then(pecan_core::workflows::child_session_task)
+        {
+            children.entry(task).or_insert(row.summary.id.as_str());
+        }
+    }
+    for run in runs {
+        for task in &mut run.tasks {
+            task.session_id = children
+                .get(&(run.run_id.as_str(), task.label.as_str()))
+                .map(|id| (*id).to_owned());
+        }
+    }
 }
 
 fn find_row<'a>(snap: &'a IndexSnapshot, id: &str) -> Result<&'a SessionRow, ApiError> {
@@ -276,17 +344,16 @@ async fn regenerate_title(
     axum::extract::Path(id): axum::extract::Path<String>,
     body: Result<Json<RegenerateTitleBody>, JsonRejection>,
 ) -> Result<Json<GeneratedTitleResponse>, ApiError> {
-    let Json(body) = body.map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let body = json_body(body)?;
     let (path, cwd, previous_title) = {
         let snap = app.snapshot().await;
         let row = find_row(&snap, &id)?;
         (row.summary.path.clone(), row.summary.cwd.clone(), row.summary.title.clone())
     };
-    let generation = app.begin_title_generation(&id).map_err(ApiError::internal)?;
+    let generation = app.begin_title_generation(&id)?;
     let thread = tokio::task::spawn_blocking(move || thread::parse_thread(&path))
         .await
-        .map_err(|_join_error| ApiError::internal(pecan_core::CoreError::Join))?
-        .map_err(ApiError::internal)?;
+        .map_err(|_join_error| ApiError::internal(pecan_core::CoreError::Join))??;
     let generated = title::generate(
         std::path::Path::new(&cwd),
         &thread,
@@ -295,10 +362,10 @@ async fn regenerate_title(
     )
     .await
     .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
-    if !app.commit_title_if_current(&id, generation, &generated).map_err(ApiError::internal)? {
+    if !app.commit_title_if_current(&id, generation, &generated)? {
         return Err(ApiError::conflict("title generation was superseded by a newer request"));
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(GeneratedTitleResponse { title: generated }))
 }
 
@@ -349,9 +416,9 @@ async fn settle(
     require_visible_session(&app, &id).await?;
     {
         let store = lock(&app)?;
-        store.settle(&id).map_err(ApiError::internal)?;
+        store.settle(&id)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(serde_json::json!({"settled": true})))
 }
 
@@ -362,48 +429,10 @@ async fn reopen(
     require_visible_session(&app, &id).await?;
     {
         let store = lock(&app)?;
-        store.reopen(&id).map_err(ApiError::internal)?;
+        store.reopen(&id)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(serde_json::json!({"settled": false})))
-}
-
-#[derive(Deserialize, Debug)]
-struct SettleStaleBody {
-    cwd: String,
-    /// Settle sessions whose last activity is older than this many days.
-    days: f64,
-}
-
-/// Bulk-settles every session in `cwd` idle beyond `days` days.
-async fn settle_stale(
-    State(app): State<App>,
-    body: Result<Json<SettleStaleBody>, JsonRejection>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    reject_global_route(&app)?;
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
-    if !(0.0..=365.0).contains(&body.days) {
-        return Err(ApiError::bad_request("days must be within 0..=365".into()));
-    }
-    let cutoff_ms = jiff::Timestamp::now().as_second() * 1000 - (body.days * 86_400_000.0) as i64;
-    let ids: Vec<String> = {
-        let snap = app.snapshot().await;
-        snap.sessions
-            .iter()
-            .filter(|row| row.summary.cwd == body.cwd)
-            .filter(|row| row.summary.last_activity.as_second() * 1000 < cutoff_ms)
-            .filter(|row| !row.settled)
-            .map(|row| row.summary.id.clone())
-            .collect()
-    };
-    if !ids.is_empty() {
-        {
-            let store = lock(&app)?;
-            store.settle_many(&ids).map_err(ApiError::internal)?;
-        }
-        app.refresh().await.map_err(ApiError::internal)?;
-    }
-    Ok(Json(serde_json::json!({ "settled": ids.len() })))
 }
 
 async fn pin(
@@ -413,9 +442,9 @@ async fn pin(
     require_visible_session(&app, &id).await?;
     {
         let store = lock(&app)?;
-        store.set_pinned(&id, true).map_err(ApiError::internal)?;
+        store.set_pinned(&id, true)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(serde_json::json!({"pinned": true})))
 }
 
@@ -426,9 +455,9 @@ async fn unpin(
     require_visible_session(&app, &id).await?;
     {
         let store = lock(&app)?;
-        store.set_pinned(&id, false).map_err(ApiError::internal)?;
+        store.set_pinned(&id, false)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(serde_json::json!({"pinned": false})))
 }
 
@@ -445,21 +474,32 @@ struct RespondBody {
     cancelled: Option<bool>,
 }
 
-/// Answers a pending extension UI request (ask_user dialogs, confirms).
+/// Answers a pending extension UI request (`ask_user` dialogs, confirms).
 async fn respond(
     State((app, workers)): State<(App, Workers)>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
     body: Result<Json<RespondBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let scope = format!("respond:{id}");
+    idempotent(&app.clone(), &headers, &scope, respond_once(app, workers, id, body)).await
+}
+
+async fn respond_once(
+    app: App,
+    workers: Workers,
+    id: String,
+    body: Result<Json<RespondBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let body = json_body(body)?;
     let worker = require_worker(&app, &workers, &id).await?;
     // A request recorded before this worker process spawned belongs to a
     // dead worker; answering it would silently vanish.
     let recorded_before_spawn = {
-        let asks = app
-            .pending_asks
-            .lock()
-            .map_err(|_| ApiError::internal(pecan_core::CoreError::LockPoisoned))?;
+        let asks = app.pending_asks.lock().map_err(|poisoned| {
+            tracing::error!(%poisoned, "pending_asks mutex poisoned");
+            ApiError::internal(pecan_core::CoreError::LockPoisoned)
+        })?;
         match asks.get(&id).and_then(|per_session| per_session.get(&body.request_id)) {
             Some(ask) => ask.recorded_at_ms < worker.spawned_ms(),
             None => true,
@@ -471,7 +511,7 @@ async fn respond(
         ));
     }
     let frame = dialog_response_frame(&body.request_id, &body);
-    worker.send_raw(frame).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    worker.send_raw(frame).await?;
     remove_pending_ask(&app, &id, &body.request_id);
     Ok(Json(serde_json::json!({ "responded": true })))
 }
@@ -483,14 +523,16 @@ fn dialog_response_frame(request_id: &str, body: &RespondBody) -> serde_json::Va
         "type": "extension_ui_response",
         "id": request_id,
     });
-    if let Some(value) = body.value.as_deref() {
-        frame["value"] = serde_json::Value::String(value.to_owned());
-    }
-    if let Some(confirmed) = body.confirmed {
-        frame["confirmed"] = serde_json::Value::Bool(confirmed);
-    }
-    if let Some(cancelled) = body.cancelled {
-        frame["cancelled"] = serde_json::Value::Bool(cancelled);
+    if let Some(map) = frame.as_object_mut() {
+        if let Some(value) = body.value.as_deref() {
+            map.insert("value".to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+        if let Some(confirmed) = body.confirmed {
+            map.insert("confirmed".to_owned(), serde_json::Value::Bool(confirmed));
+        }
+        if let Some(cancelled) = body.cancelled {
+            map.insert("cancelled".to_owned(), serde_json::Value::Bool(cancelled));
+        }
     }
     frame
 }
@@ -500,10 +542,10 @@ async fn pending_asks(
     State(app): State<App>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let asks = app
-        .pending_asks
-        .lock()
-        .map_err(|_| ApiError::internal(pecan_core::CoreError::LockPoisoned))?;
+    let asks = app.pending_asks.lock().map_err(|poisoned| {
+        tracing::error!(%poisoned, "pending_asks mutex poisoned");
+        ApiError::internal(pecan_core::CoreError::LockPoisoned)
+    })?;
     let mut list: Vec<(&String, &super::snapshot::RecordedAsk)> =
         asks.get(&id).map(|per_session| per_session.iter().collect()).unwrap_or_default();
     list.sort_by_key(|(_, ask)| ask.recorded_at_ms);
@@ -511,7 +553,9 @@ async fn pending_asks(
         .into_iter()
         .map(|(request_id, ask)| {
             let mut value = serde_json::to_value(ask).unwrap_or(serde_json::Value::Null);
-            value["id"] = serde_json::Value::String(request_id.clone());
+            if let Some(map) = value.as_object_mut() {
+                map.insert("id".to_owned(), serde_json::Value::String(request_id.clone()));
+            }
             value
         })
         .collect();
@@ -527,10 +571,8 @@ async fn session_git(
         let snap = app.snapshot().await;
         find_row(&snap, &id)?.summary.cwd.clone()
     };
-    let output = tokio::process::Command::new("git")
-        .args(["-C", &cwd, "rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .await;
+    let output =
+        git::run("git", &cwd, &["rev-parse", "--abbrev-ref", "HEAD"], git::STATUS_TIMEOUT).await;
     let branch = match output {
         Ok(out) if out.status.success() => {
             Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -559,7 +601,7 @@ async fn ship_execute(
     body: Result<Json<ship::ShipRequest>, JsonRejection>,
 ) -> Result<Json<ship::ShipResult>, ApiError> {
     require_ship_token(&app, &headers)?;
-    let Json(body) = body.map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let body = json_body(body)?;
     let (cwd, title) = {
         let snap = app.snapshot().await;
         let row = find_row(&snap, &id)?;
@@ -572,31 +614,24 @@ async fn ship_execute(
     let result = ship::execute(&cwd, title.as_deref(), &body).await?;
     {
         let store = lock(&app)?;
-        store.settle(&id).map_err(ApiError::internal)?;
+        store.settle(&id)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(result))
 }
 
 fn require_ship_token(app: &App, headers: &HeaderMap) -> Result<(), ApiError> {
     let supplied =
         headers.get("x-pecan-ship-token").and_then(|value| value.to_str().ok()).unwrap_or_default();
-    if !constant_time_eq(supplied.as_bytes(), app.ship_token.as_bytes()) {
+    if !auth::constant_time_eq(supplied.as_bytes(), app.ship_token.as_bytes()) {
         return Err(ApiError::unauthorized("Ship capability is missing or invalid"));
     }
     Ok(())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter().zip(right).fold(0_u8, |difference, (a, b)| difference | (a ^ b)) == 0
-}
-
 #[cfg(test)]
 mod ship_capability_tests {
-    use super::constant_time_eq;
+    use crate::server::auth::constant_time_eq;
 
     #[test]
     fn ship_capability_rejects_missing_truncated_and_different_tokens() {
@@ -607,10 +642,9 @@ mod ship_capability_tests {
     }
 }
 
-const DIFF_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UNTRACKED_FILES: usize = 40;
-const MAX_GIT_ERROR_BYTES: u64 = 4 * 1024;
+const MAX_GIT_ERROR_BYTES: usize = 4 * 1024;
 
 /// Bounded workspace diff for review. This is intentionally labelled as a
 /// workspace diff because a dirty checkout may contain changes from outside
@@ -703,11 +737,7 @@ async fn session_diff(
 async fn git_stdout(cwd: &str, args: &[&str]) -> Result<String, ApiError> {
     let output = git_command(cwd, args).await?;
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(ApiError::bad_gateway(format!(
-            "git diff failed: {}",
-            detail.lines().next().unwrap_or("unknown git error")
-        )));
+        return Err(git_failure(&output.stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -724,64 +754,29 @@ async fn git_command_limited(
     args: &[&str],
     max_stdout_bytes: usize,
 ) -> Result<LimitedGitOutput, ApiError> {
-    let stdout_limit = u64::try_from(max_stdout_bytes)
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .saturating_add(1);
-    let mut child = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| ApiError::bad_gateway(format!("could not run git: {error}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ApiError::internal("git stdout pipe was unavailable".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ApiError::internal("git stderr pipe was unavailable".to_owned()))?;
-    let read_output =
-        async move {
-            let mut stdout_bytes = Vec::new();
-            stdout.take(stdout_limit).read_to_end(&mut stdout_bytes).await.map_err(|error| {
-                ApiError::bad_gateway(format!("could not read git output: {error}"))
-            })?;
-            let mut stderr_bytes = Vec::new();
-            stderr.take(MAX_GIT_ERROR_BYTES).read_to_end(&mut stderr_bytes).await.map_err(
-                |error| ApiError::bad_gateway(format!("could not read git error: {error}")),
-            )?;
-            let status = child.wait().await.map_err(|error| {
-                ApiError::bad_gateway(format!("could not wait for git: {error}"))
-            })?;
-            let truncated = stdout_bytes.len() > max_stdout_bytes;
-            stdout_bytes.truncate(max_stdout_bytes);
-            Ok(LimitedGitOutput { status, stdout: stdout_bytes, stderr: stderr_bytes, truncated })
-        };
-    tokio::time::timeout(DIFF_TIMEOUT, read_output)
-        .await
-        .map_err(|_elapsed| ApiError::bad_gateway("git diff timed out".to_owned()))?
+    let bounded = git::run_bounded(
+        "git",
+        cwd,
+        args,
+        git::STATUS_TIMEOUT,
+        max_stdout_bytes,
+        MAX_GIT_ERROR_BYTES,
+    )
+    .await?;
+    Ok(LimitedGitOutput {
+        status: bounded.status,
+        stdout: bounded.stdout,
+        stderr: bounded.stderr,
+        truncated: bounded.stdout_truncated,
+    })
 }
 
 fn git_failure(stderr: &[u8]) -> ApiError {
-    let detail = String::from_utf8_lossy(stderr);
-    ApiError::bad_gateway(format!(
-        "git diff failed: {}",
-        detail.lines().next().unwrap_or("unknown git error")
-    ))
+    git::failure("git diff", stderr)
 }
 
 async fn git_command(cwd: &str, args: &[&str]) -> Result<std::process::Output, ApiError> {
-    tokio::time::timeout(
-        DIFF_TIMEOUT,
-        tokio::process::Command::new("git").arg("-C").arg(cwd).args(args).output(),
-    )
-    .await
-    .map_err(|_elapsed| ApiError::bad_gateway("git diff timed out".to_owned()))?
-    .map_err(|error| ApiError::bad_gateway(format!("could not run git: {error}")))
+    git::run("git", cwd, args, git::STATUS_TIMEOUT).await
 }
 
 // --------------------------------------------------------------- projects ----
@@ -796,15 +791,15 @@ async fn add_project(
     body: Result<Json<ProjectBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_global_route(&app)?;
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let body = json_body(body)?;
     if !body.cwd.starts_with('/') {
         return Err(ApiError::bad_request("cwd must be absolute".into()));
     }
     {
         let store = lock(&app)?;
-        store.add_project(&body.cwd).map_err(ApiError::internal)?;
+        store.add_project(&body.cwd)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(serde_json::json!({"added": true})))
 }
 
@@ -813,31 +808,13 @@ async fn remove_project(
     body: Result<Json<ProjectBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_global_route(&app)?;
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let body = json_body(body)?;
     {
         let store = lock(&app)?;
-        store.remove_project(&body.cwd).map_err(ApiError::internal)?;
+        store.remove_project(&body.cwd)?;
     }
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     Ok(Json(serde_json::json!({"removed": true})))
-}
-
-async fn seed_init(State(app): State<App>) -> Result<Json<serde_json::Value>, ApiError> {
-    reject_global_route(&app)?;
-    let cwds: Vec<String> = {
-        let snap = app.snapshot().await;
-        snap.sessions
-            .iter()
-            .filter(|row| row.summary.kind == pecan_core::session::SessionKind::Normal)
-            .map(|row| row.summary.cwd.clone())
-            .collect()
-    };
-    {
-        let store = lock(&app)?;
-        store.ensure_seeded(cwds).map_err(ApiError::internal)?;
-    }
-    app.refresh().await.map_err(ApiError::internal)?;
-    Ok(Json(serde_json::json!({"seeded": true})))
 }
 
 // ------------------------------------------------------------ rpc actions ----
@@ -898,15 +875,24 @@ mod new_session_tests {
 /// Spawns a fresh pi session rooted at `cwd` and returns its session id.
 async fn new_session(
     State((app, workers)): State<(App, Workers)>,
+    headers: HeaderMap,
+    body: Result<Json<NewSessionBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    idempotent(&app.clone(), &headers, "new-session", new_session_once(app, workers, body)).await
+}
+
+async fn new_session_once(
+    app: App,
+    workers: Workers,
     body: Result<Json<NewSessionBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_global_route(&app)?;
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let body = json_body(body)?;
     let dir = std::path::PathBuf::from(&body.cwd);
     if !body.cwd.starts_with('/') || !dir.is_dir() {
         return Err(ApiError::bad_request("cwd must be an existing directory".into()));
     }
-    let worker = workers.spawn_new(&dir).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    let worker = workers.spawn_new(&dir)?;
     // pi answers early commands before its session is initialized; poll until
     // the id materializes rather than failing on the first boot-time reply.
     let mut id = None;
@@ -920,7 +906,7 @@ async fn new_session(
             }
             Err(error) if attempt > 5 => {
                 worker.shutdown().await;
-                return Err(ApiError::bad_gateway(error.to_string()));
+                return Err(error.into());
             }
             Err(_) => {}
         }
@@ -936,16 +922,25 @@ async fn new_session(
     workers.insert(id.clone(), std::sync::Arc::clone(&worker)).await;
     // The new transcript is created by pi during startup. Refresh the
     // filesystem-backed index before the client navigates to the new id.
-    app.refresh().await.map_err(ApiError::internal)?;
+    app.refresh().await?;
     forward_worker_events(app, workers, &id, &worker);
     Ok(Json(serde_json::json!({ "id": id })))
+}
+
+/// Message send behavior: `send` when idle, `steer`/`queue` to affect an
+/// already-streaming turn.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum MessageMode {
+    Send,
+    Steer,
+    Queue,
 }
 
 #[derive(Deserialize, Debug)]
 struct MessageBody {
     text: String,
-    /// `send` when idle; `steer`/`queue` choose queueing behavior while streaming.
-    mode: String,
+    mode: MessageMode,
     /// Optional image attachments (base64, no data: prefix).
     #[serde(default)]
     images: Vec<IncomingImage>,
@@ -954,9 +949,20 @@ struct MessageBody {
 async fn message(
     State((app, workers)): State<(App, Workers)>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
     body: Result<Json<MessageBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let scope = format!("message:{id}");
+    idempotent(&app.clone(), &headers, &scope, message_once(app, workers, id, body)).await
+}
+
+async fn message_once(
+    app: App,
+    workers: Workers,
+    id: String,
+    body: Result<Json<MessageBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let body = json_body(body)?;
     if body.text.trim().is_empty() && body.images.is_empty() {
         return Err(ApiError::bad_request("empty message".into()));
     }
@@ -971,21 +977,22 @@ async fn message(
         snap.sessions.iter().find(|row| row.summary.id == id).map(|row| row.summary.path.clone())
     };
     let worker = if let Some(path) = path {
-        workers.get_or_spawn(&id, &path).await.map_err(|e| ApiError::bad_gateway(e.to_string()))?
+        workers.get_or_spawn(&id, &path).await?
     } else {
         workers.get(&id).await.ok_or_else(|| ApiError::not_found("no such session"))?
     };
     forward_worker_events(app.clone(), workers.clone(), &id, &worker);
 
-    let state = worker.get_state().await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    let state = worker.get_state().await?;
     let streaming = state.get("isStreaming").and_then(serde_json::Value::as_bool) == Some(true);
-    let cmd = match (streaming, body.mode.as_str()) {
-        (true, "send") => return Err(ApiError::conflict("agent is streaming; use steer or queue")),
-        (false, m) if m == "steer" || m == "queue" => prompt_cmd("prompt", &body),
-        (_, "send") => prompt_cmd("prompt", &body),
-        (_, "steer") => prompt_cmd("steer", &body),
-        (_, "queue") => prompt_cmd("follow_up", &body),
-        (_, other) => return Err(ApiError::bad_request(format!("unknown mode {other}"))),
+    let cmd = match (streaming, body.mode) {
+        (true, MessageMode::Send) => {
+            return Err(ApiError::conflict("agent is streaming; use steer or queue"));
+        }
+        (false, MessageMode::Steer | MessageMode::Queue) => prompt_cmd("prompt", &body),
+        (_, MessageMode::Send) => prompt_cmd("prompt", &body),
+        (_, MessageMode::Steer) => prompt_cmd("steer", &body),
+        (_, MessageMode::Queue) => prompt_cmd("follow_up", &body),
     };
     // Fire-and-forget semantics for the client: pi streams results via SSE.
     tokio::spawn(async move {
@@ -999,19 +1006,21 @@ async fn message(
 /// Builds a prompt-family command with optional image attachments.
 fn prompt_cmd(kind: &str, body: &MessageBody) -> serde_json::Value {
     let mut cmd = serde_json::json!({"type": kind, "message": body.text});
-    if !body.images.is_empty() {
-        cmd["images"] = serde_json::Value::Array(
-            body.images
-                .iter()
-                .map(|image| {
-                    serde_json::json!({
-                        "type": "image",
-                        "data": image.data,
-                        "mimeType": image.mime_type,
-                    })
+    if !body.images.is_empty()
+        && let Some(map) = cmd.as_object_mut()
+    {
+        let images = body
+            .images
+            .iter()
+            .map(|image| {
+                serde_json::json!({
+                    "type": "image",
+                    "data": image.data,
+                    "mimeType": image.mime_type,
                 })
-                .collect(),
-        );
+            })
+            .collect();
+        map.insert("images".to_owned(), serde_json::Value::Array(images));
     }
     cmd
 }
@@ -1028,8 +1037,22 @@ async fn abort(
     worker.shutdown().await;
     match result {
         Ok(_) => Ok(Json(serde_json::json!({"aborted": true}))),
-        Err(error) => Err(ApiError::bad_gateway(error.to_string())),
+        Err(error) => Err(error.into()),
     }
+}
+
+/// Live run state without spawning a worker: `{live, streaming}`.
+async fn session_status(
+    State((app, workers)): State<(App, Workers)>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_visible_session(&app, &id).await?;
+    let Some(worker) = workers.get(&id).await else {
+        return Ok(Json(serde_json::json!({"live": false, "streaming": false})));
+    };
+    let state = worker.get_state().await?;
+    let streaming = state.get("isStreaming").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Ok(Json(serde_json::json!({"live": true, "streaming": streaming})))
 }
 
 async fn agent_attach(
@@ -1038,7 +1061,7 @@ async fn agent_attach(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let worker = require_worker(&app, &workers, &id).await?;
     forward_worker_events(app.clone(), workers.clone(), &id, &worker);
-    agent_snapshot(worker, &id).await
+    agent_snapshot(worker, &id, super::model_favorites::favorite_models(&app.paths)).await
 }
 
 /// Pipes raw pi events from a worker onto the SSE bus exactly once per spawn.
@@ -1057,6 +1080,11 @@ fn forward_worker_events(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    if event.get("type").and_then(serde_json::Value::as_str)
+                        == Some(super::worker::WORKER_EXIT)
+                    {
+                        break;
+                    }
                     // A finished turn means the transcript changed on disk.
                     let settled = matches!(
                         event.get("type").and_then(serde_json::Value::as_str),
@@ -1067,11 +1095,10 @@ fn forward_worker_events(
                     {
                         record_pending_ask(&app, &session_id, &event);
                     }
-                    let _ =
-                        app.events.send(ServerEvent::AgentEvent { id: session_id.clone(), event });
+                    notify_away_devices(&app, &session_id, &event).await;
+                    app.events.send(ServerEvent::AgentEvent { id: session_id.clone(), event });
                     if settled {
-                        let _ =
-                            app.events.send(ServerEvent::ThreadChanged { id: session_id.clone() });
+                        app.events.send(ServerEvent::ThreadChanged { id: session_id.clone() });
                         if let Err(error) = app.refresh().await {
                             tracing::warn!(%error, "post-turn refresh failed");
                         }
@@ -1081,7 +1108,7 @@ fn forward_worker_events(
                 Err(_) => break,
             }
         }
-        let _ = app.events.send(ServerEvent::AgentEvent {
+        app.events.send(ServerEvent::AgentEvent {
             id: session_id.clone(),
             event: serde_json::json!({
                 "type": "extension_ui_request",
@@ -1089,8 +1116,39 @@ fn forward_worker_events(
                 "widgetKey": "pi-subagents/activity/v1"
             }),
         });
-        let _ = workers.remove(&session_id).await;
+        // The worker is gone (idle reap, crash, abort): its dialogs can no
+        // longer be answered and any in-flight turn will never settle.
+        if let Ok(mut asks) = app.pending_asks.lock() {
+            asks.remove(&session_id);
+        }
+        app.events.send(ServerEvent::AgentEvent {
+            id: session_id.clone(),
+            event: serde_json::json!({ "type": super::worker::WORKER_EXIT }),
+        });
+        workers.remove(&session_id).await;
     });
+}
+
+/// Pushes a finished turn or a blocking dialog to devices that are not
+/// watching (see [`push::Push::notify`]).
+async fn notify_away_devices(app: &App, id: &str, event: &serde_json::Value) {
+    let kind = event.get("type").and_then(serde_json::Value::as_str);
+    let blocking = kind == Some("extension_ui_request")
+        && event
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_blocking_dialog_method);
+    if kind != Some("agent_settled") && !blocking {
+        return;
+    }
+    let snap = app.snapshot().await;
+    let title = find_row(&snap, id).ok().and_then(|row| row.summary.title.as_deref());
+    let notice = if blocking {
+        push::Notice::needs_input(id, title)
+    } else {
+        push::Notice::turn_done(id, title)
+    };
+    app.push.notify(app, notice);
 }
 
 /// Returns whether an extension request blocks the agent waiting for a user
@@ -1351,7 +1409,7 @@ async fn set_model(
     axum::extract::Path(id): axum::extract::Path<String>,
     body: Result<Json<ModelBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let body = json_body(body)?;
     let worker = require_worker(&app, &workers, &id).await?;
     worker
         .command(serde_json::json!({
@@ -1359,8 +1417,7 @@ async fn set_model(
             "provider": body.provider,
             "modelId": body.model_id,
         }))
-        .await
-        .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+        .await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -1374,12 +1431,9 @@ async fn set_thinking(
     axum::extract::Path(id): axum::extract::Path<String>,
     body: Result<Json<ThinkingBody>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let body = json_body(body)?;
     let worker = require_worker(&app, &workers, &id).await?;
-    worker
-        .command(serde_json::json!({"type": "set_thinking_level", "level": body.level}))
-        .await
-        .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    worker.command(serde_json::json!({"type": "set_thinking_level", "level": body.level})).await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -1391,20 +1445,19 @@ async fn require_worker(
 ) -> Result<std::sync::Arc<super::worker::WorkerHandle>, ApiError> {
     let snap = app.snapshot().await;
     if let Some(row) = snap.sessions.iter().find(|row| row.summary.id == id) {
-        return workers
-            .get_or_spawn(id, &row.summary.path)
-            .await
-            .map_err(|e| ApiError::bad_gateway(e.to_string()));
+        return workers.get_or_spawn(id, &row.summary.path).await.map_err(ApiError::from);
     }
     workers.get(id).await.ok_or_else(|| ApiError::not_found("no such session"))
 }
 
-/// Collects model/thinking/context info from a live worker.
+/// Collects model/thinking/context info from a live worker, plus pi's
+/// favorite model patterns.
 async fn agent_snapshot(
     worker: std::sync::Arc<super::worker::WorkerHandle>,
     id: &str,
+    favorites: Vec<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let state = worker.get_state().await.map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    let state = worker.get_state().await?;
     let stats = worker
         .command(serde_json::json!({"type": "get_session_stats"}))
         .await
@@ -1421,31 +1474,175 @@ async fn agent_snapshot(
         "state": state,
         "stats": stats,
         "models": models,
+        "favorites": favorites,
     })))
 }
 
 // -------------------------------------------------------------------- sse ----
 
+#[derive(Deserialize, Debug, Default)]
+struct EventsQuery {
+    /// Last sequence the client saw (`EventSource` cannot set headers when
+    /// the page re-creates it, so the cursor also rides in the query).
+    after: Option<u64>,
+}
+
+/// Server-sent events. Each event carries its sequence as the SSE `id`; a
+/// client reconnecting with `?after=<seq>` or `Last-Event-ID` gets exactly
+/// what it missed, or a `reset` event when the gap left the replay window.
+/// The first frame is always `ready` with `{head, reset, replayed}`.
 async fn events(
     State(app): State<App>,
+    axum::extract::Extension(principal): axum::extract::Extension<Principal>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
 ) -> Sse<impl Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
-    let rx = app.events.subscribe();
-    let stream = BroadcastStream::new(rx).map(|item| match item {
-        Ok(event) => Ok(axum::response::sse::Event::default()
-            .event(match event {
-                ServerEvent::IndexChanged => "index-changed",
-                ServerEvent::ThreadChanged { .. } | ServerEvent::AgentEvent { .. } => "agent",
-            })
-            .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned()))),
-        Err(_) => Ok(axum::response::sse::Event::default().comment("lagged")),
+    let header_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let cursor = query.after.or(header_cursor);
+    let subscription = app.events.subscribe(cursor);
+    let ready = serde_json::json!({
+        "head": subscription.head,
+        "reset": subscription.reset,
+        "replayed": subscription.replay.len(),
+    });
+    let mut pending: std::collections::VecDeque<axum::response::sse::Event> =
+        std::collections::VecDeque::with_capacity(subscription.replay.len() + 1);
+    pending.push_back(axum::response::sse::Event::default().event("ready").data(ready.to_string()));
+    pending.extend(subscription.replay.iter().map(sse_event));
+    // Replay always ends at `head`; the live receiver starts right after it.
+    let last = subscription.head;
+    // A revoked device loses its open stream, not just its next request.
+    let (device, live_stream) = match principal {
+        Principal::Device(id) => {
+            let guard = app.push.stream_opened(&id);
+            (Some((id, app.auth.revocations())), Some(guard))
+        }
+        Principal::Cli => (None, None),
+    };
+    let state = EventStreamState {
+        log: app.events,
+        live: subscription.live,
+        pending,
+        last,
+        device,
+        _live_stream: live_stream,
+    };
+    let stream = futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                return Some((Ok(event), state));
+            }
+            let received = match state.device.as_mut() {
+                Some((id, revocations)) => tokio::select! {
+                    item = state.live.recv() => item,
+                    revoked = revocations.recv() => match revoked {
+                        Ok(revoked) if revoked == *id => return None,
+                        // Lagged may have skipped this device's revocation;
+                        // closing makes the client reconnect and re-check.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return None,
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            state.device = None;
+                            continue;
+                        }
+                    },
+                },
+                None => state.live.recv().await,
+            };
+            match received {
+                Ok(item) if item.seq <= state.last => {}
+                Ok(item) => {
+                    state.last = item.seq;
+                    return Some((Ok(sse_event(&item)), state));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Too slow for the live buffer: resume from the replay
+                    // window, or tell the client to refetch.
+                    let resumed = state.log.subscribe(Some(state.last));
+                    state.live = resumed.live;
+                    if resumed.reset {
+                        state.last = resumed.head;
+                        let data = serde_json::json!({ "head": resumed.head }).to_string();
+                        state.pending.push_back(
+                            axum::response::sse::Event::default().event("reset").data(data),
+                        );
+                    } else {
+                        for item in &resumed.replay {
+                            state.pending.push_back(sse_event(item));
+                            state.last = item.seq;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     });
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+struct EventStreamState {
+    log: super::event_log::EventLog,
+    live: tokio::sync::broadcast::Receiver<super::event_log::Sequenced>,
+    pending: std::collections::VecDeque<axum::response::sse::Event>,
+    /// The streaming device and a feed of revoked ids, for browsers only.
+    device: Option<(String, tokio::sync::broadcast::Receiver<String>)>,
+    last: u64,
+    /// Marks the device as watching, so it is not pushed, until the stream drops.
+    _live_stream: Option<push::LiveStream>,
+}
+
+fn sse_event(item: &super::event_log::Sequenced) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .id(item.seq.to_string())
+        .event(match item.event.as_ref() {
+            ServerEvent::IndexChanged => "index-changed",
+            ServerEvent::ThreadChanged { .. } | ServerEvent::AgentEvent { .. } => "agent",
+        })
+        .data(serde_json::to_string(item.event.as_ref()).unwrap_or_else(|_| "{}".to_owned()))
+}
+
 // ------------------------------------------------------------------ misc ----
 
-fn lock(app: &App) -> Result<std::sync::MutexGuard<'_, pecan_core::store::StateStore>, ApiError> {
-    app.store.lock().map_err(|_| ApiError::internal(pecan_core::CoreError::LockPoisoned))
+/// Runs a mutation at most once per `Idempotency-Key` header (when present):
+/// a retry after a lost response gets the first result back instead of
+/// sending the prompt or dialog answer twice.
+async fn idempotent(
+    app: &App,
+    headers: &HeaderMap,
+    scope: &str,
+    run: impl Future<Output = Result<Json<serde_json::Value>, ApiError>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use super::idempotency::{Claim, ClaimError};
+    let Some(raw) = headers.get("idempotency-key") else {
+        return run.await;
+    };
+    let key = raw
+        .to_str()
+        .map_err(|_non_ascii| ApiError::bad_request(ClaimError::InvalidKey.to_string()))?;
+    let guard = match app.idempotency.claim(scope, key) {
+        Ok(Claim::Replay(body)) => return Ok(Json(body)),
+        Ok(Claim::Fresh(guard)) => guard,
+        Err(error @ ClaimError::InvalidKey) => {
+            return Err(ApiError::bad_request(error.to_string()));
+        }
+        Err(error @ ClaimError::InFlight) => return Err(ApiError::conflict(&error.to_string())),
+        Err(error @ ClaimError::Poisoned) => return Err(ApiError::internal(error)),
+    };
+    let result = run.await;
+    guard.finish(result.as_ref().ok().map(|Json(body)| body));
+    result
+}
+
+pub(crate) fn lock(
+    app: &App,
+) -> Result<std::sync::MutexGuard<'_, pecan_core::store::StateStore>, ApiError> {
+    app.store.lock().map_err(|poisoned| {
+        tracing::error!(%poisoned, "state store mutex poisoned");
+        ApiError::internal(pecan_core::CoreError::LockPoisoned)
+    })
 }
 
 async fn require_visible_session(app: &App, id: &str) -> Result<(), ApiError> {

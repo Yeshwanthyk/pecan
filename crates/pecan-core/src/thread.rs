@@ -22,6 +22,8 @@ const TOOL_SUMMARY_CAP: usize = 180;
 const TOOL_TARGET_CAP: usize = 160;
 /// Maximum target values retained in the API metadata.
 const MAX_TOOL_TARGETS: usize = 8;
+/// Maximum workflow runs linked to one transcript.
+const MAX_WORKFLOW_RUNS: usize = 32;
 /// Maximum serialized tool details retained from a transcript result.
 const TOOL_DETAILS_CAP: usize = 64 * 1024;
 /// Maximum base64 characters retained for one inline chat thumbnail.
@@ -88,6 +90,35 @@ pub struct UserImage {
     pub data: String,
 }
 
+/// One `ask_parent` question from a pi-subagents child.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildQuestion {
+    /// Child id (`sa-2`).
+    pub child_id: String,
+    /// Request id the parent must echo in `subagent_send(mode="reply")`.
+    pub request_id: String,
+    /// The question text (bounded).
+    pub question: String,
+    /// Optional supporting context (bounded).
+    pub context: Option<String>,
+    /// Reply deadline in unix milliseconds, when recorded.
+    pub deadline_at: Option<i64>,
+    /// Whether a later `subagent_send` reply names this request id.
+    pub answered: bool,
+}
+
+/// One settled child listed in a pi-subagents result batch.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChildResult {
+    /// Child or workflow id.
+    pub id: String,
+    /// Child title.
+    pub title: String,
+    /// Terminal status (`done`, `error`, ...).
+    pub status: String,
+}
+
 /// One renderable row of a conversation thread.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -114,6 +145,10 @@ pub enum ThreadEntry {
         tools: Vec<ToolCall>,
         /// Model that produced this message, when recorded.
         model: Option<String>,
+        /// Why the turn ended early: the provider error, or "Stopped" when
+        /// the user aborted. `None` for a normal reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// An `ask_user` interaction.
     AskUser {
@@ -121,6 +156,20 @@ pub enum ThreadEntry {
         questions: serde_json::Value,
         /// The recorded free-form/selection answers, when answered.
         answer: Option<serde_json::Value>,
+    },
+    /// Questions a pi-subagents child asked through `ask_parent`.
+    ChildQuestions {
+        /// One row per question in the batch.
+        questions: Vec<ChildQuestion>,
+    },
+    /// Settled pi-subagents children handed back to the parent.
+    ChildResults {
+        /// The delivered report text (truncated when very long).
+        text: String,
+        /// Whether `text` hit the display cap.
+        truncated: bool,
+        /// One row per settled child.
+        results: Vec<ChildResult>,
     },
     /// A failed tool result; rendered as a quiet inline note.
     ToolError {
@@ -140,6 +189,9 @@ pub struct ThreadView {
     pub omitted: usize,
     /// Whether the transcript ends with an unanswered `ask_user` call.
     pub waiting_askuser: bool,
+    /// Workflow run ids referenced by `workflow*` tool results, first seen first.
+    /// Collected over the whole transcript, including omitted entries.
+    pub workflow_run_ids: Vec<String>,
 }
 
 /// Wrapper attaching a timestamp to any entry.
@@ -166,6 +218,9 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
     // result as a second transcript row.
     let mut tool_positions: std::collections::HashMap<String, (usize, usize)> =
         std::collections::HashMap::new();
+    let mut workflow_run_ids: Vec<String> = Vec::new();
+    // Request ids the parent answered with `subagent_send(mode="reply")`.
+    let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in bytes.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -174,8 +229,15 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
-            continue;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => {}
+            Some("custom_message") => {
+                if let Some(entry) = subagent_notice(&value) {
+                    all.push(Dated { ts: parse_ts(&value), entry });
+                }
+                continue;
+            }
+            _ => continue,
         }
         let ts = parse_ts(&value);
         let Some(message) = value.get("message") else { continue };
@@ -211,6 +273,9 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                                     str_field(block, "name").unwrap_or_else(|| "tool".into());
                                 let id = str_field(block, "id").unwrap_or_default();
                                 let arguments = block.get("arguments");
+                                if let Some(request_id) = reply_request_id(&name, arguments) {
+                                    replied.insert(request_id);
+                                }
                                 if name == "ask_user" {
                                     let questions =
                                         arguments.cloned().unwrap_or(serde_json::Value::Null);
@@ -242,7 +307,15 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                         }
                     }
                 }
-                if text.is_empty() && thinking.is_none() && tools.is_empty() {
+                let error = match str_field(message, "stopReason").as_deref() {
+                    Some("error") => Some(str_field(message, "errorMessage").map_or_else(
+                        || "Request failed".to_owned(),
+                        |m| truncate_chars(&m, BLOCK_TEXT_CAP),
+                    )),
+                    Some("aborted") => Some("Stopped".to_owned()),
+                    _ => None,
+                };
+                if text.is_empty() && thinking.is_none() && tools.is_empty() && error.is_none() {
                     continue;
                 }
                 let model = str_field(message, "model");
@@ -255,6 +328,7 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                         thinking,
                         tools,
                         model,
+                        error,
                     },
                 });
                 if let Some(ThreadEntry::Assistant { tools, .. }) =
@@ -270,6 +344,7 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
             }
             Some("toolResult") => {
                 let call_id = str_field(message, "toolCallId").unwrap_or_default();
+                collect_workflow_run_id(message, &mut workflow_run_ids);
                 if let Some((entry_index, tool_index)) = tool_positions.get(&call_id).copied()
                     && let Some(ThreadEntry::Assistant { tools, .. }) =
                         all.get_mut(entry_index).map(|dated| &mut dated.entry)
@@ -293,22 +368,109 @@ pub fn parse_thread(path: &Path) -> Result<ThreadView> {
                 // Standalone tool results are intentionally not rendered in v1:
                 // their outcome is visible through the next assistant turn or
                 // the error badge attached below.
-                if message.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+                if message.get("isError").and_then(serde_json::Value::as_bool) == Some(true)
                     // Errors stay visible, but as tool errors — never as if
                     // the user had typed them.
-                    if let Some((text, truncated)) = text_blocks(message.get("content"), 500) {
-                        all.push(Dated { ts, entry: ThreadEntry::ToolError { text, truncated } });
-                    }
+                    && let Some((text, truncated)) = text_blocks(message.get("content"), 500)
+                {
+                    all.push(Dated { ts, entry: ThreadEntry::ToolError { text, truncated } });
                 }
             }
             _ => {}
         }
     }
 
+    for dated in &mut all {
+        if let ThreadEntry::ChildQuestions { questions } = &mut dated.entry {
+            for question in questions {
+                question.answered = replied.contains(&question.request_id);
+            }
+        }
+    }
     let waiting_askuser = !open_askuser.is_empty();
     let omitted = all.len().saturating_sub(MAX_ENTRIES);
     let entries = all.into_iter().skip(omitted).collect();
-    Ok(ThreadView { entries, omitted, waiting_askuser })
+    Ok(ThreadView { entries, omitted, waiting_askuser, workflow_run_ids })
+}
+
+/// Maximum rows retained from one pi-subagents question or result batch.
+const MAX_CHILD_ROWS: usize = 16;
+
+/// Parses a displayed pi-subagents `custom_message` into a thread entry.
+/// Other extensions' custom messages stay hidden.
+fn subagent_notice(value: &serde_json::Value) -> Option<ThreadEntry> {
+    if value.get("display").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let details = value.get("details");
+    let rows = |key: &str| {
+        details
+            .and_then(|d| d.get(key))
+            .and_then(as_array)
+            .map(|items| items.iter().take(MAX_CHILD_ROWS).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    match value.get("customType").and_then(serde_json::Value::as_str)? {
+        "subagent-question-batch" => {
+            let questions: Vec<ChildQuestion> = rows("questions")
+                .into_iter()
+                .filter_map(|row| {
+                    Some(ChildQuestion {
+                        child_id: truncate_chars(&str_field(row, "childId")?, TOOL_TARGET_CAP),
+                        request_id: truncate_chars(&str_field(row, "requestId")?, TOOL_TARGET_CAP),
+                        question: truncate_chars(&str_field(row, "question")?, BLOCK_TEXT_CAP),
+                        context: str_field(row, "context")
+                            .map(|context| truncate_chars(&context, BLOCK_TEXT_CAP)),
+                        deadline_at: row.get("deadlineAt").and_then(serde_json::Value::as_i64),
+                        answered: false,
+                    })
+                })
+                .collect();
+            (!questions.is_empty()).then_some(ThreadEntry::ChildQuestions { questions })
+        }
+        "subagent-result-batch" => {
+            let (full, _) = text_blocks(value.get("content"), BLOCK_TEXT_CAP)?;
+            let truncated = full.chars().count() > BLOCK_TEXT_CAP;
+            let text = truncate_chars(&full, BLOCK_TEXT_CAP);
+            let results = rows("results")
+                .into_iter()
+                .filter_map(|row| {
+                    Some(ChildResult {
+                        id: truncate_chars(&str_field(row, "id")?, TOOL_TARGET_CAP),
+                        title: truncate_chars(
+                            &str_field(row, "title").unwrap_or_default(),
+                            TOOL_TARGET_CAP,
+                        ),
+                        status: truncate_chars(&str_field(row, "status")?, TOOL_TARGET_CAP),
+                    })
+                })
+                .collect();
+            Some(ThreadEntry::ChildResults { text, truncated, results })
+        }
+        _ => None,
+    }
+}
+
+/// The `requestId` a `subagent_send(mode="reply")` call answers.
+fn reply_request_id(name: &str, arguments: Option<&serde_json::Value>) -> Option<String> {
+    let arguments = arguments?;
+    (name == "subagent_send"
+        && arguments.get("mode").and_then(serde_json::Value::as_str) == Some("reply"))
+    .then(|| str_field(arguments, "requestId"))
+    .flatten()
+}
+
+/// Records the `details.runId` of a pi-subagents workflow tool result.
+fn collect_workflow_run_id(message: &serde_json::Value, ids: &mut Vec<String>) {
+    if ids.len() >= MAX_WORKFLOW_RUNS {
+        return;
+    }
+    let Some(run_id) = crate::workflows::tool_result_run_id(message) else {
+        return;
+    };
+    if !ids.iter().any(|id| id == run_id) {
+        ids.push(run_id.to_owned());
+    }
 }
 
 /// Retains structured tool details only when they fit the transcript bound.
@@ -317,7 +479,7 @@ fn bounded_tool_details(value: &serde_json::Value) -> Option<serde_json::Value> 
     (encoded.len() <= TOOL_DETAILS_CAP).then(|| value.clone())
 }
 
-fn as_array<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
+fn as_array(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     value.as_array()
 }
 
@@ -360,10 +522,10 @@ fn text_blocks(content: Option<&serde_json::Value>, cap: usize) -> Option<(Strin
         }
         Some(serde_json::Value::Array(blocks)) => {
             for block in blocks {
-                if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-                    if let Some(part) = str_field(block, "text") {
-                        push_block(&mut out, &mut truncated, &part, cap);
-                    }
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && let Some(part) = str_field(block, "text")
+                {
+                    push_block(&mut out, &mut truncated, &part, cap);
                 }
             }
         }
@@ -404,10 +566,10 @@ fn compact_json(value: &serde_json::Value) -> String {
         let path = ["filePath", "file_path", "path", "notebookPath"]
             .iter()
             .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str));
-        if let Some(path) = path {
-            if !path.is_empty() {
-                return truncate_chars(&format!("[{path}] {raw}"), ARGS_PREVIEW_CAP);
-            }
+        if let Some(path) = path
+            && !path.is_empty()
+        {
+            return truncate_chars(&format!("[{path}] {raw}"), ARGS_PREVIEW_CAP);
         }
     }
     truncate_chars(raw, ARGS_PREVIEW_CAP)
@@ -436,7 +598,7 @@ fn tool_activity(name: &str, arguments: Option<&serde_json::Value>) -> ToolActiv
 }
 
 fn tool_category(name: &str, arguments: Option<&serde_json::Value>) -> ToolCategory {
-    if name.starts_with("subagent_") || name == "subagent" {
+    if is_agent_tool(name) {
         return ToolCategory::Agent;
     }
     if name.starts_with("task") {
@@ -607,9 +769,10 @@ fn activity_summary(
         "fetch" | "fetch_content" => summarize_value("Fetch", arguments, &["url", "urls"]),
         "get_search_content" => summarize_value("Read search result", arguments, &["url", "query"]),
         "bash" | "shell" | "exec" => bash_summary(arguments),
-        name if name.starts_with("subagent_") || name == "subagent" => {
-            subagent_summary(name, arguments)
+        name if name == "workflow" || name.starts_with("workflow_") => {
+            workflow_summary(name, arguments)
         }
+        name if is_agent_tool(name) => subagent_summary(name, arguments),
         name if name.starts_with("task") => task_summary(original_name, name, arguments),
         name if name.starts_with("bg_") => background_summary(original_name, name, arguments),
         _ => match category {
@@ -708,6 +871,47 @@ fn bash_summary(arguments: Option<&serde_json::Value>) -> String {
     label.map_or_else(|| format!("Run \"{}\"", truncate_chars(command, 120)), str::to_owned)
 }
 
+/// Tools registered by pi-subagents: direct subagents, workflows, Jev, and
+/// the child-side `ask_parent`.
+fn is_agent_tool(name: &str) -> bool {
+    name.starts_with("subagent_")
+        || name == "subagent"
+        || name == "workflow"
+        || name.starts_with("workflow_")
+        || name == "ask_jev"
+        || name == "ask_parent"
+}
+
+fn workflow_summary(name: &str, arguments: Option<&serde_json::Value>) -> String {
+    let run = string_argument(arguments, &["runId"]).map(|id| truncate_chars(id, 80));
+    match name {
+        "workflow" => string_argument(arguments, &["draftId"]).map_or_else(
+            || "Draft workflow".to_owned(),
+            |draft| format!("Start workflow {}", truncate_chars(draft, 80)),
+        ),
+        "workflow_list" => "List workflows".to_owned(),
+        "workflow_check" => {
+            run.map_or_else(|| "Check workflow".to_owned(), |id| format!("Check workflow {id}"))
+        }
+        "workflow_control" => {
+            let verb = match string_argument(arguments, &["action"]) {
+                Some("pause") => "Pause",
+                Some("resume") => "Resume",
+                Some("cancel") => "Cancel",
+                Some("retry") => "Retry",
+                Some("skip") => "Skip",
+                _ => "Control",
+            };
+            let target = string_argument(arguments, &["taskId"]).map_or_else(
+                || "workflow".to_owned(),
+                |task| format!("task {} in workflow", truncate_chars(task, 60)),
+            );
+            run.map_or_else(|| format!("{verb} {target}"), |id| format!("{verb} {target} {id}"))
+        }
+        _ => format!("Run {}", truncate_chars(name, 100)),
+    }
+}
+
 fn subagent_summary(name: &str, arguments: Option<&serde_json::Value>) -> String {
     match name {
         "subagent_spawn" => {
@@ -721,10 +925,31 @@ fn subagent_summary(name: &str, arguments: Option<&serde_json::Value>) -> String
                 |prompt| format!("Delegate \"{}\"", truncate_chars(prompt, 120)),
             )
         }
+        "ask_parent" => string_argument(arguments, &["question"]).map_or_else(
+            || "Ask parent".to_owned(),
+            |question| format!("Ask parent \"{}\"", truncate_chars(question, 120)),
+        ),
         "subagent_wait" => summarize_ids("Wait for subagents", arguments, &["ids", "id"]),
         "subagent_cancel" => summarize_ids("Cancel subagents", arguments, &["ids", "id"]),
         "subagent_check" => summarize_ids("Check subagent", arguments, &["id", "ids"]),
+        "subagent_inspect" => summarize_ids("Inspect subagent", arguments, &["id", "ids"]),
+        "subagent_send" => {
+            let verb = match string_argument(arguments, &["mode"]) {
+                Some("steer") => "Steer subagent",
+                Some("reply") => "Reply to subagent",
+                _ => "Message subagent",
+            };
+            summarize_ids(verb, arguments, &["id", "ids"])
+        }
+        "subagent_route" => {
+            match arguments.and_then(|a| a.get("tasks")).and_then(serde_json::Value::as_array) {
+                Some(tasks) if tasks.len() > 1 => format!("Route {} subagent tasks", tasks.len()),
+                _ => "Route subagent task".to_owned(),
+            }
+        }
+        "subagent_approve" => "Approve subagent route".to_owned(),
         "subagent_list" => "List subagents".to_owned(),
+        "ask_jev" => "Ask Jev".to_owned(),
         _ => format!("Run {}", truncate_chars(name, 100)),
     }
 }
@@ -925,7 +1150,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pecan-thread-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
     }
@@ -974,7 +1199,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("/tmp/draft.json")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     #[test]
@@ -1007,7 +1232,7 @@ mod tests {
         assert_eq!(serialized["summary"], "Run \"ls\"");
         assert_eq!(serialized["category"], "runtime");
         assert_eq!(serialized["targetCount"], 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     #[test]
@@ -1050,7 +1275,7 @@ mod tests {
         assert_eq!(tool.targets, ["src/main.rs"]);
         assert_eq!(tool.target_count, 1);
         assert_eq!(tool.args_preview.chars().count(), ARGS_PREVIEW_CAP);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     #[test]
@@ -1072,6 +1297,16 @@ mod tests {
             ("subagent_spawn", ToolCategory::Agent, "Spawn subagent \"scout\""),
             ("subagent_wait", ToolCategory::Agent, "Wait for subagents sa-1"),
             ("subagent_check", ToolCategory::Agent, "Check subagent sa-1"),
+            ("subagent_inspect", ToolCategory::Agent, "Inspect subagent sa-1"),
+            ("subagent_send", ToolCategory::Agent, "Steer subagent sa-1"),
+            ("ask_parent", ToolCategory::Agent, "Ask parent \"Ship it?\""),
+            ("subagent_route", ToolCategory::Agent, "Route 2 subagent tasks"),
+            ("subagent_approve", ToolCategory::Agent, "Approve subagent route"),
+            ("ask_jev", ToolCategory::Agent, "Ask Jev"),
+            ("workflow", ToolCategory::Agent, "Start workflow draft_1"),
+            ("workflow_list", ToolCategory::Agent, "List workflows"),
+            ("workflow_check", ToolCategory::Agent, "Check workflow wf-1"),
+            ("workflow_control", ToolCategory::Agent, "Retry task build in workflow wf-1"),
             ("TaskCreate", ToolCategory::Task, "Create task \"activity\""),
             ("TaskList", ToolCategory::Task, "List tasks"),
             ("TaskGet", ToolCategory::Task, "Get task #7"),
@@ -1111,9 +1346,21 @@ mod tests {
                     ("name", string_value("scout")),
                     ("prompt", string_value("review this")),
                 ]),
-                "subagent_wait" | "subagent_check" => {
+                "subagent_wait" | "subagent_check" | "subagent_inspect" => {
                     object_value(&[("ids", string_array(&["sa-1"]))])
                 }
+                "subagent_send" => {
+                    object_value(&[("id", string_value("sa-1")), ("mode", string_value("steer"))])
+                }
+                "subagent_route" => object_value(&[("tasks", string_array(&["a", "b"]))]),
+                "ask_parent" => object_value(&[("question", string_value("Ship it?"))]),
+                "workflow" => object_value(&[("draftId", string_value("draft_1"))]),
+                "workflow_check" => object_value(&[("runId", string_value("wf-1"))]),
+                "workflow_control" => object_value(&[
+                    ("action", string_value("retry")),
+                    ("runId", string_value("wf-1")),
+                    ("taskId", string_value("build")),
+                ]),
                 "TaskCreate" => object_value(&[("subject", string_value("activity"))]),
                 "TaskList" => object_value(&[]),
                 "TaskGet" | "TaskUpdate" => object_value(&[("taskId", string_value("7"))]),
@@ -1171,7 +1418,39 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/png");
         assert_eq!(images[0].data, "cG5n");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
+    }
+
+    #[test]
+    fn parses_subagent_questions_and_marks_replies() {
+        let dir = temp_dir("child-questions");
+        let lines = [
+            r#"{"type":"custom_message","customType":"subagent-question-batch","display":true,"content":"Child sa-2 asks","details":{"questions":[{"childId":"sa-2","requestId":"pq-1","question":"Ship it?","context":"tests green","deadlineAt":1767225900000},{"childId":"sa-3","requestId":"pq-2","question":"Which db?","deadlineAt":1767225900000}]},"timestamp":"2026-01-01T00:00:01Z"}"#.to_owned(),
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"r1","name":"subagent_send","arguments":{"id":"sa-2","mode":"reply","requestId":"pq-1","message":"yes"}}]}}"#.to_owned(),
+            r#"{"type":"custom_message","customType":"subagent-result-batch","display":true,"content":"Subagent sa-2 \"scout\" finished.","details":{"results":[{"id":"sa-2","title":"scout","status":"done"}]},"timestamp":"2026-01-01T00:00:03Z"}"#.to_owned(),
+            r#"{"type":"custom_message","customType":"plannotator-context","display":false,"content":"hidden"}"#.to_owned(),
+            r#"{"type":"custom_message","customType":"subagent-question-batch","display":true,"content":"malformed","details":{"questions":[{"childId":"sa-9"}]}}"#.to_owned(),
+        ];
+        let view = parse_thread(&write_thread(&dir, &lines)).expect("parse");
+        assert_eq!(view.entries.len(), 3, "hidden and malformed notices are skipped");
+        match &view.entries[0].entry {
+            ThreadEntry::ChildQuestions { questions } => {
+                assert_eq!(questions.len(), 2);
+                assert_eq!(questions[0].request_id, "pq-1");
+                assert_eq!(questions[0].context.as_deref(), Some("tests green"));
+                assert!(questions[0].answered, "reply with matching requestId answers it");
+                assert!(!questions[1].answered, "no reply for pq-2");
+            }
+            other => panic!("expected child questions, got {other:?}"),
+        }
+        match &view.entries[2].entry {
+            ThreadEntry::ChildResults { text, results, .. } => {
+                assert!(text.contains("finished"));
+                assert_eq!(results[0].status, "done");
+                assert_eq!(results[0].title, "scout");
+            }
+            other => panic!("expected child results, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1190,7 +1469,7 @@ mod tests {
             ThreadEntry::AskUser { answer, .. } => assert!(answer.is_some()),
             other => panic!("expected askuser, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     #[test]
@@ -1204,6 +1483,34 @@ mod tests {
         assert!(
             matches!(view.entries[0].entry, ThreadEntry::ToolError { ref text, .. } if text.contains("boom"))
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
+    }
+
+    #[test]
+    fn keeps_failed_and_aborted_turns_with_their_reason() {
+        let dir = temp_dir("turn-errors");
+        let file = write_thread(
+            &dir,
+            &[
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limited"}}"#.to_owned(),
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"stopReason":"aborted"}}"#.to_owned(),
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","content":[],"stopReason":"stop"}}"#.to_owned(),
+            ],
+        );
+        let view = parse_thread(&file).expect("parse");
+        let errors: Vec<Option<&str>> = view
+            .entries
+            .iter()
+            .map(|dated| match &dated.entry {
+                ThreadEntry::Assistant { error, .. } => error.as_deref(),
+                _ => Some("not assistant"),
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            [Some("rate limited"), Some("Stopped")],
+            "empty normal reply is skipped"
+        );
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 }

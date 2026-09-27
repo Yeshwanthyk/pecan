@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::error::{CoreError, Result};
 
 /// Current schema version.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 
 /// A user's curation decision about one project.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -22,6 +22,37 @@ pub struct ProjectPref {
     pub added: bool,
     /// Epoch millis when the project was added or seeded.
     pub added_at_ms: i64,
+}
+
+/// A browser paired with this server. The bearer token itself is never
+/// stored; only its SHA-256 digest is, so a copied database cannot sign in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Device {
+    /// Stable public id used to list and revoke the device.
+    pub id: String,
+    /// Human label (browser and platform) captured at pairing time.
+    pub name: String,
+    /// Epoch millis when the device was paired.
+    pub created_at_ms: i64,
+    /// Epoch millis of the last authenticated request (coarse, see
+    /// [`StateStore::touch_device`]).
+    pub last_seen_at_ms: i64,
+}
+
+/// A device's web push subscription. Pushes carry no payload, so only the
+/// push service endpoint is kept, never the browser's encryption keys.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushSubscription {
+    /// The subscribed device.
+    pub device_id: String,
+    /// The device's label, for listings.
+    pub device_name: String,
+    /// Push service URL the server POSTs to.
+    pub endpoint: String,
+    /// Epoch millis when the endpoint was last (re)registered.
+    pub updated_at_ms: i64,
 }
 
 /// SQLite-backed state store.
@@ -55,7 +86,8 @@ impl StateStore {
     ///
     /// # Errors
     /// See [`StateStore::open`].
-    pub fn open_in_memory() -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
@@ -100,6 +132,19 @@ impl StateStore {
                 enabled       INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS device (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                token_sha256    TEXT NOT NULL UNIQUE,
+                created_at_ms   INTEGER NOT NULL,
+                last_seen_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS push_subscription (
+                device_id     TEXT PRIMARY KEY,
+                endpoint      TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             "#,
         )?;
         let version: String = conn.query_row(
@@ -115,7 +160,7 @@ impl StateStore {
                 )?;
                 Ok(())
             }
-            1 | 2 => {
+            1..=4 => {
                 conn.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     [SCHEMA_VERSION.to_string()],
@@ -127,73 +172,6 @@ impl StateStore {
                 "database schema version {v} is newer than supported {SCHEMA_VERSION}"
             )))),
         }
-    }
-
-    /// Imports a legacy `state.json` (pre-SQLite) once, then renames it aside.
-    ///
-    /// Missing files are normal (`Ok(0)`); unreadable ones warn and stay
-    /// untouched so nothing is lost.
-    ///
-    /// # Errors
-    /// Returns [`CoreError`] when reads or writes fail mid-import.
-    pub fn import_legacy_json(&self, legacy_path: &Path) -> Result<usize> {
-        let Ok(bytes) = std::fs::read(legacy_path) else {
-            return Ok(0);
-        };
-        #[derive(serde::Deserialize)]
-        struct LegacyPref {
-            #[serde(default = "yes")]
-            added: bool,
-            added_at: i64,
-        }
-        #[derive(serde::Deserialize)]
-        struct Legacy {
-            #[serde(default)]
-            projects: HashMap<String, LegacyPref>,
-            #[serde(default)]
-            settled: HashMap<String, i64>,
-        }
-        fn yes() -> bool {
-            true
-        }
-        let parsed: Legacy = match serde_json::from_slice(&bytes) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::warn!(path = %legacy_path.display(), %error, "unreadable legacy state");
-                return Ok(0);
-            }
-        };
-        let project_count = parsed.projects.len();
-        let settled_count = parsed.settled.len();
-
-        self.with_tx(|tx| {
-            for (cwd, pref) in &parsed.projects {
-                tx.execute(
-                    "INSERT OR REPLACE INTO project (cwd, added, added_at_ms) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![cwd, i64::from(pref.added), pref.added_at],
-                )?;
-            }
-            for (session_id, at) in &parsed.settled {
-                tx.execute(
-                    "INSERT OR REPLACE INTO settled (session_id, settled_at_ms) VALUES (?1, ?2)",
-                    rusqlite::params![session_id, at],
-                )?;
-            }
-            if project_count > 0 {
-                tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')", [])?;
-            }
-            Ok(())
-        })?;
-
-        // Retire the legacy file only after a successful import.
-        let aside = legacy_path.with_extension("json.imported");
-        if std::fs::rename(legacy_path, &aside).is_err() {
-            tracing::warn!(
-                path = %legacy_path.display(),
-                "could not rename imported legacy state"
-            );
-        }
-        Ok(project_count + settled_count)
     }
 
     /// Runs `f` inside a transaction, rolling back on error.
@@ -320,24 +298,6 @@ impl StateStore {
         })
     }
 
-    /// Marks many threads settled in one transaction (bulk curation).
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Sql`] when the write fails.
-    pub fn settle_many(&self, session_ids: &[String]) -> Result<()> {
-        let now = now_millis();
-        self.with_tx(|tx| {
-            for id in session_ids {
-                tx.execute(
-                    "INSERT INTO settled (session_id, settled_at_ms) VALUES (?1, ?2)
-                     ON CONFLICT(session_id) DO UPDATE SET settled_at_ms = excluded.settled_at_ms",
-                    rusqlite::params![id, now],
-                )?;
-            }
-            Ok(())
-        })
-    }
-
     /// Restores a settled thread back to active.
     ///
     /// # Errors
@@ -459,17 +419,141 @@ impl StateStore {
         )?)
     }
 
+    /// Records a newly paired device.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the write fails (including a
+    /// duplicate id or token digest).
+    pub fn add_device(&self, id: &str, name: &str, token_sha256: &str) -> Result<Device> {
+        let now = now_millis();
+        self.conn.execute(
+            "INSERT INTO device (id, name, token_sha256, created_at_ms, last_seen_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![id, name, token_sha256, now],
+        )?;
+        Ok(Device {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            created_at_ms: now,
+            last_seen_at_ms: now,
+        })
+    }
+
+    /// The device holding the token with this digest, if still paired.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the read fails.
+    pub fn device_by_token(&self, token_sha256: &str) -> Result<Option<Device>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, name, created_at_ms, last_seen_at_ms FROM device WHERE token_sha256 = ?1",
+        )?;
+        let mut rows = stmt.query_map([token_sha256], device_from_row)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Marks a device as seen now.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the write fails.
+    pub fn touch_device(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE device SET last_seen_at_ms = ?2 WHERE id = ?1",
+            rusqlite::params![id, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Every paired device, most recently paired first.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the read fails.
+    pub fn devices(&self) -> Result<Vec<Device>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, created_at_ms, last_seen_at_ms FROM device
+             ORDER BY created_at_ms DESC, id",
+        )?;
+        let rows = stmt.query_map([], device_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forgets a device; its token stops working immediately. Returns whether
+    /// a device with that id existed.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the write fails.
+    pub fn revoke_device(&self, id: &str) -> Result<bool> {
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM push_subscription WHERE device_id = ?1", [id])?;
+            Ok(tx.execute("DELETE FROM device WHERE id = ?1", [id])? > 0)
+        })
+    }
+
+    /// Stores (or replaces) a paired device's push endpoint.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the write fails.
+    pub fn set_push_subscription(&self, device_id: &str, endpoint: &str) -> Result<()> {
+        let now = now_millis();
+        self.conn.execute(
+            "INSERT INTO push_subscription (device_id, endpoint, created_at_ms, updated_at_ms)
+             SELECT id, ?2, ?3, ?3 FROM device WHERE id = ?1
+             ON CONFLICT(device_id) DO UPDATE SET endpoint = ?2, updated_at_ms = ?3",
+            rusqlite::params![device_id, endpoint, now],
+        )?;
+        Ok(())
+    }
+
+    /// Drops a device's push endpoint. Returns whether one existed.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the write fails.
+    pub fn remove_push_subscription(&self, device_id: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM push_subscription WHERE device_id = ?1", [device_id])?
+            > 0)
+    }
+
+    /// Every push subscription of a still-paired device.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Sql`] when the read fails.
+    pub fn push_subscriptions(&self) -> Result<Vec<PushSubscription>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.device_id, d.name, p.endpoint, p.updated_at_ms
+             FROM push_subscription p JOIN device d ON d.id = p.device_id
+             ORDER BY p.updated_at_ms DESC, p.device_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PushSubscription {
+                device_id: row.get(0)?,
+                device_name: row.get(1)?,
+                endpoint: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Whether a thread is settled.
     ///
     /// # Errors
     /// Returns [`CoreError::Sql`] when the read fails.
-    pub fn is_settled(&self, session_id: &str) -> Result<bool> {
+    #[cfg(test)]
+    pub(crate) fn is_settled(&self, session_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM settled WHERE session_id = ?1)",
             [session_id],
             |row| row.get(0),
         )?)
     }
+}
+
+fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
+    Ok(Device {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at_ms: row.get(2)?,
+        last_seen_at_ms: row.get(3)?,
+    })
 }
 
 /// Wall-clock epoch millis for state timestamps.
@@ -520,36 +604,46 @@ mod tests {
     }
 
     #[test]
-    fn imports_legacy_json_once_and_renames_it_aside() {
-        let dir = std::env::temp_dir().join(format!("pecan-store-legacy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let legacy = dir.join("state.json");
-        std::fs::write(
-            &legacy,
-            r#"{"version":1,"projects":{"/p":{"added":true,"added_at":123}},
-                "settled":{"s9":456},"seeded":true}"#,
-        )
-        .expect("write legacy");
+    fn push_subscriptions_follow_their_device() {
+        let store = StateStore::open_in_memory().expect("store");
+        store.set_push_subscription("ghost", "https://push.example/x").expect("unknown device");
+        assert!(store.push_subscriptions().expect("list").is_empty(), "needs a paired device");
+        store.add_device("dev-1", "Safari on iPhone", "digest-1").expect("add");
+        store.set_push_subscription("dev-1", "https://push.example/a").expect("subscribe");
+        store.set_push_subscription("dev-1", "https://push.example/b").expect("resubscribe");
+        let subs = store.push_subscriptions().expect("list");
+        assert_eq!(subs.len(), 1, "one endpoint per device");
+        assert_eq!(subs.first().map(|sub| sub.endpoint.as_str()), Some("https://push.example/b"));
+        assert_eq!(subs.first().map(|sub| sub.device_name.as_str()), Some("Safari on iPhone"));
+        assert!(store.revoke_device("dev-1").expect("revoke"));
+        assert!(store.push_subscriptions().expect("list").is_empty(), "revoke unsubscribes");
+        assert!(!store.remove_push_subscription("dev-1").expect("remove"), "already gone");
+    }
 
-        let store = StateStore::open(&dir.join("pecan.db")).expect("open");
-        let imported = store.import_legacy_json(&legacy).expect("import");
-        assert_eq!(imported, 2);
-        assert!(store.is_added("/p").expect("project imported"));
-        assert!(store.is_settled("s9").expect("settle imported"));
-        assert!(store.is_seeded().expect("seeded flag imported"));
-        assert!(!legacy.exists(), "legacy renamed aside");
-        assert!(dir.join("state.json.imported").exists());
+    #[test]
+    fn pairs_looks_up_and_revokes_devices() {
+        let store = StateStore::open_in_memory().expect("open");
+        let device = store.add_device("dev-1", "Safari on iPhone", "digest-1").expect("add");
+        assert_eq!(store.device_by_token("digest-1").expect("lookup"), Some(device));
+        assert_eq!(store.device_by_token("digest-2").expect("lookup"), None, "unknown token");
+        store.touch_device("dev-1").expect("touch");
+        assert_eq!(store.devices().expect("list").len(), 1);
+        assert!(store.revoke_device("dev-1").expect("revoke"));
+        assert!(!store.revoke_device("dev-1").expect("second revoke"), "already gone");
+        assert_eq!(store.device_by_token("digest-1").expect("lookup"), None, "revoked token");
+    }
 
-        // Second call is a no-op (file gone).
-        assert_eq!(store.import_legacy_json(&legacy).expect("second"), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn rejects_a_reused_token_digest() {
+        let store = StateStore::open_in_memory().expect("open");
+        store.add_device("dev-1", "one", "same").expect("add");
+        assert!(store.add_device("dev-2", "two", "same").is_err(), "digest is unique");
     }
 
     #[test]
     fn refuses_newer_schema_versions() {
         let dir = std::env::temp_dir().join(format!("pecan-store-future-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
         std::fs::create_dir_all(&dir).expect("mkdir");
         let db = dir.join("pecan.db");
         {
@@ -561,7 +655,7 @@ mod tests {
             .expect("stamp future version");
         }
         assert!(StateStore::open(&db).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     #[test]
@@ -588,7 +682,7 @@ mod tests {
     #[test]
     fn migrates_version_one_database_for_titles() {
         let dir = std::env::temp_dir().join(format!("pecan-store-v1-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
         std::fs::create_dir_all(&dir).expect("mkdir");
         let db = dir.join("pecan.db");
         {
@@ -606,7 +700,7 @@ mod tests {
             .conn
             .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, "3");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(version, SCHEMA_VERSION.to_string(), "stamped current");
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 }

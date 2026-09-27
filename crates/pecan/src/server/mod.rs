@@ -3,6 +3,13 @@
 mod api;
 mod api_errors;
 mod assets;
+mod auth;
+mod event_log;
+mod git;
+mod health;
+mod idempotency;
+mod model_favorites;
+mod push;
 mod ship;
 mod snapshot;
 mod title;
@@ -17,9 +24,8 @@ use axum::routing::get;
 use pecan_core::PiPaths;
 use pecan_core::scan::ScanCache;
 use pecan_core::session::{SessionKind, SessionSummary};
-use tokio::sync::broadcast;
 
-use self::snapshot::{App, IndexSnapshot, ServerEvent, SessionScope};
+use self::snapshot::{App, IndexSnapshot, SessionScope};
 use self::worker::Workers;
 use crate::cli::open_store;
 
@@ -35,7 +41,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), crate::cli::CliError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| crate::cli::usage(&format!("tokio runtime: {e}")))?;
+        .map_err(|e| crate::cli::startup(&format!("tokio runtime: {e}")))?;
     runtime.block_on(async move {
         serve(
             options.host,
@@ -70,7 +76,8 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, crate::cli::CliE
     let mut no_open_seen = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        let Some(current) = args.get(i) else { break };
+        match current.as_str() {
             "--port" => {
                 if port_seen {
                     return Err(crate::cli::usage("serve: duplicate --port"));
@@ -79,8 +86,9 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, crate::cli::CliE
                     .get(i + 1)
                     .filter(|value| !value.starts_with("--"))
                     .ok_or_else(|| crate::cli::usage("serve: --port expects a number"))?;
-                options.port =
-                    value.parse().map_err(|_| crate::cli::usage("--port expects a number"))?;
+                options.port = value
+                    .parse()
+                    .map_err(|e| crate::cli::usage(&format!("--port expects a number: {e}")))?;
                 port_seen = true;
                 i += 1;
             }
@@ -174,12 +182,12 @@ async fn serve(
         )
         .init();
 
-    let paths = PiPaths::detect().map_err(|e| crate::cli::usage(&e.to_string()))?;
+    let paths = PiPaths::detect().map_err(|e| crate::cli::startup(&e.to_string()))?;
     let session_scope = if session_id.is_some() {
         let mut cache = ScanCache::new();
         let sessions = cache
             .refresh(&paths.sessions_dir())
-            .map_err(|error| crate::cli::usage(&error.to_string()))?;
+            .map_err(|error| crate::cli::startup(&error.to_string()))?;
         let id = resolve_session_id(&sessions, session_id.as_deref(), session_cwd.as_deref())?
             .ok_or_else(|| crate::cli::usage("serve: missing session selector"))?;
         Some(SessionScope::new(id))
@@ -187,16 +195,17 @@ async fn serve(
         None
     };
     let store = Arc::new(std::sync::Mutex::new(
-        open_store(&paths).map_err(|e| crate::cli::usage(&e.to_string()))?,
+        open_store(&paths).map_err(|e| crate::cli::startup(&e.to_string()))?,
     ));
-    let (events, _) = broadcast::channel::<ServerEvent>(256);
+    let auth = auth::Auth::load(&paths).map_err(|e| crate::cli::startup(&e.to_string()))?;
+    let push = push::Push::load(&paths).map_err(|e| crate::cli::startup(&e.to_string()))?;
+    let events = event_log::EventLog::new();
     let app = App {
         paths: paths.clone(),
         store,
         snapshot: Arc::new(tokio::sync::RwLock::new(Arc::new(IndexSnapshot {
             sessions: Arc::new(Vec::new()),
             tasks: std::collections::HashMap::new(),
-            workflows: std::collections::HashMap::new(),
         }))),
         events,
         scan_cache: Arc::new(std::sync::Mutex::new(ScanCache::new())),
@@ -206,8 +215,12 @@ async fn serve(
         ship_lock: Arc::new(tokio::sync::Mutex::new(())),
         ship_token: Arc::from(ship_token.as_str()),
         session_scope,
+        idempotency: idempotency::Idempotency::default(),
+        health: health::HealthCache::default(),
+        auth,
+        push,
     };
-    app.refresh().await.map_err(|e| crate::cli::usage(&e.to_string()))?;
+    app.refresh().await.map_err(|e| crate::cli::startup(&e.to_string()))?;
 
     // Projects are tracked only when the user explicitly adds them; the
     // index stays global but the sidebar starts empty.
@@ -216,10 +229,11 @@ async fn serve(
     // explicit opt-in bulk import.
 
     let workers = Workers::new();
-    let project_roots =
-        watched_project_roots(&app).await.map_err(|error| crate::cli::usage(&error.to_string()))?;
+    let project_roots = watched_project_roots(&app)
+        .await
+        .map_err(|error| crate::cli::startup(&error.to_string()))?;
     let _watcher = watcher::spawn(&paths, Arc::new(app.clone()), &project_roots)
-        .map_err(|e| crate::cli::usage(&format!("watcher: {e}")))?;
+        .map_err(|e| crate::cli::startup(&format!("watcher: {e}")))?;
 
     let router = Router::new()
         .route("/", get(assets::serve))
@@ -228,38 +242,51 @@ async fn serve(
     let addr = std::net::SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| crate::cli::usage(&format!("bind {addr}: {e}")))?;
-    let bound_addr =
-        listener.local_addr().map_err(|e| crate::cli::usage(&format!("listener address: {e}")))?;
+        .map_err(|e| crate::cli::startup(&format!("bind {addr}: {e}")))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|e| crate::cli::startup(&format!("listener address: {e}")))?;
     let url = format!("http://{bound_addr}");
     println!("pecan serving {url}");
     let ship_url = format!("{url}/?ship-token={ship_token}");
     println!("Ship-enabled URL: {ship_url}");
-    if open_browser && cfg!(target_os = "macos") {
-        let _ = std::process::Command::new("open").arg(&ship_url).spawn();
+    println!("Pair a phone or browser: pecan pair");
+    if open_browser
+        && cfg!(target_os = "macos")
+        && let Err(error) = open_paired(&app, &ship_url)
+    {
+        tracing::warn!(%error, "failed to open browser");
     }
 
     tokio::select! {
         result = axum::serve(listener, router).into_future() => {
-            result.map_err(|e| crate::cli::usage(&format!("serve: {e}")))
+            result.map_err(|e| crate::cli::startup(&format!("serve: {e}")))
         }
         signal = tokio::signal::ctrl_c() => {
-            signal.map_err(|e| crate::cli::usage(&format!("shutdown signal: {e}")))?;
+            signal.map_err(|e| crate::cli::startup(&format!("shutdown signal: {e}")))?;
             tracing::info!("shutting down");
             Ok(())
         }
     }
 }
 
+/// Opens this machine's browser already paired: the URL carries a fresh
+/// one-time code the page redeems on load.
+fn open_paired(app: &App, ship_url: &str) -> Result<(), String> {
+    let code = app.auth.mint_code(std::time::Instant::now()).map_err(|error| error.to_string())?;
+    let url = format!("{ship_url}&pair={code}");
+    std::process::Command::new("open").arg(url).spawn().map(drop).map_err(|error| error.to_string())
+}
+
 fn generate_ship_token() -> Result<String, crate::cli::CliError> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes)
-        .map_err(|error| crate::cli::usage(&format!("generate Ship token: {error}")))?;
+        .map_err(|error| crate::cli::startup(&format!("generate Ship token: {error}")))?;
     let mut token = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;
         write!(&mut token, "{byte:02x}")
-            .map_err(|error| crate::cli::usage(&format!("encode Ship token: {error}")))?;
+            .map_err(|error| crate::cli::startup(&format!("encode Ship token: {error}")))?;
     }
     Ok(token)
 }
@@ -451,7 +478,6 @@ mod tests {
             preview: None,
             title: None,
             kind,
-            parent_id: None,
             agent_name: None,
         }
     }

@@ -50,6 +50,19 @@ fn mime_for(path: &str) -> &'static str {
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
+        Some("webmanifest") => "application/manifest+json",
+        Some("json") => "application/json",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webmanifest_gets_manifest_mime() {
+        assert_eq!(mime_for("manifest.webmanifest"), "application/manifest+json");
+        assert_eq!(mime_for("foo.json"), "application/json");
     }
 }

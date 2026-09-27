@@ -6,6 +6,7 @@
  * (permission-gated); everywhere else — notably iOS Safari — users pick
  * from a curated stack of fonts commonly present on the device.
  */
+import { readLocalStorage, readStoredStrings, writeLocalStorage } from "~/lib/storage";
 
 const UI_FONT_KEY = "pecan:font-ui";
 const CODE_FONT_KEY = "pecan:font-code";
@@ -19,7 +20,7 @@ export const SYSTEM_CODE = "system-mono";
 
 export type TextSize = "small" | "default" | "large";
 
-export const TEXT_SIZE_SCALES: Record<TextSize, number> = {
+const TEXT_SIZE_SCALES: Record<TextSize, number> = {
   small: 0.9,
   default: 1,
   large: 1.12,
@@ -72,103 +73,75 @@ function familyStack(font: string, fallback: string): string {
 export async function loadInstalledFonts(): Promise<string[]> {
   const root = globalThis as { queryLocalFonts?: () => Promise<Array<{ family: string }>> };
   if (typeof root.queryLocalFonts !== "function") return [];
+  let fonts: string[] = [];
   try {
-    const fonts = await root.queryLocalFonts();
-    return [...new Set(fonts.map((font) => font.family))].sort((a, b) => a.localeCompare(b));
+    fonts = [...new Set((await root.queryLocalFonts()).map((font) => font.family))].sort((a, b) =>
+      a.localeCompare(b),
+    );
   } catch {
-    return [];
+    // Permission denied or an unsupported browser; the curated fallback list is used instead.
   }
+  return fonts;
 }
 
 /** Applies stored font choices and size preferences as :root variable overrides. */
-export function applyFonts(): void {
-  try {
-    const ui = localStorage.getItem(UI_FONT_KEY);
-    const code = localStorage.getItem(CODE_FONT_KEY);
-    if (ui && ui !== SYSTEM_UI) {
-      document.documentElement.style.setProperty("--font-sans", familyStack(ui, UI_FALLBACK));
-    } else {
-      document.documentElement.style.removeProperty("--font-sans");
-    }
-    if (code && code !== SYSTEM_CODE) {
-      document.documentElement.style.setProperty("--font-mono", familyStack(code, CODE_FALLBACK));
-    } else {
-      document.documentElement.style.removeProperty("--font-mono");
-    }
-    document.documentElement.style.setProperty(
-      "--ui-font-scale",
-      String(TEXT_SIZE_SCALES[readUiTextSize()]),
-    );
-    document.documentElement.style.setProperty(
-      "--code-font-scale",
-      String(TEXT_SIZE_SCALES[readCodeTextSize()]),
-    );
-  } catch {
-    /* private mode */
+function applyFonts(): void {
+  const ui = readLocalStorage(UI_FONT_KEY);
+  const code = readLocalStorage(CODE_FONT_KEY);
+  if (ui && ui !== SYSTEM_UI) {
+    document.documentElement.style.setProperty("--font-sans", familyStack(ui, UI_FALLBACK));
+  } else {
+    document.documentElement.style.removeProperty("--font-sans");
   }
+  if (code && code !== SYSTEM_CODE) {
+    document.documentElement.style.setProperty("--font-mono", familyStack(code, CODE_FALLBACK));
+  } else {
+    document.documentElement.style.removeProperty("--font-mono");
+  }
+  document.documentElement.style.setProperty(
+    "--ui-font-scale",
+    String(TEXT_SIZE_SCALES[readUiTextSize()]),
+  );
+  document.documentElement.style.setProperty(
+    "--code-font-scale",
+    String(TEXT_SIZE_SCALES[readCodeTextSize()]),
+  );
 }
 
 export function readUiFont(): string {
-  try {
-    return localStorage.getItem(UI_FONT_KEY) ?? SYSTEM_UI;
-  } catch {
-    return SYSTEM_UI;
-  }
+  return readLocalStorage(UI_FONT_KEY) ?? SYSTEM_UI;
 }
 
 export function readCodeFont(): string {
-  try {
-    return localStorage.getItem(CODE_FONT_KEY) ?? SYSTEM_CODE;
-  } catch {
-    return SYSTEM_CODE;
-  }
+  return readLocalStorage(CODE_FONT_KEY) ?? SYSTEM_CODE;
 }
 
 export function saveUiFont(font: string): void {
   const normalized = normalizeFont(font);
   if (!normalized) return;
-  try {
-    localStorage.setItem(UI_FONT_KEY, normalized);
-  } catch {
-    /* in-memory style update still works when persistence is unavailable */
-  }
+  writeLocalStorage(UI_FONT_KEY, normalized);
   applyFonts();
 }
 
 export function saveCodeFont(font: string): void {
   const normalized = normalizeFont(font);
   if (!normalized) return;
-  try {
-    localStorage.setItem(CODE_FONT_KEY, normalized);
-  } catch {
-    /* in-memory style update still works when persistence is unavailable */
-  }
+  writeLocalStorage(CODE_FONT_KEY, normalized);
   applyFonts();
 }
 
 function readCustomFonts(key: string): string[] {
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
-    if (!Array.isArray(value)) return [];
-    return [...new Set(value.flatMap((font) => {
-      if (typeof font !== "string") return [];
-      const normalized = normalizeFont(font);
-      return normalized ? [normalized] : [];
-    }))];
-  } catch {
-    return [];
-  }
+  return [...new Set(readStoredStrings(key).flatMap((font) => {
+    const normalized = normalizeFont(font);
+    return normalized ? [normalized] : [];
+  }))];
 }
 
 function addCustomFont(key: string, font: string): string[] {
   const normalized = normalizeFont(font);
   if (!normalized) return readCustomFonts(key);
   const fonts = [...new Set([...readCustomFonts(key), normalized])];
-  try {
-    localStorage.setItem(key, JSON.stringify(fonts));
-  } catch {
-    /* The active choice still works when persistence is unavailable. */
-  }
+  writeLocalStorage(key, JSON.stringify(fonts));
   return fonts;
 }
 
@@ -178,23 +151,15 @@ export const addCustomUiFont = (font: string) => addCustomFont(UI_CUSTOM_FONTS_K
 export const addCustomCodeFont = (font: string) => addCustomFont(CODE_CUSTOM_FONTS_KEY, font);
 
 function readTextSize(key: string): TextSize {
-  try {
-    const value = localStorage.getItem(key);
-    return value === "small" || value === "large" ? value : "default";
-  } catch {
-    return "default";
-  }
+  const value = readLocalStorage(key);
+  return value === "small" || value === "large" ? value : "default";
 }
 
 export const readUiTextSize = () => readTextSize(UI_SIZE_KEY);
 export const readCodeTextSize = () => readTextSize(CODE_SIZE_KEY);
 
 function saveTextSize(key: string, size: TextSize): void {
-  try {
-    localStorage.setItem(key, size);
-  } catch {
-    /* The current page still receives the style update. */
-  }
+  writeLocalStorage(key, size);
   applyFonts();
 }
 

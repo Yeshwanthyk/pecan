@@ -66,11 +66,12 @@ impl ScanCache {
 
         let mut out: Vec<SessionSummary> = Vec::with_capacity(seen.len());
         for (path, (modified, bytes)) in seen {
-            if let Some(cached) = self.by_path.get(&path) {
-                if cached.modified == modified && cached.bytes == bytes {
-                    out.push(cached.summary.clone());
-                    continue;
-                }
+            if let Some(cached) = self.by_path.get(&path)
+                && cached.modified == modified
+                && cached.bytes == bytes
+            {
+                out.push(cached.summary.clone());
+                continue;
             }
             match build_summary(&path, modified, bytes) {
                 Some(summary) => {
@@ -84,7 +85,7 @@ impl ScanCache {
             }
         }
 
-        out.sort_by(|a, b| b.opened_at.cmp(&a.opened_at));
+        out.sort_by_key(|session| std::cmp::Reverse(session.opened_at));
         Ok(out)
     }
 }
@@ -104,8 +105,8 @@ fn build_summary(path: &Path, modified: SystemTime, bytes: u64) -> Option<Sessio
     let header = session::read_header(path).ok()??;
     let preview = session::extract_preview(path);
     let last_activity = Timestamp::try_from(modified).unwrap_or(Timestamp::UNIX_EPOCH);
-    let subagent = session::subagent_info(path);
-    let kind = if subagent.is_some() {
+    let agent_name = session::subagent_name(path);
+    let kind = if agent_name.is_some() {
         SessionKind::Subagent
     } else {
         session::kind_for(&header.cwd, path)
@@ -122,8 +123,7 @@ fn build_summary(path: &Path, modified: SystemTime, bytes: u64) -> Option<Sessio
         preview,
         title: None,
         kind,
-        parent_id: subagent.as_ref().map(|(parent, _)| parent.clone()),
-        agent_name: subagent.and_then(|(_, name)| name),
+        agent_name,
     })
 }
 
@@ -140,7 +140,7 @@ mod tests {
     impl TempTree {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("pecan-scan-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir).unwrap_or_default();
             std::fs::create_dir_all(&dir).expect("mkdir root");
             Self(dir)
         }
@@ -159,7 +159,7 @@ mod tests {
     }
     impl Drop for TempTree {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            std::fs::remove_dir_all(&self.0).unwrap_or_default();
         }
     }
 

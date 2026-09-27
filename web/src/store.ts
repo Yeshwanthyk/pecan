@@ -2,23 +2,48 @@
 import { create } from "zustand";
 
 import type { AgentSnapshot, Bootstrap, SessionRow, ThreadView } from "./api/types";
+import { readLocalStorage, writeLocalStorage } from "./lib/storage";
+
+const THEME_KEY = "pecan:theme";
 
 export type ThemeName = "earl-grey-light" | "one-dark";
-export type SendMode = "steer" | "queue";
+type SendMode = "steer" | "queue";
 
+/** One live child from the `pi-subagents/activity/v1` widget. */
 export type RunningSubagent = {
   id?: string;
   title: string;
-  status?: "running" | "settled";
+  status: "queued" | "running";
   backend?: string;
   model?: string;
+  reasoningEffort?: string;
+  /** Latest tool call, newest last in the widget. */
+  tool?: { name: string; args?: string; isError: boolean };
+  /** Tail of the child's streamed output. */
+  output?: string;
+  failure?: string;
+  /** Steer/follow-up messages waiting for the child. */
+  queuedMessages: number;
+  tokens?: number;
+  contextWindow?: number;
   startedAt: number;
   lastActivityAt: number;
+};
+
+/** The one child that just settled, shown briefly after it leaves `children`. */
+export type SubagentHandoff = {
+  id: string;
+  title: string;
+  status: "done" | "error";
+  output: string;
+  failure?: string;
+  settledAt: number;
 };
 
 export type SubagentActivity = {
   revision: number;
   children: RunningSubagent[];
+  terminal?: SubagentHandoff;
 };
 
 /** One select choice exactly as pi sent it: a bare string or a label/value pair. */
@@ -30,7 +55,7 @@ export type ExtensionNotice = {
   notifyType: "info" | "warning" | "error";
 };
 
-export type ExtensionStatus = {
+type ExtensionStatus = {
   key: string;
   text: string;
 };
@@ -41,7 +66,7 @@ export type ExtensionWidget = {
   placement: "aboveEditor" | "belowEditor";
 };
 
-export type ExtensionEditorText = {
+type ExtensionEditorText = {
   revision: number;
   text: string;
 };
@@ -59,8 +84,20 @@ export type PendingAsk = {
   options?: DialogOption[];
 };
 
+/** A transient message shown in the app-wide toaster. */
+export type Toast = { id: number; message: string; tone: "error" | "info" };
+
 type AppState = {
+  toasts: Toast[];
+  pushToast: (message: string, tone?: Toast["tone"]) => void;
+  dismissToast: (id: number) => void;
+  /** Project directory a new session is being started in, if any. */
+  startingCwd: string | null;
+  setStartingCwd: (cwd: string | null) => void;
   bootstrap: Bootstrap | null;
+  /** `false` once the server refuses this browser as unpaired. */
+  paired: boolean;
+  setPaired: (paired: boolean) => void;
   sessions: SessionRow[];
   theme: ThemeName;
   connected: boolean;
@@ -109,25 +146,32 @@ type AppState = {
 
 function applyTheme(theme: ThemeName) {
   document.documentElement.classList.toggle("dark", theme === "one-dark");
-  try {
-    localStorage.setItem("pecan:theme", theme);
-  } catch {
-    /* private mode */
-  }
+  writeLocalStorage(THEME_KEY, theme);
 }
 
-const initialTheme = (): ThemeName => {
-  try {
-    return localStorage.getItem("pecan:theme") === "one-dark" ? "one-dark" : "earl-grey-light";
-  } catch {
-    return "earl-grey-light";
-  }
-};
+const initialTheme = (): ThemeName =>
+  readLocalStorage(THEME_KEY) === "one-dark" ? "one-dark" : "earl-grey-light";
 
 applyTheme(initialTheme());
 
+let toastSeq = 0;
+
 export const useApp = create<AppState>((set) => ({
+  toasts: [],
+  pushToast: (message, tone = "error") =>
+    set((current) => {
+      // Collapse repeats of the newest message instead of stacking them.
+      if (current.toasts.at(-1)?.message === message) return current;
+      toastSeq += 1;
+      return { toasts: [...current.toasts, { id: toastSeq, message, tone }].slice(-3) };
+    }),
+  dismissToast: (id) =>
+    set((current) => ({ toasts: current.toasts.filter((toast) => toast.id !== id) })),
+  startingCwd: null,
+  setStartingCwd: (startingCwd) => set({ startingCwd }),
   bootstrap: null,
+  paired: true,
+  setPaired: (paired) => set({ paired }),
   sessions: [],
   theme: initialTheme(),
   connected: false,

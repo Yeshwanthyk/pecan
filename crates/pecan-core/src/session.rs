@@ -69,9 +69,8 @@ pub struct SessionSummary {
     pub title: Option<String>,
     /// User-opened vs subagent-spawned.
     pub kind: SessionKind,
-    /// Parent session id, when this session is a spawned subagent.
-    pub parent_id: Option<String>,
-    /// Subagent display name from its `session_info` record (e.g. "scout").
+    /// Subagent display name from its `session_info` record, formatted
+    /// `<owner>: <title>` (e.g. "subagents: scout" or "workflow:wf-1: Build").
     pub agent_name: Option<String>,
 }
 
@@ -81,7 +80,7 @@ impl SessionHeader {
     /// Returns `None` for any line that is not a well-formed session record;
     /// scan callers simply skip such files rather than failing the whole index.
     #[must_use]
-    pub fn parse_line(line: &str) -> Option<Self> {
+    pub(crate) fn parse_line(line: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         if value.get("type")?.as_str()? != "session" {
             return None;
@@ -104,7 +103,7 @@ fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
 ///
 /// # Errors
 /// Returns [`CoreError::Io`] when the file cannot be opened or read.
-pub fn read_header(path: &Path) -> crate::error::Result<Option<SessionHeader>> {
+pub(crate) fn read_header(path: &Path) -> crate::error::Result<Option<SessionHeader>> {
     let file = std::fs::File::open(path)
         .map_err(|source| CoreError::Io { path: path.to_owned(), source })?;
     let mut reader = std::io::BufReader::new(file);
@@ -121,7 +120,7 @@ pub fn read_header(path: &Path) -> crate::error::Result<Option<SessionHeader>> {
 ///
 /// Reads at most [`PREVIEW_SCAN_BYTES`] so huge transcripts stay cheap to index.
 /// Malformed content yields `None` rather than an error: previews are cosmetic.
-pub fn extract_preview(path: &Path) -> Option<String> {
+pub(crate) fn extract_preview(path: &Path) -> Option<String> {
     let bytes = bounded_head(path, PREVIEW_SCAN_BYTES)?;
     let text = String::from_utf8_lossy(&bytes);
     for line in text.lines().skip(1) {
@@ -135,32 +134,34 @@ pub fn extract_preview(path: &Path) -> Option<String> {
         if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
             continue;
         }
-        if let Some(preview) = user_text_of(message) {
-            if !preview.is_empty() {
-                return Some(truncate_chars(&preview, PREVIEW_MAX_CHARS));
-            }
+        if let Some(preview) = user_text_of(message)
+            && !preview.is_empty()
+        {
+            return Some(truncate_chars(&preview, PREVIEW_MAX_CHARS));
         }
     }
     None
 }
 
-/// Bounded scan for a `session_info` record near the head of the file, which
-/// marks spawned subagents with their parent id and display name.
-pub fn subagent_info(path: &Path) -> Option<(String, Option<String>)> {
+/// Bounded scan for the `session_info` record a spawned child writes before
+/// its first message, returning the child's display name (`<owner>: <title>`).
+///
+/// A `session_info` after the first message is a user rename, not a spawn
+/// marker, so the scan stops at the first `message` entry.
+pub(crate) fn subagent_name(path: &Path) -> Option<String> {
     let bytes = bounded_head(path, PREVIEW_SCAN_BYTES)?;
     let text = String::from_utf8_lossy(&bytes);
     for line in text.lines().skip(1) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_info") {
-            continue;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => return None,
+            Some("session_info") => {
+                return str_field(&value, "name").filter(|name| !name.trim().is_empty());
+            }
+            _ => {}
         }
-        let parent_id = str_field(&value, "parentId")?;
-        if parent_id.is_empty() {
-            return None;
-        }
-        return Some((parent_id, str_field(&value, "name")));
     }
     None
 }
@@ -173,13 +174,13 @@ fn user_text_of(message: &serde_json::Value) -> Option<String> {
         Some(serde_json::Value::Array(blocks)) => {
             let mut out = String::new();
             for block in blocks {
-                if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-                    if let Some(part) = block.get("text").and_then(serde_json::Value::as_str) {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(part);
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && let Some(part) = block.get("text").and_then(serde_json::Value::as_str)
+                {
+                    if !out.is_empty() {
+                        out.push('\n');
                     }
+                    out.push_str(part);
                 }
             }
             Some(out)
@@ -191,19 +192,9 @@ fn user_text_of(message: &serde_json::Value) -> Option<String> {
 /// Reads up to `max` bytes from the start of a file.
 fn bounded_head(path: &Path, max: u64) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let take = len.min(max);
-    let mut buf = vec![0_u8; usize::try_from(take).ok()?];
-    let mut reader = std::io::BufReader::new(file);
-    let mut filled = 0_usize;
-    while filled < buf.len() {
-        match std::io::Read::read(&mut reader, &mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => return None,
-        }
-    }
-    buf.truncate(filled);
+    let capacity = usize::try_from(file.metadata().ok()?.len().min(max)).ok()?;
+    let mut buf = Vec::with_capacity(capacity);
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, max), &mut buf).ok()?;
     Some(buf)
 }
 
@@ -219,7 +210,7 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
 
 /// Classifies a session by its working directory and folder location.
 #[must_use]
-pub fn kind_for(cwd: &str, path: &Path) -> SessionKind {
+pub(crate) fn kind_for(cwd: &str, path: &Path) -> SessionKind {
     let in_subagent_dir =
         path.components().any(|c| c.as_os_str().to_string_lossy().starts_with("--tmp-pi-subagent"));
     if cwd.starts_with(SUBAGENT_CWD_PREFIX) || in_subagent_dir {
@@ -279,6 +270,28 @@ mod tests {
         )
         .expect("write");
         assert_eq!(extract_preview(&file).as_deref(), Some("fix the flaky test"));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
+    }
+
+    #[test]
+    fn subagent_name_requires_session_info_before_first_message() {
+        let dir = std::env::temp_dir().join(format!("pecan-subagent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let info =
+            r#"{"type":"session_info","id":"i1","parentId":"m0","name":"workflow:wf-1: Build"}"#;
+        let message = r#"{"type":"message","id":"m1","message":{"role":"user","content":"hi"}}"#;
+        let child = dir.join("child.jsonl");
+        std::fs::write(&child, format!("{HEADER}\n{info}\n{message}\n")).expect("write");
+        assert_eq!(subagent_name(&child).as_deref(), Some("workflow:wf-1: Build"));
+
+        let renamed = dir.join("renamed.jsonl");
+        std::fs::write(&renamed, format!("{HEADER}\n{message}\n{info}\n")).expect("write");
+        assert_eq!(subagent_name(&renamed), None);
+
+        let blank = dir.join("blank.jsonl");
+        let blank_info = r#"{"type":"session_info","id":"i1","name":"  "}"#;
+        std::fs::write(&blank, format!("{HEADER}\n{blank_info}\n")).expect("write");
+        assert_eq!(subagent_name(&blank), None);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 }

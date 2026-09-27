@@ -9,15 +9,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
 
-export async function copyText(text: string): Promise<boolean> {
+async function writeAsyncClipboard(text: string): Promise<boolean> {
+  if (!navigator.clipboard?.writeText) return false;
+  await navigator.clipboard.writeText(text);
+  return true;
+}
+
+async function copyText(text: string): Promise<boolean> {
+  let copied = false;
   try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
+    copied = await writeAsyncClipboard(text);
   } catch {
-    /* fall through to legacy path */
+    // Clipboard permission denied or an insecure origin; fall through to the legacy path.
   }
+  if (copied) return true;
   try {
     const scratch = document.createElement("textarea");
     scratch.value = text;
