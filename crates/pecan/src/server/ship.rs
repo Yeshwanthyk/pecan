@@ -159,8 +159,7 @@ async fn plan_with_gh(
         suggested_branch,
         commit_message: clean_title.clone(),
         pull_request_title: clean_title,
-        pull_request_body:
-            "## Summary\n\nShipped from Pecan after reviewing all workspace changes.".to_owned(),
+        pull_request_body: String::new(),
         has_changes,
         changed_files,
         ahead_count,

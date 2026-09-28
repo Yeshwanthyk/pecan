@@ -25,7 +25,6 @@ import {
   SheetPopup,
   SheetTitle,
 } from "~/components/ui/sheet";
-import { Textarea } from "~/components/ui/textarea";
 import { useApp } from "~/store";
 
 export default function ShipSidebar({
@@ -43,7 +42,6 @@ export default function ShipSidebar({
   const [branch, setBranch] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
   const [pullRequestTitle, setPullRequestTitle] = useState("");
-  const [pullRequestBody, setPullRequestBody] = useState("");
   const [loading, setLoading] = useState(false);
   const [shipping, setShipping] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +61,6 @@ export default function ShipSidebar({
         setBranch(next.branch === next.baseBranch ? next.suggestedBranch : (next.branch ?? ""));
         setCommitMessage(next.commitMessage);
         setPullRequestTitle(next.pullRequestTitle);
-        setPullRequestBody(next.pullRequestBody);
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
@@ -86,10 +83,13 @@ export default function ShipSidebar({
         baseBranch: plan.baseBranch,
         commitMessage,
         pullRequestTitle,
-        pullRequestBody,
+        pullRequestBody: "",
         reviewToken: plan.reviewToken,
       });
       setResult(shipped);
+      void api
+        .send(sessionId, describePullRequestPrompt(shipped.pullRequest), "queue")
+        .catch(() => undefined);
       window.dispatchEvent(new CustomEvent("pecan:refresh"));
       const updated = await api.thread(sessionId);
       if (useApp.getState().thread?.summary.id === sessionId) {
@@ -126,8 +126,8 @@ export default function ShipSidebar({
             <SheetTitle className="text-base">Ship this work</SheetTitle>
           </div>
           <SheetDescription className="text-xs leading-5">
-            Review the checkout, commit every local change, push the branch, and ensure a GitHub
-            pull request exists. The thread settles only after every step succeeds.
+            Commit every local change, push the branch, and open a GitHub pull request. The
+            thread's agent then writes the PR description.
           </SheetDescription>
         </SheetHeader>
 
@@ -207,29 +207,20 @@ export default function ShipSidebar({
                     </Field>
                   ) : null}
                   {!existingPullRequest ? (
-                    <>
-                      <Field label="Pull request title">
-                        <Input
-                          nativeInput
-                          onChange={(event) => setPullRequestTitle(event.currentTarget.value)}
-                          value={pullRequestTitle}
-                        />
-                      </Field>
-                      <Field label="Pull request body">
-                        <Textarea
-                          onChange={(event) => setPullRequestBody(event.currentTarget.value)}
-                          value={pullRequestBody}
-                        />
-                      </Field>
-                    </>
+                    <Field label="Pull request title">
+                      <Input
+                        nativeInput
+                        onChange={(event) => setPullRequestTitle(event.currentTarget.value)}
+                        value={pullRequestTitle}
+                      />
+                    </Field>
                   ) : null}
                 </div>
               )}
 
               <p className="rounded-lg bg-muted/60 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
                 This includes <strong className="font-medium text-foreground">all changes</strong> in
-                the workspace, including files not created by this thread. No model is used to write
-                these defaults.
+                the workspace, including files not created by this thread.
               </p>
             </>
           ) : null}
@@ -270,6 +261,10 @@ export default function ShipSidebar({
       </SheetPopup>
     </Sheet>
   );
+}
+
+function describePullRequestPrompt(pullRequest: ShipResult["pullRequest"]) {
+  return `Write the description for PR #${pullRequest.number} (${pullRequest.url}) using the show-me skill's visual PR workflow.`;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
