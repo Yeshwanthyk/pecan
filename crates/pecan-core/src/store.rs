@@ -127,11 +127,6 @@ impl StateStore {
                 title         TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS ui_plugin (
-                plugin_id     TEXT PRIMARY KEY,
-                enabled       INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS device (
                 id              TEXT PRIMARY KEY,
                 name            TEXT NOT NULL,
@@ -412,36 +407,6 @@ impl StateStore {
         Ok(map)
     }
 
-    /// Enables or disables one allowlisted UI projection.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Sql`] when the write fails.
-    pub fn set_ui_plugin_enabled(&self, plugin_id: &str, enabled: bool) -> Result<()> {
-        let now = now_millis();
-        self.conn.execute(
-            "INSERT INTO ui_plugin (plugin_id, enabled, updated_at_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT(plugin_id) DO UPDATE SET
-                 enabled = excluded.enabled,
-                 updated_at_ms = excluded.updated_at_ms",
-            rusqlite::params![plugin_id, i64::from(enabled), now],
-        )?;
-        Ok(())
-    }
-
-    /// Whether an allowlisted UI projection is enabled.
-    ///
-    /// Missing rows are disabled by default so discovery never opts a plugin in.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Sql`] when the read fails.
-    pub fn is_ui_plugin_enabled(&self, plugin_id: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT COALESCE((SELECT enabled FROM ui_plugin WHERE plugin_id = ?1), 0)",
-            [plugin_id],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?)
-    }
-
     /// Records a newly paired device.
     ///
     /// # Errors
@@ -703,16 +668,6 @@ mod tests {
             store.titles().expect("titles").get("sid-1").map(String::as_str),
             Some("Fix session recovery")
         );
-    }
-
-    #[test]
-    fn ui_plugins_are_opt_in_and_persist_disablement() {
-        let store = StateStore::open_in_memory().expect("open");
-        assert!(!store.is_ui_plugin_enabled("pi-tasks").expect("default"));
-        store.set_ui_plugin_enabled("pi-tasks", true).expect("enable");
-        assert!(store.is_ui_plugin_enabled("pi-tasks").expect("enabled"));
-        store.set_ui_plugin_enabled("pi-tasks", false).expect("disable");
-        assert!(!store.is_ui_plugin_enabled("pi-tasks").expect("disabled"));
     }
 
     #[test]

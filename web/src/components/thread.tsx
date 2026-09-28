@@ -6,22 +6,24 @@
  */
 import {
   ActivityIcon,
+  ArrowUpRightIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CircleAlertIcon,
   CornerDownLeftIcon,
   MessageCircleQuestionIcon,
 } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import type { DatedEntry, ThreadEntry, ThreadView, ToolCall } from "~/api/types";
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
+import type { DatedEntry, SessionRow, ThreadEntry, ThreadView, ToolCall } from "~/api/types";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/components/ui/collapsible";
 import { Spinner } from "~/components/ui/spinner";
 import { DiffBlock } from "~/components/diff-block";
 import { ChatMarkdown } from "~/components/markdown";
 import { CopyButton } from "~/components/copy-button";
 import { TaskListPanel, WorkflowListPanel } from "~/components/extension-ui";
+import { api } from "~/api/client";
 import { useApp } from "~/store";
-import { shortModel } from "~/lib/format";
+import { agentTitle, shortModel } from "~/lib/format";
 import { cn } from "~/lib/utils";
 
 const OPEN_TURNS = 3;
@@ -46,9 +48,133 @@ const TOOL_CATEGORY_LABELS: Record<ToolCategory, string> = {
   other: "Other",
 };
 
+/** A `subagent_spawn` tool call resolved to the child session it produced. */
+type SpawnLink = { childId: string; parentId: string };
+
+/** Keyed by `toolCallId`; empty outside a `Thread` that found any spawns. */
+const SpawnLinksContext = createContext<Map<string, SpawnLink>>(new Map());
+
+function parseSpawnDetails(details: unknown): { title: string; cwd: string } | null {
+  if (typeof details !== "object" || details === null) return null;
+  const record = details as Record<string, unknown>;
+  const { title, cwd } = record;
+  if (typeof title !== "string" || typeof cwd !== "string") return null;
+  return { title, cwd };
+}
+
+/**
+ * Resolves each `subagent_spawn` tool call in this thread to the child
+ * session row it produced, so the tool row can link straight to it.
+ *
+ * Pi's toolResult carries the spawn's title/cwd but never a session id, and
+ * the subagent-manager's spawn-id counter is reused across spawn rounds, so
+ * the same title can legitimately be spawned more than once in one thread.
+ * Matching goes through the same title+cwd+recency claiming `SubagentStrip`
+ * uses for live activity: each session row is claimed by at most one call,
+ * closest by open time, so a repeated title can't link two calls to the
+ * same child or vice versa. `cwd` here is the exact cwd recorded on that
+ * spawn (not the parent's own cwd) since a child can run in a different
+ * cwd than its parent.
+ */
+function resolveSpawnChildren(
+  entries: DatedEntry[],
+  sessions: SessionRow[],
+  parentId: string,
+): Map<string, SpawnLink> {
+  const spawns: Array<{ toolCallId: string; title: string; cwd: string; ts: number }> = [];
+  for (const dated of entries) {
+    if (dated.entry.kind !== "assistant") continue;
+    const ts = dated.ts ? Date.parse(dated.ts) : Number.NaN;
+    for (const tool of dated.entry.tools ?? []) {
+      if (tool.name !== "subagent_spawn") continue;
+      const spawn = parseSpawnDetails(tool.details);
+      if (spawn) spawns.push({ toolCallId: tool.toolCallId, ts, ...spawn });
+    }
+  }
+  if (spawns.length === 0) return new Map();
+
+  const candidates = sessions.filter((row) => row.kind === "subagent");
+  const claimed = new Set<string>();
+  const links = new Map<string, SpawnLink>();
+  for (const spawn of spawns) {
+    const title = agentTitle(spawn.title);
+    const match = candidates
+      .filter(
+        (row) =>
+          !claimed.has(row.id) &&
+          row.cwd === spawn.cwd &&
+          agentTitle(row.agentName ?? "") === title &&
+          (!Number.isFinite(spawn.ts) ||
+            !Number.isFinite(Date.parse(row.openedAt)) ||
+            Date.parse(row.openedAt) >= spawn.ts),
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(Date.parse(a.openedAt) - spawn.ts) -
+          Math.abs(Date.parse(b.openedAt) - spawn.ts),
+      )[0];
+    if (match) {
+      claimed.add(match.id);
+      links.set(spawn.toolCallId, { childId: match.id, parentId });
+    }
+  }
+  return links;
+}
+
+/** Distinct cwds this thread's `subagent_spawn` calls ran in. */
+function spawnCwds(entries: DatedEntry[]): string[] {
+  const cwds = new Set<string>();
+  for (const dated of entries) {
+    if (dated.entry.kind !== "assistant") continue;
+    for (const tool of dated.entry.tools ?? []) {
+      if (tool.name !== "subagent_spawn") continue;
+      const spawn = parseSpawnDetails(tool.details);
+      if (spawn) cwds.add(spawn.cwd);
+    }
+  }
+  return [...cwds].sort();
+}
+
+/**
+ * Store sessions plus the subagent rows for every cwd this thread spawned
+ * into. The store's page lists threads first and caps its size, so older
+ * children (or children in unlinked folders) are usually missing from it.
+ */
+function useSpawnCandidates(entries: DatedEntry[]): SessionRow[] {
+  const sessions = useApp((state) => state.sessions);
+  const key = spawnCwds(entries).join("\n");
+  const [fetched, setFetched] = useState<SessionRow[]>([]);
+
+  useEffect(() => {
+    if (key === "") return;
+    let cancelled = false;
+    Promise.all(
+      key.split("\n").map((project) =>
+        api.sessions({ project, kind: "subagent", limit: 400 }),
+      ),
+    )
+      .then((pages) => {
+        if (!cancelled) setFetched(pages.flatMap((page) => page.sessions));
+      })
+      .catch(() => {
+        // Links fall back to whatever the store already holds.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [key]);
+
+  return useMemo(() => {
+    if (fetched.length === 0) return sessions;
+    const seen = new Set(sessions.map((row) => row.id));
+    return [...sessions, ...fetched.filter((row) => !seen.has(row.id))];
+  }, [sessions, fetched]);
+}
+
 export function Thread({ data }: { data: ThreadView }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
+  const sessions = useSpawnCandidates(data.entries);
 
   // Keep newest content in view only when the reader hasn't scrolled up.
   useEffect(() => {
@@ -60,6 +186,10 @@ export function Thread({ data }: { data: ThreadView }) {
   const turns = useMemo(() => buildTurns(data.entries), [data.entries]);
   const foldCount = Math.max(0, turns.length - OPEN_TURNS);
   const openTurns = turns.slice(foldCount);
+  const spawnLinks = useMemo(
+    () => resolveSpawnChildren(data.entries, sessions, data.summary.id),
+    [data.entries, sessions, data.summary.id],
+  );
 
   return (
     <div
@@ -72,16 +202,18 @@ export function Thread({ data }: { data: ThreadView }) {
       }}
       ref={scrollRef}
     >
-      <div className="mx-auto w-full max-w-[46rem] px-4 pt-4 pb-6 md:px-6" role="log">
-        {turns.length === 0 ? <BlankThread cwd={data.summary.cwd} /> : null}
-        {foldCount > 0 ? <FoldedTurns turns={turns.slice(0, foldCount)} /> : null}
-        {openTurns.map((turn) => (
-          <TurnBlock key={turn.key} turn={turn} />
-        ))}
-        <StreamingDraft sessionId={data.summary.id} />
-        <Panels data={data} />
-        <div className="h-2" />
-      </div>
+      <SpawnLinksContext.Provider value={spawnLinks}>
+        <div className="mx-auto w-full max-w-[46rem] px-4 pt-4 pb-6 md:px-6" role="log">
+          {turns.length === 0 ? <BlankThread cwd={data.summary.cwd} /> : null}
+          {foldCount > 0 ? <FoldedTurns turns={turns.slice(0, foldCount)} /> : null}
+          {openTurns.map((turn) => (
+            <TurnBlock key={turn.key} turn={turn} />
+          ))}
+          <StreamingDraft sessionId={data.summary.id} />
+          <Panels data={data} />
+          <div className="h-2" />
+        </div>
+      </SpawnLinksContext.Provider>
     </div>
   );
 }
@@ -267,9 +399,15 @@ function ToolActivity({ tools }: { tools: ToolCall[] }) {
       ? (firstSummary ?? "Tool activity")
       : `${tools.length} actions${firstSummary ? ` · ${firstSummary}` : ""}`;
   const only = tools.length === 1 ? tools[0] : undefined;
+  const [open, setOpen] = useState(false);
+  const spawnLinks = useContext(SpawnLinksContext);
+  const spawned = tools.flatMap((tool) => {
+    const link = spawnLinks.get(tool.toolCallId);
+    return link ? [{ tool, link }] : [];
+  });
   if (only) return <ToolAction lead tool={only} />;
   return (
-    <Collapsible className="my-0.5 min-w-0" defaultOpen={false}>
+    <Collapsible className="my-0.5 min-w-0" onOpenChange={setOpen} open={open}>
       <CollapsibleTrigger
         aria-label={`Show ${tools.length} tool ${tools.length === 1 ? "action" : "actions"}`}
         className="group -ms-1.5 flex min-h-11 max-w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-7"
@@ -278,6 +416,13 @@ function ToolActivity({ tools }: { tools: ToolCall[] }) {
         <span className="min-w-0 truncate">{title}</span>
         <ChevronRightIcon className="size-3.5 shrink-0 opacity-0 transition-[rotate,opacity] duration-200 group-hover:opacity-70 group-focus-visible:opacity-70 group-data-[panel-open]:rotate-90 group-data-[panel-open]:opacity-70 max-md:opacity-70" />
       </CollapsibleTrigger>
+      {!open && spawned.length > 0 ? (
+        <div className="ms-5 flex flex-wrap gap-1.5 pb-1">
+          {spawned.map(({ tool, link }) => (
+            <SpawnChip key={tool.toolCallId} label={spawnLabel(tool)} link={link} />
+          ))}
+        </div>
+      ) : null}
       <CollapsibleContent className="ease-[cubic-bezier(0.2,0,0,1)]">
         <div className="ms-[5px] mt-0.5 mb-1 border-s ps-3">
           {groups.map((group) => (
@@ -286,6 +431,25 @@ function ToolActivity({ tools }: { tools: ToolCall[] }) {
         </div>
       </CollapsibleContent>
     </Collapsible>
+  );
+}
+
+function spawnLabel(tool: ToolCall): string {
+  const title = parseSpawnDetails(tool.details)?.title;
+  return title ? agentTitle(title) : "subagent";
+}
+
+/** Compact jump into a spawned child's thread. */
+function SpawnChip({ label, link }: { label: string; link: SpawnLink }) {
+  return (
+    <a
+      className="flex h-7 max-w-full min-w-0 items-center gap-1 rounded-full border bg-card px-2.5 text-[12px] text-foreground/80 outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring max-md:h-9"
+      href={`#/s/${link.childId}?parent=${encodeURIComponent(link.parentId)}`}
+      title="Open the subagent's thread"
+    >
+      <span className="truncate">{label}</span>
+      <ArrowUpRightIcon className="size-3 shrink-0 opacity-60" />
+    </a>
   );
 }
 
@@ -323,19 +487,32 @@ function ToolActivityGroup({ group, labelled }: { group: ToolGroup; labelled: bo
 function ToolAction({ tool, lead = false }: { tool: ToolCall; lead?: boolean }) {
   const body = previewBody(tool.argsPreview);
   const diff = looksLikeDiff(body);
+  const spawnLink = useContext(SpawnLinksContext).get(tool.toolCallId);
   return (
     <Collapsible className={lead ? "my-0.5 min-w-0" : undefined}>
-      <CollapsibleTrigger
-        className={cn(
-          "group flex min-h-11 max-w-full min-w-0 items-center gap-1.5 rounded-md text-left text-[13px] outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-7",
-          lead ? "text-muted-foreground" : "text-foreground/80",
-        )}
-        title={tool.summary}
-      >
-        {lead ? <ActivityIcon className="size-3.5 shrink-0 opacity-70" /> : null}
-        <span className="min-w-0 truncate">{tool.summary}</span>
-        <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground transition-transform duration-200 group-data-[panel-open]:rotate-90" />
-      </CollapsibleTrigger>
+      <div className="flex min-w-0 items-center">
+        <CollapsibleTrigger
+          className={cn(
+            "group flex min-h-11 max-w-full min-w-0 flex-1 items-center gap-1.5 rounded-md text-left text-[13px] outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:min-h-7",
+            lead ? "text-muted-foreground" : "text-foreground/80",
+          )}
+          title={tool.summary}
+        >
+          {lead ? <ActivityIcon className="size-3.5 shrink-0 opacity-70" /> : null}
+          <span className="min-w-0 truncate">{tool.summary}</span>
+          <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground transition-transform duration-200 group-data-[panel-open]:rotate-90" />
+        </CollapsibleTrigger>
+        {spawnLink ? (
+          <a
+            className="flex shrink-0 items-center gap-1 rounded-md px-2 text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            href={`#/s/${spawnLink.childId}?parent=${encodeURIComponent(spawnLink.parentId)}`}
+            title="Open the spawned session's thread"
+          >
+            Open thread
+            <ArrowUpRightIcon className="size-3" />
+          </a>
+        ) : null}
+      </div>
       <CollapsibleContent className="ease-[cubic-bezier(0.2,0,0,1)]">
         <div className={cn("pb-2 pe-1", lead && "ms-[5px] mt-0.5 border-s ps-3")}>
           {tool.targetCount > 0 ? (

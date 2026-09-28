@@ -119,7 +119,7 @@ await step("load", async () => {
 });
 
 await step("new-session", async () => {
-  await page.getByTestId("empty-new-session").first().click();
+  await page.getByTestId("home-send").click();
   await page.getByTestId("composer-input").waitFor({ timeout: STEP_TIMEOUT });
   await page.getByText("New session").first().waitFor({ timeout: STEP_TIMEOUT });
   return noHorizontalScroll();

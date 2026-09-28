@@ -17,3 +17,23 @@ export function agentTitle(name: string): string {
   const match = /^(\S+?): ([\s\S]*)$/.exec(name);
   return (match?.[2] ?? name).trim();
 }
+
+/** Compact activity time: "now", "12m", "14:05" today, "3d", then "9/14". */
+export function timeLabel(iso: string) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const seconds = Math.max(0, (Date.now() - date.getTime()) / 1000);
+  if (seconds < 3600) {
+    if (seconds < 90) return "now";
+    return `${Math.round(seconds / 60)}m`;
+  }
+  if (date.toDateString() === new Date().toDateString()) {
+    return date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  }
+  if (seconds < 86_400 * 7) return `${Math.round(seconds / 86_400)}d`;
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}

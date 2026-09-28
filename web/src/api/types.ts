@@ -56,15 +56,19 @@ export const Project = Object({
 });
 export type Project = Static<typeof Project>;
 
-export const UiPlugin = Object({
-  id: String(),
-  name: String(),
-  description: String(),
-  detected: Boolean(),
-  sourceEnabled: Boolean(),
-  enabled: Boolean(),
+export const FolderPick = Object({
+  home: Union([String(), Null()]),
+  known: Array(
+    Object({
+      path: String(),
+      name: String(),
+      sessions: Number(),
+      lastActivity: String(),
+    }),
+  ),
+  entries: Array(Object({ path: String(), name: String() })),
 });
-type UiPlugin = Static<typeof UiPlugin>;
+export type FolderPick = Static<typeof FolderPick>;
 
 export const WorkspaceDiff = Object({
   branch: Union([String(), Null()]),
@@ -126,7 +130,6 @@ export const Bootstrap = Object({
   ]),
   projects: Array(Project),
   sessions: Array(SessionRow),
-  uiPlugins: Array(UiPlugin),
 });
 export type Bootstrap = Static<typeof Bootstrap>;
 

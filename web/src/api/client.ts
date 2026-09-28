@@ -16,14 +16,18 @@ import {
 } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 
-import { readLocalStorage, readSessionStorage, writeLocalStorage, writeSessionStorage } from "~/lib/storage";
+import {
+  readLocalStorage,
+  readSessionStorage,
+  writeLocalStorage,
+  writeSessionStorage,
+} from "~/lib/storage";
 
 import * as types from "./types";
 
 export type TitleModelPreset = "luna-low" | "luna-medium" | "sol-low";
 
 const TITLE_MODEL_PRESET_KEY = "pecan:title-model-preset";
-const AI_TITLE_GENERATION_KEY = "pecan:ai-title-generation";
 const SHIP_TOKEN_KEY = "pecan:ship-token";
 const TITLE_MODEL_PRESETS = new Set<TitleModelPreset>([
   "luna-low",
@@ -40,18 +44,6 @@ export function readTitleModelPreset(): TitleModelPreset {
 
 export function saveTitleModelPreset(preset: TitleModelPreset) {
   writeLocalStorage(TITLE_MODEL_PRESET_KEY, preset);
-}
-
-/** AI title generation is opt-in so browsing sessions never spend model tokens. */
-export function readAiTitleGenerationEnabled(): boolean {
-  return readLocalStorage(AI_TITLE_GENERATION_KEY) === "true";
-}
-
-export function saveAiTitleGenerationEnabled(enabled: boolean) {
-  writeLocalStorage(AI_TITLE_GENERATION_KEY, String(enabled));
-  window.dispatchEvent(
-    new CustomEvent("pecan:title-settings", { detail: { enabled } }),
-  );
 }
 
 export class ApiError extends Error {
@@ -100,7 +92,11 @@ async function request<T extends TSchema>(
     if (response.status === 401 && code === "unpaired") {
       window.dispatchEvent(new CustomEvent(UNPAIRED_EVENT));
     }
-    throw new ApiError(field("error") ?? response.statusText, response.status, code);
+    throw new ApiError(
+      field("error") ?? response.statusText,
+      response.status,
+      code,
+    );
   }
   const data: unknown = await response.json();
   if (!Value.Check(schema, data)) {
@@ -117,7 +113,9 @@ async function request<T extends TSchema>(
  * phone on plain LAN http does not have; `getRandomValues` works everywhere. */
 function newIdempotencyKey(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return globalThis.Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return globalThis.Array.from(bytes, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 }
 
 const RETRY_DELAYS_MS = [400, 1200, 3000];
@@ -140,7 +138,10 @@ async function postOnce<T extends TSchema>(
     return await request("POST", path, schema, body, undefined, key);
   } catch (error) {
     const inFlight =
-      attempt > 0 && error instanceof ApiError && error.status === 409 && /Idempotency-Key/.test(error.message);
+      attempt > 0 &&
+      error instanceof ApiError &&
+      error.status === 409 &&
+      /Idempotency-Key/.test(error.message);
     const retryable = error instanceof TypeError || inFlight;
     const delay = RETRY_DELAYS_MS[attempt];
     if (!retryable || delay === undefined) throw error;
@@ -156,7 +157,11 @@ export function captureShipToken() {
   if (!token) return;
   writeSessionStorage(SHIP_TOKEN_KEY, token);
   url.searchParams.delete("ship-token");
-  history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  history.replaceState(
+    history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
 }
 
 /** Takes a one-time `?pair=` code off the URL (so reloads and shared links
@@ -166,7 +171,11 @@ export function takePairCode(): string | null {
   const code = url.searchParams.get("pair");
   if (!code) return null;
   url.searchParams.delete("pair");
-  history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  history.replaceState(
+    history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
   return code;
 }
 
@@ -178,9 +187,18 @@ export const api = {
   bootstrap: () => request("GET", "/api/bootstrap", types.Bootstrap),
   /** VAPID `applicationServerKey` and whether this device is subscribed. */
   pushKey: () =>
-    request("GET", "/api/push/key", Object({ publicKey: TString(), subscribed: Boolean() })),
+    request(
+      "GET",
+      "/api/push/key",
+      Object({ publicKey: TString(), subscribed: Boolean() }),
+    ),
   pushSubscribe: (endpoint: string) =>
-    request("PUT", "/api/push/subscription", Object({ subscribed: Boolean() }), { endpoint }),
+    request(
+      "PUT",
+      "/api/push/subscription",
+      Object({ subscribed: Boolean() }),
+      { endpoint },
+    ),
   pushUnsubscribe: () =>
     request("DELETE", "/api/push/subscription", Object({ removed: Boolean() })),
   /** Pushes a test notification to this device, even while it is open. */
@@ -194,16 +212,30 @@ export const api = {
   pair: (code: string) =>
     request("POST", "/api/pair", types.Paired, { code: code.trim() }),
   health: (refresh = false) =>
-    request("GET", refresh ? "/api/health?refresh=true" : "/api/health", types.Health),
-  sessions: (query: { project?: string; limit?: number }) => {
+    request(
+      "GET",
+      refresh ? "/api/health?refresh=true" : "/api/health",
+      types.Health,
+    ),
+  sessions: (query: {
+    project?: string;
+    limit?: number;
+    kind?: "normal" | "subagent";
+  }) => {
     const params = new URLSearchParams();
     if (query.project) params.set("project", query.project);
+    if (query.kind) params.set("kind", query.kind);
     params.set("limit", String(query.limit ?? 400));
     return request("GET", `/api/sessions?${params}`, types.SessionPage);
   },
-  thread: (id: string) => request("GET", `/api/session/${id}`, types.ThreadView),
+  thread: (id: string) =>
+    request("GET", `/api/session/${id}`, types.ThreadView),
   gitBranch: (id: string) =>
-    request("GET", `/api/session/${id}/git`, Object({ branch: Union([Null(), TString()]) })),
+    request(
+      "GET",
+      `/api/session/${id}/git`,
+      Object({ branch: Union([Null(), TString()]) }),
+    ),
   workspaceDiff: (id: string) =>
     request("GET", `/api/session/${id}/diff`, types.WorkspaceDiff),
   shipPlan: (id: string) =>
@@ -226,8 +258,10 @@ export const api = {
       { confirmed: true, ...input },
       "ship",
     ),
-  settle: async (id: string) => request("POST", `/api/session/${id}/settle`, Ack),
-  reopen: async (id: string) => request("DELETE", `/api/session/${id}/settle`, Ack),
+  settle: async (id: string) =>
+    request("POST", `/api/session/${id}/settle`, Ack),
+  reopen: async (id: string) =>
+    request("DELETE", `/api/session/${id}/settle`, Ack),
   pin: async (id: string) => request("POST", `/api/session/${id}/pin`, Ack),
   unpin: async (id: string) => request("DELETE", `/api/session/${id}/pin`, Ack),
   regenerateTitle: (
@@ -240,12 +274,16 @@ export const api = {
       Object({ title: TString() }),
       { preset },
     ),
+  /** Folder picker: known Pi folders plus child directories of `path`. */
+  folders: (path: string) =>
+    request(
+      "GET",
+      `/api/folders?${new URLSearchParams({ path })}`,
+      types.FolderPick,
+    ),
   addProject: (cwd: string) => request("POST", "/api/projects", Ack, { cwd }),
-  removeProject: (cwd: string) => request("DELETE", "/api/projects", Ack, { cwd }),
-  setUiPlugin: (id: string, enabled: boolean) =>
-    request("POST", `/api/ui-plugins/${encodeURIComponent(id)}`, types.UiPlugin, {
-      enabled,
-    }),
+  removeProject: (cwd: string) =>
+    request("DELETE", "/api/projects", Ack, { cwd }),
   attachAgent: (id: string) =>
     request("POST", `/api/session/${id}/agent-attach`, types.AgentSnapshot),
   newSession: (cwd: string) =>
@@ -277,11 +315,14 @@ export const api = {
     requestId: string,
     answer: { cancelled?: boolean; confirmed?: boolean; value?: string },
   ) =>
-    postOnce(
-      `/api/session/${id}/respond`,
-      Object({ responded: Boolean() }),
-      { requestId, ...answer },
-    ),
+    postOnce(`/api/session/${id}/respond`, Object({ responded: Boolean() }), {
+      requestId,
+      ...answer,
+    }),
   asks: (id: string) =>
-    request("GET", `/api/session/${id}/asks`, Object({ asks: Array(types.PendingAsk) })),
+    request(
+      "GET",
+      `/api/session/${id}/asks`,
+      Object({ asks: Array(types.PendingAsk) }),
+    ),
 };

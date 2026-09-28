@@ -5,6 +5,7 @@ mod api_errors;
 mod assets;
 mod auth;
 mod event_log;
+mod folders;
 mod git;
 mod health;
 mod idempotency;
@@ -13,7 +14,6 @@ mod push;
 mod ship;
 mod snapshot;
 mod title;
-mod ui_plugins;
 mod watcher;
 mod worker;
 

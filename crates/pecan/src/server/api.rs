@@ -13,12 +13,12 @@ use serde::Deserialize;
 use std::time::Duration;
 
 use super::auth::{self, Principal};
+use super::folders;
 use super::git;
 use super::push;
 use super::ship;
 use super::snapshot::{App, IndexSnapshot, ServerEvent, SessionRow};
 use super::title;
-use super::ui_plugins;
 use super::worker::Workers;
 use crate::server::api_errors::{ApiError, json_body};
 
@@ -49,7 +49,7 @@ pub(crate) fn router(app: App, workers: Workers) -> Router {
         .route("/session/{id}/asks", get(pending_asks))
         .route("/session/{id}/title/regenerate", post(regenerate_title))
         .route("/projects", post(add_project).delete(remove_project))
-        .route("/ui-plugins/{id}", post(set_ui_plugin))
+        .route("/folders", get(folders))
         .route("/events", get(events))
         .route("/pair/code", post(auth::mint_code))
         .route("/devices", get(auth::list_devices))
@@ -79,7 +79,6 @@ async fn bootstrap(State(app): State<App>) -> Result<Json<serde_json::Value>, Ap
     let snap = app.snapshot().await;
     let store = lock(&app)?;
     let seeded = store.is_seeded()?;
-    let ui_plugins = ui_plugins::catalog(&app.paths, &store)?;
     let project_rows = if app.session_scope.is_some() {
         Vec::new()
     } else {
@@ -115,42 +114,7 @@ async fn bootstrap(State(app): State<App>) -> Result<Json<serde_json::Value>, Ap
         "sessionScope": app.session_scope,
         "projects": projects,
         "sessions": sessions,
-        "uiPlugins": ui_plugins,
     })))
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-struct SetUiPluginBody {
-    enabled: bool,
-}
-
-async fn set_ui_plugin(
-    State(app): State<App>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    body: Result<Json<SetUiPluginBody>, JsonRejection>,
-) -> Result<Json<ui_plugins::UiPluginDescriptor>, ApiError> {
-    if id != ui_plugins::PI_TASKS_ID {
-        return Err(ApiError::not_found("unknown UI plugin"));
-    }
-    let body = json_body(body)?;
-    let descriptor = {
-        let store = lock(&app)?;
-        let current = ui_plugins::catalog(&app.paths, &store)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ApiError::not_found("unknown UI plugin"))?;
-        if body.enabled && (!current.detected || !current.source_enabled) {
-            return Err(ApiError::conflict("Pi Tasks must be installed and enabled in Pi first"));
-        }
-        store.set_ui_plugin_enabled(ui_plugins::PI_TASKS_ID, body.enabled)?;
-        ui_plugins::catalog(&app.paths, &store)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ApiError::not_found("unknown UI plugin"))?
-    };
-    app.refresh().await?;
-    Ok(Json(descriptor))
 }
 
 /// Page order for list views: threads before subagents (only reached via
@@ -205,6 +169,8 @@ async fn health(
 #[derive(Deserialize, Debug, Default)]
 struct SessionsQuery {
     project: Option<String>,
+    /// Only sessions of this kind, e.g. a thread's subagent children.
+    kind: Option<SessionKind>,
     offset: Option<usize>,
     limit: Option<usize>,
 }
@@ -236,6 +202,7 @@ async fn sessions(
         .sessions
         .iter()
         .filter(|row| query.project.as_deref().is_none_or(|p| row.summary.cwd == p))
+        .filter(|row| query.kind.is_none_or(|kind| row.summary.kind == kind))
         .filter(|row| added_cwds.as_ref().is_none_or(|cwds| cwds.contains(&row.summary.cwd)))
         .collect();
     matching.sort_by_key(|row| list_order(row));
@@ -812,21 +779,66 @@ async fn add_project(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_global_route(&app)?;
     let body = json_body(body)?;
-    if !body.cwd.starts_with('/') {
-        return Err(ApiError::bad_request("cwd must be absolute".into()));
+    let expanded = folders::expand_home(body.cwd.trim(), folders::home_dir().as_deref());
+    let cwd = expanded.trim_end_matches('/');
+    let cwd = if cwd.is_empty() { "/" } else { cwd };
+    if !cwd.starts_with('/') {
+        return Err(ApiError::bad_request("cwd must be an absolute path or start with ~/".into()));
+    }
+    if !tokio::fs::metadata(cwd).await.is_ok_and(|meta| meta.is_dir()) {
+        return Err(ApiError::bad_request(format!("{cwd} is not a folder on this machine")));
     }
     let snap = app.snapshot().await;
     let idle = pecan_core::session::idle_session_ids(
         snap.sessions.iter().map(|row| &row.summary),
-        &body.cwd,
+        cwd,
         jiff::Timestamp::now(),
     );
     {
         let store = lock(&app)?;
-        store.add_project(&body.cwd, idle)?;
+        store.add_project(cwd, idle)?;
     }
     app.refresh().await?;
     Ok(Json(serde_json::json!({"added": true})))
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct FoldersQuery {
+    #[serde(default)]
+    path: String,
+}
+
+/// Folder picker: known Pi session folders (filtered by the typed text) and,
+/// for an absolute or `~` path, the matching child directories.
+async fn folders(
+    State(app): State<App>,
+    axum::extract::Query(query): axum::extract::Query<FoldersQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_global_route(&app)?;
+    let home = folders::home_dir();
+    let typed = query.path.trim();
+    let expanded = folders::expand_home(typed, home.as_deref());
+    let snap = app.snapshot().await;
+    let linked_cwds = {
+        let store = lock(&app)?;
+        store
+            .projects()?
+            .into_iter()
+            .filter(|(_, pref)| pref.added)
+            .map(|(cwd, _)| cwd)
+            .collect::<Vec<_>>()
+    };
+    let linked: std::collections::HashSet<&str> = linked_cwds.iter().map(String::as_str).collect();
+    let filter = if expanded.starts_with('/') { expanded.as_str() } else { typed };
+    let known = folders::known_folders(snap.sessions.iter(), &linked, filter);
+    let entries =
+        if expanded.starts_with('/') { folders::complete(expanded).await } else { Vec::new() };
+    Ok(Json(serde_json::json!({
+        "home": home.map(|home| home.to_string_lossy().into_owned()),
+        "known": known,
+        "entries": entries,
+    })))
 }
 
 async fn remove_project(

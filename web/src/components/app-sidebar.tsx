@@ -23,7 +23,8 @@ import {
   type ReactNode,
 } from "react";
 
-import { api, readAiTitleGenerationEnabled } from "~/api/client";
+import { api } from "~/api/client";
+import { timeLabel } from "~/lib/format";
 import type { SessionRow as SessionRowData } from "~/api/types";
 import { reportError } from "~/lib/errors";
 import {
@@ -37,6 +38,7 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarTrigger,
 } from "~/components/ui/sidebar";
 import {
   AddProjectForm,
@@ -54,11 +56,14 @@ const MAX_SETTLED_ROWS = 50;
 
 export function AppSidebar() {
   return (
-    <Sidebar collapsible="offcanvas">
-      <SidebarHeader className="min-h-12 flex-row items-center gap-2 px-4 pt-3 pb-1">
+    <Sidebar collapsible="offcanvas" variant="inset">
+      <SidebarHeader className="h-14 flex-row items-center gap-2 py-0 ps-3.5 pe-1">
         <BrandMark />
         <span className="text-sm font-semibold tracking-[-0.01em]">Pecan</span>
-        <ConnectionStatus />
+        <span className="ms-auto flex items-center gap-1">
+          <ConnectionStatus />
+          <SidebarTrigger className="hidden text-sidebar-muted-foreground md:inline-flex" />
+        </span>
       </SidebarHeader>
       <SidebarContent className="gap-0 px-1">
         <PrimaryNav />
@@ -86,24 +91,25 @@ export function BrandMark({ className }: { className?: string }) {
   );
 }
 
+/** Silent while live; a small amber pill only when the event stream drops. */
 function ConnectionStatus() {
   const connected = useApp((state) => state.connected);
   return (
-    <span
-      className="ml-auto flex items-center gap-1.5 text-[11px] font-medium text-sidebar-muted-foreground"
-      role="status"
-      title={connected ? "Live updates connected" : "Reconnecting…"}
-    >
-      <span
-        aria-hidden
-        className={cn(
-          "size-2 rounded-full",
-          connected ? "bg-success/80" : "animate-pulse bg-warning",
-        )}
-      />
-      <span className={connected ? "sr-only" : undefined}>
-        {connected ? "Live" : "Reconnecting"}
-      </span>
+    <span role="status">
+      {connected ? (
+        <span className="sr-only">Live</span>
+      ) : (
+        <span
+          className="flex animate-toast-in items-center gap-1.5 rounded-full bg-warning/12 px-2 py-0.5 text-[11px] font-medium text-sidebar-muted-foreground"
+          title="Live updates reconnecting…"
+        >
+          <span
+            aria-hidden
+            className="size-1.5 animate-pulse rounded-full bg-warning"
+          />
+          Reconnecting
+        </span>
+      )}
     </span>
   );
 }
@@ -185,7 +191,12 @@ function SessionTree() {
           <GroupHeading>Pinned</GroupHeading>
           <SidebarMenu>
             {pinned.map((row, index) => (
-              <SessionRow key={row.id} active={row.id === activeId} index={index} row={row} />
+              <SessionRow
+                key={row.id}
+                active={row.id === activeId}
+                index={index}
+                row={row}
+              />
             ))}
           </SidebarMenu>
         </SidebarGroup>
@@ -204,7 +215,9 @@ function SessionTree() {
         <SidebarGroupContent>
           <Collapse open={adding}>
             <div className="px-1 pt-1 pb-2">
-              {adding ? <AddProjectForm onDone={() => setAdding(false)} /> : null}
+              {adding ? (
+                <AddProjectForm onDone={() => setAdding(false)} />
+              ) : null}
             </div>
           </Collapse>
           <SidebarMenu className="gap-0.5">
@@ -215,7 +228,10 @@ function SessionTree() {
                 open={!collapsed.has(project.cwd)}
                 project={project}
               >
-                <ProjectSessions activeId={activeId} rows={byProject.get(project.cwd) ?? []} />
+                <ProjectSessions
+                  activeId={activeId}
+                  rows={byProject.get(project.cwd) ?? []}
+                />
               </ProjectFolder>
             ))}
             {projects.length === 0 && !adding ? (
@@ -236,7 +252,12 @@ function GroupHeading({
   action,
 }: {
   children: ReactNode;
-  action?: { icon: LucideIcon; label: string; pressed: boolean; onClick: () => void };
+  action?: {
+    icon: LucideIcon;
+    label: string;
+    pressed: boolean;
+    onClick: () => void;
+  };
 }) {
   return (
     <div className="flex min-h-9 items-center px-2">
@@ -270,12 +291,19 @@ function ProjectSessions({
   const [expanded, setExpanded] = useState(false);
   // Keep the open session visible even when it sits past the cap.
   const activeIndex = rows.findIndex((row) => row.id === activeId);
-  const limit = expanded ? rows.length : Math.max(MAX_PROJECT_ROWS, activeIndex + 1);
+  const limit = expanded
+    ? rows.length
+    : Math.max(MAX_PROJECT_ROWS, activeIndex + 1);
   const hidden = rows.length - limit;
   return (
     <SidebarMenu className="ps-2.5 pt-0.5 pb-1.5">
       {rows.slice(0, limit).map((row, index) => (
-        <SessionRow key={row.id} active={row.id === activeId} index={index} row={row} />
+        <SessionRow
+          key={row.id}
+          active={row.id === activeId}
+          index={index}
+          row={row}
+        />
       ))}
       {rows.length === 0 ? (
         <li className="px-[var(--sidebar-row-content-inset)] py-1 ps-[calc(var(--sidebar-row-content-inset)+14px)] text-xs text-sidebar-muted-foreground/80">
@@ -345,24 +373,17 @@ function SessionRow({
   index?: number;
 }) {
   const waiting = useApp(
-    (state) => row.waitingAskuser || (state.pendingAsks[row.id]?.length ?? 0) > 0,
+    (state) =>
+      row.waitingAskuser || (state.pendingAsks[row.id]?.length ?? 0) > 0,
   );
   const running = useApp(
-    (state) => !waiting && state.streaming && state.thread?.summary.id === row.id,
+    (state) =>
+      !waiting && state.streaming && state.thread?.summary.id === row.id,
   );
   const [titlePending, setTitlePending] = useState(false);
-  const [aiTitlesEnabled, setAiTitlesEnabled] = useState(
-    readAiTitleGenerationEnabled,
-  );
   const titleAction = row.title
     ? "Regenerate title with AI (uses tokens)"
     : "Generate title with AI (uses tokens)";
-
-  useEffect(() => {
-    const sync = () => setAiTitlesEnabled(readAiTitleGenerationEnabled());
-    window.addEventListener("pecan:title-settings", sync);
-    return () => window.removeEventListener("pecan:title-settings", sync);
-  }, []);
 
   async function togglePin() {
     try {
@@ -370,7 +391,9 @@ function SessionRow({
       else await api.pin(row.id);
       window.dispatchEvent(new CustomEvent("pecan:refresh"));
     } catch (error) {
-      reportError(error instanceof Error ? error.message : "Failed to update pin.");
+      reportError(
+        error instanceof Error ? error.message : "Failed to update pin.",
+      );
     }
   }
 
@@ -423,7 +446,9 @@ function SessionRow({
           >
             {row.title ?? row.preview ?? row.id.slice(0, 8)}
           </span>
-          {waiting ? <span className="sr-only">Waiting for your answer</span> : null}
+          {waiting ? (
+            <span className="sr-only">Waiting for your answer</span>
+          ) : null}
           {running ? <span className="sr-only">Working</span> : null}
           <span
             className={cn(
@@ -437,25 +462,23 @@ function SessionRow({
         </span>
       </NavHashLink>
       <span className="flex shrink-0 items-center pe-0.5 md:absolute md:inset-y-0 md:end-0 md:pe-1">
-        {aiTitlesEnabled ? (
-          <button
-            aria-label={titleAction}
-            className={cn(
-              "flex size-11 items-center justify-center rounded-md text-sidebar-muted-foreground outline-none hover:bg-sidebar-row-active hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring md:pointer-events-none md:size-7 md:opacity-0 md:group-focus-within/row:pointer-events-auto md:group-focus-within/row:opacity-100 md:group-hover/row:pointer-events-auto md:group-hover/row:opacity-100",
-              titlePending && "md:pointer-events-auto md:opacity-100",
-            )}
-            disabled={titlePending}
-            onClick={() => void generateTitle()}
-            title={titleAction}
-            type="button"
-          >
-            {titlePending ? (
-              <LoaderCircleIcon className="size-3.5 animate-spin" />
-            ) : (
-              <RefreshCwIcon className="size-3.5" />
-            )}
-          </button>
-        ) : null}
+        <button
+          aria-label={titleAction}
+          className={cn(
+            "flex size-11 items-center justify-center rounded-md text-sidebar-muted-foreground outline-none hover:bg-sidebar-row-active hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring md:pointer-events-none md:size-7 md:opacity-0 md:group-focus-within/row:pointer-events-auto md:group-focus-within/row:opacity-100 md:group-hover/row:pointer-events-auto md:group-hover/row:opacity-100",
+            titlePending && "md:pointer-events-auto md:opacity-100",
+          )}
+          disabled={titlePending}
+          onClick={() => void generateTitle()}
+          title={titleAction}
+          type="button"
+        >
+          {titlePending ? (
+            <LoaderCircleIcon className="size-3.5 animate-spin" />
+          ) : (
+            <RefreshCwIcon className="size-3.5" />
+          )}
+        </button>
         <button
           aria-label={row.pinned ? "Unpin session" : "Pin session"}
           className={cn(
@@ -480,7 +503,13 @@ function SessionRow({
 }
 
 /** Pulsing green while Pi works, amber while it waits on you, quiet otherwise. */
-function StatusDot({ running, waiting }: { running: boolean; waiting: boolean }) {
+function StatusDot({
+  running,
+  waiting,
+}: {
+  running: boolean;
+  waiting: boolean;
+}) {
   return (
     <span aria-hidden className="relative flex size-1.5 shrink-0">
       {running || waiting ? (
@@ -494,7 +523,11 @@ function StatusDot({ running, waiting }: { running: boolean; waiting: boolean })
       <span
         className={cn(
           "relative size-1.5 rounded-full transition-colors duration-300",
-          running ? "bg-success" : waiting ? "bg-warning" : "bg-sidebar-muted-foreground/35",
+          running
+            ? "bg-success"
+            : waiting
+              ? "bg-warning"
+              : "bg-sidebar-muted-foreground/35",
         )}
       />
     </span>
@@ -537,23 +570,4 @@ export function useHash(): string {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   return hash;
-}
-
-function timeLabel(iso: string) {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "";
-  const seconds = Math.max(0, (Date.now() - date.getTime()) / 1000);
-  if (seconds < 3600) {
-    if (seconds < 90) return "now";
-    return `${Math.round(seconds / 60)}m`;
-  }
-  if (date.toDateString() === new Date().toDateString()) {
-    return date.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  }
-  if (seconds < 86_400 * 7) return `${Math.round(seconds / 86_400)}d`;
-  return `${date.getMonth() + 1}/${date.getDate()}`;
 }

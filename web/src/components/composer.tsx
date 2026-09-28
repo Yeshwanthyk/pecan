@@ -426,8 +426,10 @@ export function Composer({
                   }
                 >
                   <span className="truncate">
-                    <span className="hidden sm:inline">Thinking </span>
-                    {thinking}
+                    <span className="hidden sm:inline">
+                      Thinking {thinking}
+                    </span>
+                    <span className="sm:hidden">{shortThinking(thinking)}</span>
                   </span>
                   <ChevronDownIcon className="size-3 opacity-60" />
                 </PopoverTrigger>
@@ -464,8 +466,7 @@ export function Composer({
             <div className="ms-auto flex shrink-0 items-center gap-0.5">
               {streaming ? (
                 <>
-                  <SendModeChip active={sendMode === "steer"} mode="steer" />
-                  <SendModeChip active={sendMode === "queue"} mode="queue" />
+                  <SendModeToggle mode={sendMode} />
                   <Button
                     aria-label={
                       sendMode === "steer" ? "Steer agent" : "Queue message"
@@ -684,10 +685,22 @@ function ModelPicker({
   );
 }
 
+/** Phone label for a thinking level: "medium" → "med", "xhigh" → "xhigh". */
+function shortThinking(level: string): string {
+  return level === "medium" ? "med" : level === "minimal" ? "min" : level;
+}
+
 function ContextMeter({ percent }: { percent: number }) {
   const clamped = Math.min(100, Math.max(0, Math.round(percent)));
   return (
-    <span className="flex shrink-0 items-center gap-1 tabular-nums">
+    <span
+      className={cn(
+        "shrink-0 items-center gap-1 tabular-nums",
+        // Phones only need the meter once the window is nearly full.
+        clamped >= 80 ? "flex text-warning" : "hidden sm:flex",
+      )}
+      title={`${clamped}% of the context window used`}
+    >
       <span className="hidden h-[3px] w-12 overflow-hidden rounded-full bg-border sm:block">
         <span
           className={cn(
@@ -702,25 +715,22 @@ function ContextMeter({ percent }: { percent: number }) {
   );
 }
 
-function SendModeChip({
-  active,
-  mode,
-}: {
-  active: boolean;
-  mode: "steer" | "queue";
-}) {
+/** One chip that flips how a message sent mid-turn is delivered. */
+function SendModeToggle({ mode }: { mode: "steer" | "queue" }) {
   const setSendMode = useApp((state) => state.setSendMode);
+  const next = mode === "steer" ? "queue" : "steer";
   return (
     <Button
-      className="rounded-[var(--control-radius)]"
-      onClick={() => setSendMode(mode)}
+      aria-label={`Delivery: ${mode}. Switch to ${next}`}
+      className="rounded-[var(--control-radius)] px-2 font-normal text-muted-foreground hover:text-foreground"
+      onClick={() => setSendMode(next)}
       size="xs"
       title={
         mode === "steer"
-          ? "Deliver right after the current tool calls finish"
-          : "Wait until the agent finishes, then deliver"
+          ? "Steer: delivered right after the current tool calls finish. Tap to queue instead."
+          : "Queue: delivered once the agent finishes. Tap to steer instead."
       }
-      variant={active ? "secondary" : "ghost"}
+      variant="ghost"
     >
       {mode}
     </Button>

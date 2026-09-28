@@ -357,21 +357,17 @@ impl IndexSnapshot {
             // recent-agent fallback and never parses historical transcripts.
             link_parent_sessions(&mut rows);
         }
-        let tasks = if store_data.pi_tasks_enabled {
-            pecan_core::tasks::load_for_sessions(
-                rows.iter()
-                    .filter(|row| {
-                        store_data
-                            .added_cwds
-                            .as_ref()
-                            .is_none_or(|cwds| cwds.contains(&row.summary.cwd))
-                    })
-                    .map(|row| (row.summary.id.as_str(), row.summary.cwd.as_str())),
-                &paths.tasks_dir(),
-            )
-        } else {
-            HashMap::new()
-        };
+        let tasks = pecan_core::tasks::load_for_sessions(
+            rows.iter()
+                .filter(|row| {
+                    store_data
+                        .added_cwds
+                        .as_ref()
+                        .is_none_or(|cwds| cwds.contains(&row.summary.cwd))
+                })
+                .map(|row| (row.summary.id.as_str(), row.summary.cwd.as_str())),
+            &paths.tasks_dir(),
+        );
         Ok(Self { sessions: Arc::new(rows), tasks })
     }
 }
@@ -384,7 +380,6 @@ pub(crate) struct StoreData {
     titles: HashMap<String, String>,
     /// Added project cwds, only meaningful in global (non-scoped) mode.
     added_cwds: Option<HashSet<String>>,
-    pi_tasks_enabled: bool,
 }
 
 impl StoreData {
@@ -392,11 +387,7 @@ impl StoreData {
     ///
     /// # Errors
     /// Returns [`pecan_core::CoreError`] when the state store fails.
-    fn capture(
-        paths: &PiPaths,
-        store: &StateStore,
-        scope: Option<&SessionScope>,
-    ) -> pecan_core::Result<Self> {
+    fn capture(store: &StateStore, scope: Option<&SessionScope>) -> pecan_core::Result<Self> {
         let settled = store.settled()?;
         let pinned = store.pinned()?;
         let titles = store.titles()?;
@@ -412,8 +403,7 @@ impl StoreData {
                     .collect::<HashSet<_>>(),
             )
         };
-        let pi_tasks_enabled = crate::server::ui_plugins::pi_tasks_enabled(paths, store)?;
-        Ok(Self { settled, pinned, titles, added_cwds, pi_tasks_enabled })
+        Ok(Self { settled, pinned, titles, added_cwds })
     }
 }
 
@@ -545,7 +535,7 @@ impl App {
         // (potentially slow) filesystem scan and transcript parsing below.
         let store_data = {
             let store = self.store.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;
-            StoreData::capture(&paths, &store, scope.as_ref())?
+            StoreData::capture(&store, scope.as_ref())?
         };
         let built = tokio::task::spawn_blocking(move || {
             let mut scans = scans.lock().map_err(|_poisoned| CoreError::LockPoisoned)?;

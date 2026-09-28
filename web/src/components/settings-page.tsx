@@ -2,7 +2,6 @@
 import {
   BellIcon,
   FolderGit2Icon,
-  PanelsTopLeftIcon,
   MoonIcon,
   RadioIcon,
   SparklesIcon,
@@ -12,13 +11,10 @@ import { useState, type ReactNode } from "react";
 
 import {
   api,
-  readAiTitleGenerationEnabled,
   readTitleModelPreset,
-  saveAiTitleGenerationEnabled,
   saveTitleModelPreset,
   type TitleModelPreset,
 } from "~/api/client";
-import type { Bootstrap } from "~/api/types";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Switch } from "~/components/ui/switch";
@@ -61,10 +57,9 @@ import {
   type TextSize,
 } from "~/fonts";
 
-const EMPTY_PROJECTS: Array<{ cwd: string; name: string }> = [];
 // Selectors must return a stable value: a fresh `[]` per read makes zustand
 // re-render forever (React #185) whenever bootstrap is null.
-const EMPTY_PLUGINS: Bootstrap["uiPlugins"] = [];
+const EMPTY_PROJECTS: Array<{ cwd: string; name: string }> = [];
 const DEFAULT_TITLE_MODEL = {
   value: "luna-low",
   label: "Luna · Low",
@@ -94,14 +89,12 @@ export function SettingsPage() {
   const theme = useApp((state) => state.theme);
   const connected = useApp((state) => state.connected);
   const sessions = useApp((state) => state.sessions);
-  const projects = useApp((state) => state.bootstrap?.projects ?? EMPTY_PROJECTS);
-  const uiPlugins = useApp((state) => state.bootstrap?.uiPlugins ?? EMPTY_PLUGINS);
-  const [removing, setRemoving] = useState<string | null>(null);
-  const [changingPlugin, setChangingPlugin] = useState<string | null>(null);
-  const [aiTitlesEnabled, setAiTitlesEnabled] = useState(
-    readAiTitleGenerationEnabled,
+  const projects = useApp(
+    (state) => state.bootstrap?.projects ?? EMPTY_PROJECTS,
   );
-  const [titleModel, setTitleModel] = useState<TitleModelPreset>(readTitleModelPreset);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [titleModel, setTitleModel] =
+    useState<TitleModelPreset>(readTitleModelPreset);
   const [uiFont, setUiFont] = useState(readUiFont);
   const [codeFont, setCodeFont] = useState(readCodeFont);
   const [uiTextSize, setUiTextSize] = useState<TextSize>(readUiTextSize);
@@ -119,23 +112,17 @@ export function SettingsPage() {
     }
   }
 
-  async function setPluginEnabled(id: string, enabled: boolean) {
-    setChangingPlugin(id);
-    try {
-      await api.setUiPlugin(id, enabled);
-      window.dispatchEvent(new CustomEvent("pecan:refresh"));
-    } catch (error) {
-      reportError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChangingPlugin(null);
-    }
-  }
-
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto" aria-labelledby="settings-title">
+    <div
+      className="min-h-0 flex-1 overflow-y-auto"
+      aria-labelledby="settings-title"
+    >
       <div className="mx-auto w-full max-w-[46rem] px-5 py-8 md:px-8 md:py-12">
         <div className="mb-9">
-          <h1 className="text-xl font-semibold tracking-tight" id="settings-title">
+          <h1
+            className="text-xl font-semibold tracking-tight"
+            id="settings-title"
+          >
             Settings
           </h1>
           <p className="mt-1 max-w-[62ch] text-sm leading-6 text-muted-foreground">
@@ -192,21 +179,6 @@ export function SettingsPage() {
         <SettingsSection icon={<SparklesIcon />} title="Thread titles">
           <SettingsRow
             control={
-              <Switch
-                aria-label="Allow AI title generation"
-                checked={aiTitlesEnabled}
-                onCheckedChange={(enabled) => {
-                  setAiTitlesEnabled(enabled);
-                  saveAiTitleGenerationEnabled(enabled);
-                }}
-              />
-            }
-            description="Off by default. Pecan uses the first request as the title and makes no model call."
-            title="AI title generation"
-          />
-          {aiTitlesEnabled ? (
-            <SettingsRow
-            control={
               <TitleModelControl
                 onChange={(preset) => {
                   setTitleModel(preset);
@@ -218,7 +190,6 @@ export function SettingsPage() {
             description="Manual only. Clicking a title refresh sends bounded thread context to this model and uses tokens."
             title="Generation model"
           />
-          ) : null}
         </SettingsSection>
 
         <SettingsSection icon={<RadioIcon />} title="Runtime">
@@ -239,40 +210,15 @@ export function SettingsPage() {
             title="Event stream"
           />
           <SettingsRow
-            control={<span className="text-xs tabular-nums">{sessions.length}</span>}
+            control={
+              <span className="text-xs tabular-nums">{sessions.length}</span>
+            }
             description="Pi sessions currently available in the local index."
             title="Loaded sessions"
           />
         </SettingsSection>
 
-        <SettingsSection icon={<PanelsTopLeftIcon />} title="Session UI">
-          {uiPlugins.map((plugin) => (
-            <SettingsRow
-              control={
-                <Switch
-                  aria-label={`Show ${plugin.name} in sessions`}
-                  checked={plugin.enabled}
-                  disabled={
-                    changingPlugin === plugin.id ||
-                    !plugin.detected ||
-                    !plugin.sourceEnabled
-                  }
-                  onCheckedChange={(checked) =>
-                    void setPluginEnabled(plugin.id, checked)
-                  }
-                />
-              }
-              description={pluginDescription(plugin)}
-              key={plugin.id}
-              title={plugin.name}
-            />
-          ))}
-        </SettingsSection>
-
-        <SettingsSection
-          icon={<FolderGit2Icon />}
-          title="Linked projects"
-        >
+        <SettingsSection icon={<FolderGit2Icon />} title="Linked projects">
           {projects.length > 0 ? (
             projects.map((project) => (
               <SettingsRow
@@ -303,18 +249,6 @@ export function SettingsPage() {
   );
 }
 
-function pluginDescription(plugin: {
-  detected: boolean;
-  sourceEnabled: boolean;
-  enabled: boolean;
-  description: string;
-}) {
-  if (!plugin.detected) return "Install Pi Tasks to make this view available.";
-  if (!plugin.sourceEnabled) return "Installed, but disabled in your Pi settings.";
-  if (plugin.enabled) return "Read-only typed task data is shown inside each thread.";
-  return `${plugin.description} Off until you choose to enable it.`;
-}
-
 function TitleModelControl({
   value,
   onChange,
@@ -322,7 +256,8 @@ function TitleModelControl({
   value: TitleModelPreset;
   onChange: (value: TitleModelPreset) => void;
 }) {
-  const selected = TITLE_MODELS.find((model) => model.value === value) ?? DEFAULT_TITLE_MODEL;
+  const selected =
+    TITLE_MODELS.find((model) => model.value === value) ?? DEFAULT_TITLE_MODEL;
 
   return (
     <Select
@@ -348,9 +283,17 @@ function TitleModelControl({
           </span>
         </SelectValue>
       </SelectTrigger>
-      <SelectContent align="end" className="w-[min(19rem,calc(100vw-2rem))]" matchTriggerWidth={false}>
+      <SelectContent
+        align="end"
+        className="w-[min(19rem,calc(100vw-2rem))]"
+        matchTriggerWidth={false}
+      >
         {TITLE_MODELS.map((model) => (
-          <SelectItem className="min-h-12 py-2" key={model.value} value={model.value}>
+          <SelectItem
+            className="min-h-12 py-2"
+            key={model.value}
+            value={model.value}
+          >
             <span className="flex min-w-0 flex-col gap-0.5">
               <span className="flex items-center gap-2 font-medium">
                 {model.label}
@@ -385,7 +328,9 @@ function AttentionSettings() {
       const report = await api.pushTest();
       if (report.sent === 0) {
         reportError(
-          report.failed > 0 ? "The push service refused the test notification." : "This device is not subscribed to push yet.",
+          report.failed > 0
+            ? "The push service refused the test notification."
+            : "This device is not subscribed to push yet.",
         );
       }
     } catch (error) {
@@ -422,7 +367,13 @@ function AttentionSettings() {
       {notify && canPush ? (
         <SettingsRow
           control={
-            <Button className="min-h-11 md:min-h-8" disabled={testing} onClick={() => void sendTest()} size="xs" variant="outline">
+            <Button
+              className="min-h-11 md:min-h-8"
+              disabled={testing}
+              onClick={() => void sendTest()}
+              size="xs"
+              variant="outline"
+            >
               {testing ? "Sending\u2026" : "Send test"}
             </Button>
           }
@@ -560,7 +511,11 @@ function TextSizeControl({
   return (
     <SettingsRow
       control={
-        <div aria-label={title} className="flex rounded-lg bg-muted p-0.5" role="group">
+        <div
+          aria-label={title}
+          className="flex rounded-lg bg-muted p-0.5"
+          role="group"
+        >
           {options.map((option) => (
             <button
               aria-pressed={value === option.value}
@@ -608,15 +563,20 @@ function FontControl({
   );
   const [customFont, setCustomFont] = useState("");
   const [adding, setAdding] = useState(false);
-  const systemLabel = kind === "ui" ? "System default (SF Pro)" : "System default (SF Mono)";
+  const systemLabel =
+    kind === "ui" ? "System default (SF Pro)" : "System default (SF Mono)";
   const curated = kind === "ui" ? CURATED_UI_FONTS : CURATED_CODE_FONTS;
-  const options = [...new Set([
-    ...curated,
-    ...customFonts,
-    ...installed,
-    ...(code !== SYSTEM_UI && code !== SYSTEM_CODE ? [code] : []),
-  ])];
-  const canScan = typeof (globalThis as { queryLocalFonts?: unknown }).queryLocalFonts === "function";
+  const options = [
+    ...new Set([
+      ...curated,
+      ...customFonts,
+      ...installed,
+      ...(code !== SYSTEM_UI && code !== SYSTEM_CODE ? [code] : []),
+    ]),
+  ];
+  const canScan =
+    typeof (globalThis as { queryLocalFonts?: unknown }).queryLocalFonts ===
+    "function";
 
   async function scan() {
     setScanning(true);
@@ -630,7 +590,8 @@ function FontControl({
   function addFont() {
     const value = customFont.trim();
     if (!value) return;
-    const next = kind === "ui" ? addCustomUiFont(value) : addCustomCodeFont(value);
+    const next =
+      kind === "ui" ? addCustomUiFont(value) : addCustomCodeFont(value);
     if (!next.includes(value)) return;
     setCustomFonts(next);
     onChange(value);
@@ -649,7 +610,10 @@ function FontControl({
             }}
             value={code}
           >
-            <SelectTrigger aria-label={title} className="min-h-11 w-full sm:min-h-9">
+            <SelectTrigger
+              aria-label={title}
+              className="min-h-11 w-full sm:min-h-9"
+            >
               <SelectValue>
                 <span
                   className="truncate"
@@ -660,7 +624,9 @@ function FontControl({
                         : `"${code}", sans-serif`,
                   }}
                 >
-                  {code === SYSTEM_UI || code === SYSTEM_CODE ? systemLabel : code}
+                  {code === SYSTEM_UI || code === SYSTEM_CODE
+                    ? systemLabel
+                    : code}
                 </span>
               </SelectValue>
             </SelectTrigger>
@@ -670,7 +636,9 @@ function FontControl({
               </SelectItem>
               {options.map((font) => (
                 <SelectItem key={font} value={font}>
-                  <span style={{ fontFamily: `"${font}", sans-serif` }}>{font}</span>
+                  <span style={{ fontFamily: `"${font}", sans-serif` }}>
+                    {font}
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>
@@ -693,7 +661,12 @@ function FontControl({
                 placeholder="Font family name"
                 value={customFont}
               />
-              <Button disabled={!customFont.trim()} onClick={addFont} size="xs" variant="outline">
+              <Button
+                disabled={!customFont.trim()}
+                onClick={addFont}
+                size="xs"
+                variant="outline"
+              >
                 Add
               </Button>
             </div>

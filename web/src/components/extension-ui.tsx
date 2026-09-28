@@ -14,8 +14,7 @@ import type { TaskGroup, TaskItem, WorkflowRun, WorkflowTask } from "~/api/types
 import { Badge } from "~/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/components/ui/collapsible";
 import { cn } from "~/lib/utils";
-import { useIsMobile } from "~/hooks/useMediaQuery";
-import type { ExtensionWidget, RunningSubagent, SubagentActivity, SubagentHandoff } from "~/store";
+import type { ExtensionWidget, SubagentActivity, SubagentHandoff } from "~/store";
 
 const SUBAGENT_WIDGET = "pi-subagents/activity/v1";
 
@@ -27,7 +26,7 @@ export function ExtensionWidgetRenderer({
   activity: SubagentActivity | undefined;
 }) {
   if (widget.key === SUBAGENT_WIDGET && activity) {
-    return <ActivityList activity={activity} />;
+    return <ActivityHandoff activity={activity} />;
   }
   return <GenericWidget widget={widget} />;
 }
@@ -35,98 +34,20 @@ export function ExtensionWidgetRenderer({
 /** How long a settled child's handoff stays visible after it leaves the list. */
 const HANDOFF_VISIBLE_MS = 8_000;
 
-function ActivityList({ activity }: { activity: SubagentActivity }) {
-  const isMobile = useIsMobile();
+/** Running children live in the agent tabs above the composer; this only
+ * surfaces a just-finished child's handoff for a few seconds. */
+function ActivityHandoff({ activity }: { activity: SubagentActivity }) {
   const handoff = useRecentHandoff(activity.terminal);
-  const { children } = activity;
-  if (children.length === 0) {
-    return handoff ? <HandoffRow handoff={handoff} /> : null;
-  }
-  const running = children.filter((child) => child.status === "running").length;
-  const queued = children.length - running;
-  const summary = [
-    running > 0 ? `${running} ${running === 1 ? "agent" : "agents"} working` : null,
-    queued > 0 ? `${queued} queued` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  return (
-    <Collapsible defaultOpen={!isMobile}>
-      <section aria-label="Subagent activity" aria-live="polite" className="rounded-lg border bg-card">
-        <CollapsibleTrigger className="group flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-[12px] font-medium text-muted-foreground md:min-h-9">
-          {running > 0 ? (
-            <CircleDotIcon className="size-3.5 shrink-0 animate-pulse text-success" />
-          ) : (
-            <CircleDashedIcon className="size-3.5 shrink-0" />
-          )}
-          <span>{summary}</span>
-          <span className="ms-auto max-w-[45%] truncate text-[11px] font-normal md:hidden">
-            {children.map((child) => child.title).join(", ")}
-          </span>
-          <ChevronDownIcon className="size-3.5 shrink-0 transition-transform group-data-[panel-open]:rotate-180 md:ms-auto" />
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className="flex flex-col gap-2 border-t px-3 py-2">
-            {children.map((child) => (
-              <ActivityChildRow child={child} key={child.id ?? child.title} />
-            ))}
-            {handoff ? <HandoffRow handoff={handoff} inline /> : null}
-          </div>
-        </CollapsibleContent>
-      </section>
-    </Collapsible>
-  );
+  return handoff ? <HandoffRow handoff={handoff} /> : null;
 }
 
-function ActivityChildRow({ child }: { child: RunningSubagent }) {
-  const meta = [child.backend, child.model, child.reasoningEffort].filter(Boolean).join(" · ");
-  const detail = child.failure
-    ? { text: child.failure, className: "text-destructive" }
-    : child.tool
-      ? {
-          text: child.tool.args ? `${child.tool.name} ${child.tool.args}` : child.tool.name,
-          className: cn("font-mono", child.tool.isError ? "text-destructive" : "text-muted-foreground"),
-        }
-      : child.output
-        ? { text: lastLine(child.output), className: "text-muted-foreground" }
-        : null;
-  return (
-    <div className="flex min-w-0 flex-col gap-0.5 text-[12px] animate-row-in">
-      <div className="flex min-w-0 items-center gap-2">
-        {child.status === "running" ? (
-          <LoaderCircleIcon aria-label="Running" className="size-3 shrink-0 animate-spin text-success" />
-        ) : (
-          <CircleDashedIcon aria-label="Queued" className="size-3 shrink-0 text-muted-foreground" />
-        )}
-        <span className="min-w-0 truncate font-medium">{child.title}</span>
-        {child.queuedMessages > 0 ? (
-          <Badge variant="secondary" title="Messages waiting for this agent">
-            +{child.queuedMessages}
-          </Badge>
-        ) : null}
-        {meta ? (
-          <span className="ms-auto hidden shrink-0 text-[10px] text-muted-foreground sm:inline">{meta}</span>
-        ) : null}
-      </div>
-      {detail ? (
-        <span className={cn("truncate ps-5 text-[11px]", detail.className)} title={detail.text}>
-          {detail.text}
-        </span>
-      ) : null}
-    </div>
-  );
-}
-
-function HandoffRow({ handoff, inline = false }: { handoff: SubagentHandoff; inline?: boolean }) {
+function HandoffRow({ handoff }: { handoff: SubagentHandoff }) {
   const failed = handoff.status === "error";
   const detail = failed ? (handoff.failure ?? handoff.output) : handoff.output;
   return (
     <div
       aria-live="polite"
-      className={cn(
-        "flex min-w-0 items-center gap-2 text-[12px] animate-toast-in",
-        inline ? "border-t pt-2" : "rounded-lg border bg-card px-3 py-2",
-      )}
+      className="flex min-w-0 items-center gap-2 px-1 text-[12px] animate-toast-in"
     >
       {failed ? (
         <CircleXIcon className="size-3.5 shrink-0 text-destructive" />

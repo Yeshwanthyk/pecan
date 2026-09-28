@@ -6,6 +6,16 @@ import { cn } from "~/lib/utils";
 import { ExtensionWidgetRenderer } from "~/components/extension-ui";
 import { useApp, type ExtensionNotice, type ExtensionWidget } from "~/store";
 
+/** Status key pi-subagents uses for its "N running" footer line. */
+const SUBAGENT_STATUS = "subagents";
+// Pi extensions write statuses for a terminal; drop SGR/CSI colour codes.
+// oxlint-disable-next-line no-control-regex -- matching ESC is the point
+const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI, "");
+}
+
 const EMPTY_NOTICES: ExtensionNotice[] = [];
 const EMPTY_STATUSES: Record<string, { key: string; text: string }> = {};
 const EMPTY_WIDGETS: Record<string, ExtensionWidget> = {};
@@ -33,21 +43,25 @@ export function ExtensionChrome({
   }, [title]);
 
   const visibleWidgets = Object.values(widgets).filter((widget) => widget.placement === placement);
-  const showChrome = placement === "aboveEditor" && (notices.length > 0 || Object.keys(statuses).length > 0);
+  // The agent tabs already show running children; drop the TUI's duplicate line.
+  const visibleStatuses = Object.values(statuses)
+    .filter((status) => !(activity && status.key === SUBAGENT_STATUS))
+    .map((status) => ({ key: status.key, text: stripAnsi(status.text) }))
+    .filter((status) => status.text.trim() !== "");
+  const showChrome = placement === "aboveEditor" && (notices.length > 0 || visibleStatuses.length > 0);
   if (!showChrome && visibleWidgets.length === 0) return null;
 
   return (
     <div className="mx-auto flex w-full max-w-[46rem] flex-col gap-2 px-4 pb-1 md:px-6">
       {placement === "aboveEditor" ? (
         <>
-          {Object.values(statuses).length > 0 ? (
-            <div aria-label="Extension status" className="flex flex-wrap gap-1.5">
-              {Object.values(statuses).map((status) => (
-                <span
-                  className="rounded-full border border-border bg-card px-2 py-1 text-[11px] text-muted-foreground"
-                  key={status.key}
-                  title={status.key}
-                >
+          {visibleStatuses.length > 0 ? (
+            <div
+              aria-label="Extension status"
+              className="flex min-w-0 items-center gap-3 px-1 text-[11px] leading-4 text-muted-foreground"
+            >
+              {visibleStatuses.map((status) => (
+                <span className="min-w-0 truncate" key={status.key} title={status.text}>
                   {status.text}
                 </span>
               ))}

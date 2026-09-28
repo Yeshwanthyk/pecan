@@ -28,44 +28,62 @@ export function SubagentStrip({
   const sessions = useApp((state) => state.sessions);
   const activity = useApp((state) => state.subagentActivity[parentId]);
   const isInsideChild = current.id !== parentId;
+  const parentOpenedAt = parent ? Date.parse(parent.openedAt) : Number.NaN;
 
-  const candidates = useMemo(() => {
-    const parentOpenedAt = parent ? Date.parse(parent.openedAt) : Number.NaN;
-    const liveNames = new Set(
-      (activity?.children ?? []).map((child) => agentTitle(child.title)),
-    );
-    return sessions.filter((row) => {
-      if (row.kind !== "subagent" || row.cwd !== (parent?.cwd ?? current.cwd)) {
-        return false;
-      }
-      const exactMatch = row.parentSessionId === parentId;
-      const fallbackMatch =
-        (row.parentSessionId === null || row.parentSessionId === undefined) &&
-        (row.id === current.id || liveNames.has(agentName(row))) &&
-        (!Number.isFinite(parentOpenedAt) ||
-          !Number.isFinite(Date.parse(row.openedAt)) ||
-          Date.parse(row.openedAt) >= parentOpenedAt);
-      if (!exactMatch && !fallbackMatch) {
-        return false;
-      }
-      return !row.settled || row.id === current.id;
-    });
-  }, [activity, current.cwd, current.id, parent, parentId, sessions]);
-
-  const runningIds = useMemo(() => {
-    const ids = new Set<string>();
+  // One session row per live child, chosen by title + closest start time.
+  // `activity` is already scoped to this exact parentId (keyed by
+  // `subagentActivity[parentId]`), so title matching here doesn't need a
+  // cwd guard — a direct `subagent_spawn` can run in a different cwd than
+  // its parent (the `pi` backend passes the caller's own cwd through
+  // unchanged), and requiring cwd equality hid cross-cwd children entirely.
+  // Claiming each matched row also keeps a reused title (a later spawn
+  // round can reuse a name like "fix-idle-coldstart") from matching more
+  // than one historical row at once, which used to render duplicate tabs
+  // with the same label instead of one tab per live child.
+  const runningRows = useMemo(() => {
+    const claimed = new Set<string>();
+    const matches: SessionRow[] = [];
     for (const live of activity?.children ?? []) {
-      const match = candidates
-        .filter((row) => agentName(row) === agentTitle(live.title))
+      const title = agentTitle(live.title);
+      const match = sessions
+        .filter(
+          (row) =>
+            row.kind === "subagent" &&
+            !claimed.has(row.id) &&
+            agentName(row) === title &&
+            (!Number.isFinite(parentOpenedAt) ||
+              !Number.isFinite(Date.parse(row.openedAt)) ||
+              Date.parse(row.openedAt) >= parentOpenedAt),
+        )
         .sort(
           (a, b) =>
             Math.abs(Date.parse(a.openedAt) - live.startedAt) -
             Math.abs(Date.parse(b.openedAt) - live.startedAt),
         )[0];
-      if (match) ids.add(match.id);
+      if (match) {
+        claimed.add(match.id);
+        matches.push(match);
+      }
     }
-    return ids;
-  }, [activity, candidates]);
+    return matches;
+  }, [activity, parentOpenedAt, sessions]);
+
+  const runningIds = useMemo(
+    () => new Set(runningRows.map((row) => row.id)),
+    [runningRows],
+  );
+
+  const candidates = useMemo(() => {
+    return sessions.filter((row) => {
+      if (row.kind !== "subagent") return false;
+      const exactMatch = row.parentSessionId === parentId;
+      const fallbackMatch = row.id === current.id || runningIds.has(row.id);
+      if (!exactMatch && !fallbackMatch) {
+        return false;
+      }
+      return !row.settled || row.id === current.id;
+    });
+  }, [current.id, parentId, runningIds, sessions]);
 
   const children = useMemo(
     () =>

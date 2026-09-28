@@ -1,8 +1,18 @@
 /** Lazy-loaded, bounded workspace review panel powered by Pierre Diffs. */
-import { parsePatchFiles, setLanguageOverride } from "@pierre/diffs";
+import {
+  type FileDiffMetadata,
+  parsePatchFiles,
+  setLanguageOverride,
+} from "@pierre/diffs";
 import { FileDiff } from "@pierre/diffs/react";
-import { Columns2Icon, FileDiffIcon, Rows3Icon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  ChevronRightIcon,
+  Columns2Icon,
+  GitBranchIcon,
+  Rows3Icon,
+  XIcon,
+} from "lucide-react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { api } from "~/api/client";
 import type { WorkspaceDiff } from "~/api/types";
@@ -65,6 +75,23 @@ export default function DiffSidebar({
     };
   }, [open, sessionId]);
 
+  const totals = useMemo(() => {
+    let additions = 0;
+    let deletions = 0;
+    for (const file of files) {
+      const stats = fileStats(file);
+      additions += stats.additions;
+      deletions += stats.deletions;
+    }
+    return { additions, deletions };
+  }, [files]);
+
+  function jumpTo(index: number) {
+    document
+      .getElementById(fileAnchor(index))
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   function chooseStyle(next: DiffStyle) {
     setStyle(next);
     writeLocalStorage(DIFF_STYLE_KEY, next);
@@ -74,64 +101,100 @@ export default function DiffSidebar({
     <Sheet onOpenChange={onOpenChange} open={open}>
       <SheetPopup
         className="w-full max-w-none sm:w-[min(88vw,72rem)] sm:max-w-none"
+        showCloseButton={false}
         side="right"
       >
-        <SheetHeader className="shrink-0 gap-1 border-b px-3 py-3 pe-12 sm:px-4">
+        <SheetHeader className="shrink-0 gap-0.5 border-b px-3 py-2.5 sm:px-4">
           <div className="flex min-w-0 items-center gap-2">
-            <FileDiffIcon className="size-4 shrink-0 text-muted-foreground" />
-            <SheetTitle className="truncate text-sm leading-5">Workspace diff</SheetTitle>
+            <SheetTitle className="truncate text-sm leading-5">
+              Changes
+            </SheetTitle>
             {data?.branch ? (
-              <span className="truncate font-mono text-[11px] text-muted-foreground">
-                {data.branch}
+              <span className="flex min-w-0 items-center gap-1 font-mono text-[11px] text-muted-foreground">
+                <GitBranchIcon className="size-3 shrink-0 opacity-60" />
+                <span className="truncate">{data.branch}</span>
               </span>
             ) : null}
-            <div className="ms-auto hidden shrink-0 items-center rounded-md bg-muted p-0.5 sm:flex">
-              <StyleButton active={style === "split"} onClick={() => chooseStyle("split")}>
-                <Columns2Icon /> Split
+            <div className="ms-auto flex shrink-0 items-center rounded-md bg-muted p-0.5">
+              <StyleButton
+                active={style === "unified"}
+                label="Unified"
+                onClick={() => chooseStyle("unified")}
+              >
+                <Rows3Icon />
               </StyleButton>
-              <StyleButton active={style === "unified"} onClick={() => chooseStyle("unified")}>
-                <Rows3Icon /> Unified
+              <StyleButton
+                active={style === "split"}
+                label="Split"
+                onClick={() => chooseStyle("split")}
+              >
+                <Columns2Icon />
               </StyleButton>
             </div>
+            <Button
+              aria-label="Close"
+              className="shrink-0"
+              onClick={() => onOpenChange(false)}
+              size="icon"
+              variant="ghost"
+            >
+              <XIcon />
+            </Button>
           </div>
-          <SheetDescription className="flex min-w-0 items-center gap-1.5 text-[11px]">
-            <span>{data ? `${data.files} ${data.files === 1 ? "file" : "files"}` : "Current checkout"}</span>
-            {data?.untracked ? <span>· {data.untracked} untracked</span> : null}
-            {data?.truncated ? <span className="text-warning">· truncated</span> : null}
-            <span>· includes all local workspace changes</span>
+          <SheetDescription className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-[11px]">
+            {data ? (
+              <>
+                <span>
+                  {data.files} {data.files === 1 ? "file" : "files"}
+                </span>
+                {totals.additions + totals.deletions > 0 ? (
+                  <LineStats {...totals} />
+                ) : null}
+                {data.untracked ? (
+                  <span>· {data.untracked} untracked</span>
+                ) : null}
+                {data.truncated ? (
+                  <span className="text-warning">· truncated</span>
+                ) : null}
+              </>
+            ) : (
+              <span>All local workspace changes</span>
+            )}
           </SheetDescription>
-          <div className="mt-1 flex w-fit items-center rounded-md bg-muted p-0.5 sm:hidden">
-            <StyleButton active={style === "unified"} onClick={() => chooseStyle("unified")}>
-              <Rows3Icon /> Unified
-            </StyleButton>
-            <StyleButton active={style === "split"} onClick={() => chooseStyle("split")}>
-              <Columns2Icon /> Split
-            </StyleButton>
-          </div>
         </SheetHeader>
 
         <div className="min-h-0 flex-1 overflow-auto bg-background">
           {loading ? (
             <DiffLoading />
           ) : error ? (
-            <div className="mx-auto max-w-lg p-6 text-sm text-destructive">{error}</div>
+            <div className="mx-auto max-w-lg p-6 text-sm text-destructive">
+              {error}
+            </div>
           ) : files.length > 0 ? (
             <div className="space-y-px bg-border/50 pb-8">
+              {files.length > 1 ? (
+                <FileIndex files={files} onJump={jumpTo} />
+              ) : null}
               {files.map((file, index) => (
-                <FileDiff
-                  className="min-w-0 bg-background"
-                  fileDiff={file}
+                <div
+                  className="scroll-mt-2"
+                  id={fileAnchor(index)}
                   key={`${file.prevName ?? file.name}:${file.name}:${index}`}
-                  options={{
-                    diffIndicators: "bars",
-                    diffStyle: style,
-                    hunkSeparators: "line-info",
-                    lineDiffType: "word-alt",
-                    overflow: "scroll",
-                    theme: { dark: "pierre-dark", light: "pierre-light" },
-                    themeType: theme === "one-dark" ? "dark" : "light",
-                  }}
-                />
+                >
+                  <FileDiff
+                    className="min-w-0 bg-background"
+                    fileDiff={file}
+                    options={{
+                      diffIndicators: "bars",
+                      diffStyle: style,
+                      hunkSeparators: "line-info",
+                      lineDiffType: "word-alt",
+                      overflow: "scroll",
+                      theme: { dark: "pierre-dark", light: "pierre-light" },
+                      themeType: theme === "one-dark" ? "dark" : "light",
+                    }}
+                  />
+                </div>
               ))}
             </div>
           ) : (
@@ -152,22 +215,125 @@ export default function DiffSidebar({
 
 function StyleButton({
   active,
+  label,
   onClick,
   children,
 }: {
   active: boolean;
+  label: string;
   onClick: () => void;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <Button
-      className={cn("h-7 gap-1 border-0 px-2 text-[11px]", active && "shadow-xs")}
+      aria-label={`${label} diff`}
+      aria-pressed={active}
+      className={cn(
+        "h-7 gap-1 border-0 px-2 text-[11px]",
+        active && "shadow-xs",
+      )}
       onClick={onClick}
       size="compact"
+      title={`${label} diff`}
       variant={active ? "outline" : "ghost-muted"}
     >
       {children}
+      <span className="hidden sm:inline">{label}</span>
     </Button>
+  );
+}
+
+type Stats = { additions: number; deletions: number };
+
+function fileStats(file: FileDiffMetadata): Stats {
+  let additions = 0;
+  let deletions = 0;
+  for (const hunk of file.hunks) {
+    additions += hunk.additionLines;
+    deletions += hunk.deletionLines;
+  }
+  return { additions, deletions };
+}
+
+function fileAnchor(index: number): string {
+  return `diff-file-${index}`;
+}
+
+function LineStats({ additions, deletions }: Stats) {
+  return (
+    <span className="font-mono tabular-nums">
+      <span className="text-success">+{additions}</span>{" "}
+      <span className="text-destructive">−{deletions}</span>
+    </span>
+  );
+}
+
+const CHANGE_LABEL: Record<FileDiffMetadata["type"], string> = {
+  change: "M",
+  "rename-pure": "R",
+  "rename-changed": "R",
+  new: "A",
+  deleted: "D",
+};
+
+/** Jump list of changed files, collapsed by default when long. */
+function FileIndex({
+  files,
+  onJump,
+}: {
+  files: FileDiffMetadata[];
+  onJump: (index: number) => void;
+}) {
+  return (
+    <details className="group bg-background" open={files.length <= 8}>
+      <summary className="flex min-h-10 cursor-pointer list-none items-center gap-1.5 px-3 text-[12px] font-medium text-muted-foreground select-none hover:text-foreground sm:px-4 [&::-webkit-details-marker]:hidden">
+        <ChevronRightIcon className="size-3.5 transition-transform group-open:rotate-90" />
+        Files
+      </summary>
+      <ul className="pb-2">
+        {files.map((file, index) => {
+          const stats = fileStats(file);
+          const slash = file.name.lastIndexOf("/");
+          return (
+            <li key={`${file.name}:${index}`}>
+              <button
+                className="flex min-h-10 w-full items-center gap-2.5 px-3 text-left text-[12px] outline-none hover:bg-accent focus-visible:bg-accent sm:min-h-8 sm:px-4"
+                onClick={() => onJump(index)}
+                title={
+                  file.prevName ? `${file.prevName} → ${file.name}` : file.name
+                }
+                type="button"
+              >
+                <span
+                  className={cn(
+                    "w-3 shrink-0 text-center font-mono text-[11px] font-semibold",
+                    file.type === "new" && "text-success",
+                    file.type === "deleted" && "text-destructive",
+                    file.type === "change" && "text-warning",
+                    file.type.startsWith("rename") && "text-muted-foreground",
+                  )}
+                >
+                  {CHANGE_LABEL[file.type]}
+                </span>
+                <span className="min-w-0 flex-1 truncate">
+                  <span className="font-medium">
+                    {file.name.slice(slash + 1)}
+                  </span>
+                  {slash > 0 ? (
+                    <span className="ms-1.5 text-muted-foreground">
+                      {file.name.slice(0, slash)}
+                    </span>
+                  ) : null}
+                </span>
+                <span className="shrink-0 text-[11px]">
+                  <LineStats {...stats} />
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
   );
 }
 

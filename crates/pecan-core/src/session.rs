@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
 
@@ -30,7 +30,7 @@ pub struct SessionHeader {
 }
 
 /// Whether a session was started by a user or spawned as a subagent child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionKind {
     /// An interactive session opened by a user.

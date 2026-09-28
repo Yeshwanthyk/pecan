@@ -8,16 +8,23 @@ import {
   MoreHorizontalIcon,
   PackageCheckIcon,
   PlusIcon,
+  RotateCcwIcon,
+  SparklesIcon,
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 
-import { api, captureShipToken, takePairCode, UNPAIRED_EVENT } from "~/api/client";
+import {
+  api,
+  captureShipToken,
+  takePairCode,
+  UNPAIRED_EVENT,
+} from "~/api/client";
 import type { ThreadView } from "~/api/types";
 import { AppSidebar, BrandMark, useHash } from "~/components/app-sidebar";
-import { AddProjectForm } from "~/components/projects-group";
 import { Composer } from "~/components/composer";
 import { ErrorBoundary } from "~/components/error-boundary";
 import { HealthBanner } from "~/components/health-banner";
+import { Home } from "~/components/home";
 import { PairScreen } from "~/components/pair-screen";
 import { ExtensionHost } from "~/components/extension-host";
 import { ExtensionChrome } from "~/components/extension-chrome";
@@ -27,6 +34,11 @@ import { Thread, threadChangeCount } from "~/components/thread";
 import { SubagentStrip } from "~/components/subagent-strip";
 import { Toaster } from "~/components/toaster";
 import { Button } from "~/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "~/components/ui/popover";
 import { Spinner } from "~/components/ui/spinner";
 import {
   SidebarInset,
@@ -82,7 +94,11 @@ export function App() {
       load();
       connectEvents();
     };
-    if (code) void api.pair(code).catch(() => undefined).finally(start);
+    if (code)
+      void api
+        .pair(code)
+        .catch(() => undefined)
+        .finally(start);
     else start();
     return () => {
       window.removeEventListener("pecan:refresh", load);
@@ -98,7 +114,8 @@ export function App() {
     if (
       route &&
       allowed.has(route.sessionId) &&
-      (route.sessionId === sessionScope.mainSessionId || route.parentId === sessionScope.mainSessionId)
+      (route.sessionId === sessionScope.mainSessionId ||
+        route.parentId === sessionScope.mainSessionId)
     ) {
       return;
     }
@@ -118,7 +135,11 @@ export function App() {
   }, []);
 
   if (!paired) {
-    return <PairScreen onPaired={() => window.dispatchEvent(new CustomEvent("pecan:refresh"))} />;
+    return (
+      <PairScreen
+        onPaired={() => window.dispatchEvent(new CustomEvent("pecan:refresh"))}
+      />
+    );
   }
 
   return (
@@ -126,10 +147,12 @@ export function App() {
       {sessionScope ? null : <AppSidebar />}
       {sessionScope ? null : <MobileSheetCloser />}
       <SidebarInset>
-        <header className="flex min-h-12 shrink-0 items-center gap-2 px-2.5 py-1.5">
-          {sessionScope ? null : <SidebarTrigger />}
+        <header className="flex h-14 shrink-0 items-center gap-2 px-2.5">
+          {sessionScope ? null : <HeaderSidebarTrigger />}
           {isSettings ? (
-            <span className="text-sm font-semibold tracking-tight">Settings</span>
+            <span className="text-sm font-semibold tracking-tight">
+              Settings
+            </span>
           ) : activeThread ? (
             <HeaderContext
               data={activeThread}
@@ -201,7 +224,7 @@ export function App() {
             </Suspense>
           </>
         ) : (
-          <EmptyState />
+          <Home />
         )}
       </SidebarInset>
       <Toaster />
@@ -250,7 +273,8 @@ function HeaderContext({
   const hasParentContext = isSubagent && parentRouteId.length > 0;
 
   const project = projectName(data.summary.cwd);
-  const title = data.summary.title ?? data.summary.preview ?? data.summary.id.slice(0, 8);
+  const title =
+    data.summary.title ?? data.summary.preview ?? data.summary.id.slice(0, 8);
   const changes = threadChangeCount(data.entries);
 
   async function toggleSettled() {
@@ -284,13 +308,17 @@ function HeaderContext({
               >
                 {parent?.title ?? parent?.preview ?? "Parent"}
               </a>
-              <ChevronRightIcon aria-hidden className="hidden size-3.5 shrink-0 text-border sm:block" />
+              <ChevronRightIcon
+                aria-hidden
+                className="hidden size-3.5 shrink-0 text-border sm:block"
+              />
             </>
           ) : null}
-          <h1 className="min-w-0 truncate text-[13px] font-medium text-foreground/90" title={title}>
-            {isSubagent
-              ? agentTitle(data.summary.agentName ?? title)
-              : title}
+          <h1
+            className="min-w-0 truncate text-[13px] font-medium text-foreground/90"
+            title={title}
+          >
+            {isSubagent ? agentTitle(data.summary.agentName ?? title) : title}
           </h1>
           {data.waitingAskuser && !data.settled ? (
             <span
@@ -316,7 +344,9 @@ function HeaderContext({
           )}
           {branch ? (
             <>
-              <span aria-hidden className="text-border">/</span>
+              <span aria-hidden className="text-border">
+                /
+              </span>
               <span className="flex min-w-0 items-center gap-1 font-mono">
                 <GitBranchIcon className="size-3 shrink-0 opacity-60" />
                 <span className="truncate">{branch}</span>
@@ -325,39 +355,29 @@ function HeaderContext({
           ) : null}
           {data.summary.model ? (
             <>
-              <span aria-hidden className="hidden text-border md:inline">/</span>
-              <span className="hidden shrink-0 md:inline">{shortModel(data.summary.model)}</span>
+              <span aria-hidden className="hidden text-border md:inline">
+                /
+              </span>
+              <span className="hidden shrink-0 md:inline">
+                {shortModel(data.summary.model)}
+              </span>
             </>
           ) : null}
         </div>
         <ActiveTaskStatus groups={data.tasks} />
       </div>
-      {embedded ? null : <NewInProjectButton cwd={data.summary.cwd} />}
       <Button
         aria-label="Open workspace diff"
-        className="min-w-8 px-2 sm:px-2.5"
+        className="min-w-8 gap-1 px-2"
         onClick={onOpenDiff}
         size="sm"
         title="Review all local workspace changes"
         variant="ghost-muted"
       >
         <FileDiffIcon />
-        <span className="hidden sm:inline">Diff</span>
         {changes > 0 ? (
-          <span className="tabular-nums text-[11px] opacity-70">{changes}</span>
+          <span className="tabular-nums text-[11px]">{changes}</span>
         ) : null}
-      </Button>
-      <Button
-        aria-label={data.settled ? "Reopen settled thread" : "Mark thread done in Pecan"}
-        className="min-w-8 px-2"
-        disabled={settling}
-        onClick={() => void toggleSettled()}
-        size="sm"
-        title={data.settled ? "Move back to active threads" : "Mark done without changing Git"}
-        variant="ghost-muted"
-      >
-        {settling ? <MoreHorizontalIcon className="animate-pulse" /> : <CheckIcon />}
-        <span className="hidden lg:inline">{data.settled ? "Reopen" : "Done"}</span>
       </Button>
       <Button
         aria-label="Review and ship with Git"
@@ -370,146 +390,142 @@ function HeaderContext({
         <PackageCheckIcon />
         <span className="hidden sm:inline">Ship</span>
       </Button>
+      <ThreadMenu
+        busy={settling}
+        data={data}
+        embedded={embedded}
+        onToggleSettled={() => void toggleSettled()}
+      />
     </div>
   );
 }
 
-/** Starts a fresh session in the current thread's project. */
-function NewInProjectButton({ cwd }: { cwd: string }) {
+/** Less frequent thread actions, folded out of the header. */
+function ThreadMenu({
+  data,
+  embedded,
+  busy,
+  onToggleSettled,
+}: {
+  data: ThreadView;
+  embedded: boolean;
+  busy: boolean;
+  onToggleSettled: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [titling, setTitling] = useState(false);
+  const cwd = data.summary.cwd;
   const starting = useApp((state) => state.startingCwd === cwd);
-  return (
-    <Button
-      aria-label="New session in this project"
-      className="min-w-8 px-2"
-      data-testid="header-new-session"
-      disabled={starting}
-      onClick={() => void startSession(cwd)}
-      size="sm"
-      title="New session in this project"
-      variant="ghost-muted"
-    >
-      {starting ? <Spinner className="size-4" /> : <PlusIcon />}
-      <span className="hidden lg:inline">New</span>
-    </Button>
-  );
-}
 
-const RECENT_ON_HOME = 5;
-
-function EmptyState() {
-  const bootstrap = useApp((state) => state.bootstrap);
-  const sessions = useApp((state) => state.sessions);
-  const startingCwd = useApp((state) => state.startingCwd);
-  if (bootstrap === null) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-muted-foreground">
-        <Spinner className="size-5" />
-      </div>
-    );
+  function run(action: () => void) {
+    setOpen(false);
+    action();
   }
-  const projects = bootstrap.projects;
-  const linked = new Set(projects.map((project) => project.cwd));
-  const recent = sessions
-    .filter((row) => row.kind !== "subagent" && !row.settled && linked.has(row.cwd))
-    .sort((a, b) => Date.parse(b.lastActivity) - Date.parse(a.lastActivity))
-    .slice(0, RECENT_ON_HOME);
+
+  async function regenerateTitle() {
+    if (titling) return;
+    setTitling(true);
+    try {
+      await api.regenerateTitle(data.summary.id);
+      const updated = await api.thread(data.summary.id);
+      if (useApp.getState().thread?.summary.id === data.summary.id) {
+        useApp.getState().setThread(updated);
+      }
+      window.dispatchEvent(new CustomEvent("pecan:refresh"));
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setTitling(false);
+    }
+  }
 
   return (
-    <div className="flex-1 overflow-y-auto" data-testid="empty-state">
-      <div className="mx-auto flex w-full max-w-xl flex-col px-5 pt-[10vh] pb-16 sm:pt-[14vh]">
-        <BrandMark className="size-9 rounded-[10px] text-lg" />
-        <h1 className="mt-5 text-xl font-semibold tracking-[-0.015em]">
-          {projects.length === 0 ? "Welcome to Pecan" : "What should Pi work on?"}
-        </h1>
-        <p className="mt-1 text-sm leading-6 text-muted-foreground">
-          {projects.length === 0
-            ? "Add a project folder, then start Pi sessions in it from any device."
-            : "Start a new session in a project, or pick up where you left off."}
-        </p>
-
-        {projects.length === 0 ? (
-          <div className="mt-7 rounded-2xl border bg-card p-4 shadow-xs">
-            <AddProjectForm autoFocus={false} />
-          </div>
+    <Popover onOpenChange={setOpen} open={open}>
+      <PopoverTrigger
+        aria-label="Thread actions"
+        className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring data-[popup-open]:bg-accent data-[popup-open]:text-foreground"
+        data-testid="thread-menu"
+      >
+        {busy || titling || starting ? (
+          <Spinner className="size-4" />
         ) : (
-          <>
-            <SectionHeading>New session</SectionHeading>
-            <ul className="grid gap-2 sm:grid-cols-2">
-              {projects.map((project) => (
-                <li className="min-w-0" key={project.cwd}>
-                  <button
-                    className="group flex min-h-16 w-full items-center gap-3 rounded-2xl border bg-card px-3.5 py-3 text-left shadow-xs outline-none transition hover:border-input hover:shadow-sm focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
-                    data-testid="empty-new-session"
-                    disabled={startingCwd !== null}
-                    onClick={() => void startSession(project.cwd)}
-                    title={project.cwd}
-                    type="button"
-                  >
-                    <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-muted text-muted-foreground transition-colors group-hover:bg-primary group-hover:text-primary-foreground">
-                      {startingCwd === project.cwd ? (
-                        <Spinner className="size-4" />
-                      ) : (
-                        <PlusIcon className="size-4" />
-                      )}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[15px] font-medium">{project.name}</span>
-                      <span className="block truncate text-xs text-muted-foreground" dir="rtl">
-                        <bdi>{project.cwd}</bdi>
-                      </span>
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-
-            {recent.length > 0 ? (
-              <>
-                <SectionHeading>Recent</SectionHeading>
-                <ul className="overflow-hidden rounded-2xl border bg-card shadow-xs">
-                  {recent.map((row) => (
-                    <li className="border-b last:border-b-0" key={row.id}>
-                      <a
-                        className="flex min-h-14 items-center gap-3 px-4 py-2.5 outline-none transition-colors hover:bg-accent focus-visible:bg-accent"
-                        href={`#/s/${row.id}`}
-                      >
-                        <span
-                          aria-hidden
-                          className={
-                            row.waitingAskuser
-                              ? "size-2 shrink-0 rounded-full bg-warning"
-                              : "size-2 shrink-0 rounded-full bg-border"
-                          }
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-sm font-medium">
-                            {row.title ?? row.preview ?? row.id.slice(0, 8)}
-                          </span>
-                          <span className="block truncate text-xs text-muted-foreground">
-                            {projectName(row.cwd)}
-                            {row.waitingAskuser ? " · needs your answer" : ""}
-                          </span>
-                        </span>
-                        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/60" />
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            ) : null}
-          </>
+          <MoreHorizontalIcon className="size-4" />
         )}
-      </div>
-    </div>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-60 p-1" side="bottom">
+        {embedded ? null : (
+          <MenuItem
+            data-testid="header-new-session"
+            disabled={starting}
+            hint="Fresh session in this project"
+            icon={<PlusIcon />}
+            label="New session"
+            onClick={() => run(() => void startSession(cwd))}
+          />
+        )}
+        <MenuItem
+          disabled={titling}
+          hint="Uses a few tokens"
+          icon={<SparklesIcon />}
+          label={data.summary.title ? "Regenerate title" : "Generate title"}
+          onClick={() => run(() => void regenerateTitle())}
+        />
+        <div className="my-1 h-px bg-border" />
+        <MenuItem
+          disabled={busy}
+          hint={
+            data.settled
+              ? "Move back to active threads"
+              : "Archive in Pecan; Git is untouched"
+          }
+          icon={data.settled ? <RotateCcwIcon /> : <CheckIcon />}
+          label={data.settled ? "Reopen" : "Mark done"}
+          onClick={() => run(onToggleSettled)}
+        />
+      </PopoverContent>
+    </Popover>
   );
 }
 
-function SectionHeading({ children }: { children: string }) {
+function MenuItem({
+  icon,
+  label,
+  hint,
+  onClick,
+  disabled,
+  ...rest
+}: {
+  icon: ReactNode;
+  label: string;
+  hint: string;
+  onClick: () => void;
+  disabled?: boolean;
+  "data-testid"?: string;
+}) {
   return (
-    <h2 className="mt-8 mb-2 px-1 text-xs text-muted-foreground">
-      {children}
-    </h2>
+    <button
+      className="flex min-h-11 w-full items-center gap-2.5 rounded-md px-2 text-left outline-none transition-colors hover:bg-accent focus-visible:bg-accent disabled:opacity-50 md:min-h-9 [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground"
+      disabled={disabled}
+      onClick={onClick}
+      type="button"
+      {...rest}
+    >
+      {icon}
+      <span className="min-w-0 flex-1">
+        <span className="block text-[13px] leading-5">{label}</span>
+        <span className="block truncate text-[11px] leading-4 text-muted-foreground">
+          {hint}
+        </span>
+      </span>
+    </button>
   );
+}
+
+/** The sidebar owns its toggle while open on desktop; the header shows it otherwise. */
+function HeaderSidebarTrigger() {
+  const { isMobile, open } = useSidebar();
+  if (!isMobile && open) return null;
+  return <SidebarTrigger className="animate-toast-in" />;
 }
 
 /** Closes the mobile sidebar sheet whenever in-sidebar navigation happens. */

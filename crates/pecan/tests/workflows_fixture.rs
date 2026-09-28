@@ -162,6 +162,16 @@ mod tests {
         );
         assert_eq!(rows[1]["parentSessionId"], json!(PARENT), "linked via run id: {sessions}");
 
+        let children = get_ok(&addr, "/api/sessions?kind=subagent").await;
+        let child_ids: Vec<&str> = children["sessions"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(|row| row["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(child_ids, vec![WORKFLOW_CHILD], "kind filter keeps only children: {children}");
+        let (status, _) =
+            get_json(&addr, "/api/sessions?kind=robot").expect("request unknown session kind");
+        assert_eq!(status, 400, "unknown kinds are rejected at the boundary");
+
         let (status, _) = get_json(&addr, &format!("/api/session/{PLAIN_SESSION}"))
             .expect("request out-of-scope session");
         assert_eq!(status, 404, "sessions outside the scope are not served");

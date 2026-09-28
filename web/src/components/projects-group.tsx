@@ -9,16 +9,22 @@ import {
   FolderIcon,
   FolderOpenIcon,
   PlusIcon,
+  SearchIcon,
   XIcon,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { api } from "~/api/client";
-import type { Project } from "~/api/types";
+import type { FolderPick, Project } from "~/api/types";
 import { Input } from "~/components/ui/input";
-import { Popover, PopoverContent, PopoverTrigger } from "~/components/ui/popover";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "~/components/ui/popover";
 import { Spinner } from "~/components/ui/spinner";
 import { reportError } from "~/lib/errors";
+import { timeLabel } from "~/lib/format";
 import { startSession } from "~/lib/sessions";
 import { readStoredStrings, writeLocalStorage } from "~/lib/storage";
 import { cn } from "~/lib/utils";
@@ -44,7 +50,13 @@ export function useCollapsedProjects() {
 }
 
 /** Animated height collapse: grid rows 0fr ↔ 1fr, content stays mounted. */
-export function Collapse({ open, children }: { open: boolean; children: ReactNode }) {
+export function Collapse({
+  open,
+  children,
+}: {
+  open: boolean;
+  children: ReactNode;
+}) {
   return (
     <div
       className={cn(
@@ -113,7 +125,11 @@ export function ProjectFolder({
             title="New session"
             type="button"
           >
-            {starting ? <Spinner className="size-3.5" /> : <PlusIcon className="size-3.5" />}
+            {starting ? (
+              <Spinner className="size-3.5" />
+            ) : (
+              <PlusIcon className="size-3.5" />
+            )}
           </button>
         </span>
       </div>
@@ -142,7 +158,10 @@ function ProjectMenu({ project }: { project: Project }) {
         <EllipsisIcon className="size-3.5" />
       </PopoverTrigger>
       <PopoverContent align="end" className="w-64 p-1" side="bottom">
-        <p className="truncate px-2 py-1.5 font-mono text-[11px] text-muted-foreground" title={project.cwd}>
+        <p
+          className="truncate px-2 py-1.5 font-mono text-[11px] text-muted-foreground"
+          title={project.cwd}
+        >
           {project.cwd}
         </p>
         <button
@@ -158,7 +177,24 @@ function ProjectMenu({ project }: { project: Project }) {
   );
 }
 
-/** Links a project folder by absolute path; `onDone` runs after success or Escape. */
+/** Shows `path` relative to `home` as `~/…` when it lives under it. */
+export function tildify(path: string, home: string | null | undefined): string {
+  if (!home) return path;
+  if (path === home) return "~";
+  return path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+}
+
+type PickRow =
+  | { kind: "known"; path: string; name: string; detail: string }
+  | { kind: "entry"; path: string; name: string };
+
+const PICK_DEBOUNCE_MS = 90;
+
+/**
+ * Folder picker that links a project: suggests folders Pi already worked in,
+ * completes typed paths (`~/` or `/`) one directory at a time, and adds on
+ * tap or Enter. `onDone` runs after success or Escape.
+ */
 export function AddProjectForm({
   onDone,
   autoFocus = true,
@@ -167,16 +203,57 @@ export function AddProjectForm({
   autoFocus?: boolean;
 }) {
   const [draft, setDraft] = useState("");
+  const [pick, setPick] = useState<FolderPick | null>(null);
+  const [highlight, setHighlight] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const seq = useRef(0);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  async function submit() {
-    const cwd = draft.trim();
-    if (!cwd.startsWith("/")) {
-      setError("Enter an absolute path, e.g. /Users/you/code/project");
+  useEffect(() => {
+    const mine = ++seq.current;
+    const timer = window.setTimeout(
+      () => {
+        api.folders(draft.trim()).then(
+          (result) => {
+            if (seq.current === mine) {
+              setPick(result);
+              setHighlight(0);
+            }
+          },
+          () => {
+            if (seq.current === mine) setPick(null);
+          },
+        );
+      },
+      draft === "" ? 0 : PICK_DEBOUNCE_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [draft]);
+
+  const home = pick?.home ?? null;
+  const rows: PickRow[] = [
+    ...(pick?.known ?? []).map((folder) => ({
+      kind: "known" as const,
+      path: folder.path,
+      name: folder.name,
+      detail: `${folder.sessions} session${folder.sessions === 1 ? "" : "s"} · ${timeLabel(folder.lastActivity)}`,
+    })),
+    ...(pick?.entries ?? []).map((entry) => ({
+      kind: "entry" as const,
+      path: entry.path,
+      name: entry.name,
+    })),
+  ];
+  const knownCount = pick?.known.length ?? 0;
+
+  async function add(path: string) {
+    const cwd = path.trim();
+    if (!cwd.startsWith("/") && !cwd.startsWith("~")) {
+      setError("Type a path starting with ~/ or /");
       return;
     }
-    setBusy(true);
+    setBusy(cwd);
     try {
       await api.addProject(cwd);
       window.dispatchEvent(new CustomEvent("pecan:refresh"));
@@ -186,45 +263,167 @@ export function AddProjectForm({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
+  }
+
+  function browse(path: string) {
+    setDraft(`${tildify(path, home)}/`);
+    setError(null);
+    inputRef.current?.focus();
   }
 
   return (
     <form
+      className="flex flex-col"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!busy) void submit();
+        if (busy) return;
+        const row = rows[highlight];
+        void add(
+          row && draft.trim() !== "" && !draft.endsWith("/")
+            ? row.path
+            : draft || row?.path || "",
+        );
       }}
     >
-      <label className="block px-1 pb-1.5 text-[11px] leading-4 text-muted-foreground" htmlFor="add-project-path">
-        Full path of the folder Pi should work in
-      </label>
-      <Input
-        autoFocus={autoFocus}
-        id="add-project-path"
-        aria-label="Project directory"
-        className="min-h-11 font-mono text-sm md:min-h-9 md:text-[13px]"
-        placeholder="/path/to/project"
-        spellCheck={false}
-        autoCapitalize="off"
-        autoCorrect="off"
-        enterKeyHint="go"
-        value={draft}
-        onChange={(event) => {
-          setDraft(event.target.value);
-          setError(null);
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
+      <div className="relative">
+        <SearchIcon className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          ref={inputRef}
+          autoFocus={autoFocus}
+          aria-label="Project folder"
+          aria-autocomplete="list"
+          aria-controls="folder-pick-list"
+          className="min-h-11 ps-8 font-mono text-sm md:min-h-9 md:text-[13px]"
+          placeholder="~/code/project"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          enterKeyHint="go"
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
             setError(null);
-            onDone?.();
-          }
-        }}
-      />
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setError(null);
+              onDone?.();
+            } else if (event.key === "ArrowDown" && rows.length > 0) {
+              event.preventDefault();
+              setHighlight((index) => (index + 1) % rows.length);
+            } else if (event.key === "ArrowUp" && rows.length > 0) {
+              event.preventDefault();
+              setHighlight((index) => (index - 1 + rows.length) % rows.length);
+            } else if (
+              event.key === "Tab" &&
+              rows[highlight]?.kind === "entry" &&
+              !event.shiftKey
+            ) {
+              event.preventDefault();
+              browse(rows[highlight].path);
+            }
+          }}
+        />
+      </div>
       {error ? (
-        <p className="mt-1 px-1 text-[11px] leading-4 text-destructive">{error}</p>
+        <p className="mt-1.5 px-1 text-[11px] leading-4 text-destructive">
+          {error}
+        </p>
+      ) : null}
+      <ul
+        className="mt-1.5 -mx-1 flex max-h-72 flex-col overflow-y-auto overscroll-contain"
+        id="folder-pick-list"
+        role="listbox"
+      >
+        {rows.map((row, index) => (
+          <li key={`${row.kind}:${row.path}`} role="presentation">
+            {index === 0 && row.kind === "known" ? (
+              <PickHeading>Pi has worked in</PickHeading>
+            ) : null}
+            {index === knownCount && row.kind === "entry" ? (
+              <PickHeading>{knownCount > 0 ? "Folders" : "Browse"}</PickHeading>
+            ) : null}
+            <div
+              aria-selected={index === highlight}
+              className="group/pick flex min-h-11 items-center rounded-md transition-colors aria-selected:bg-accent md:min-h-8"
+              onMouseEnter={() => setHighlight(index)}
+              role="option"
+            >
+              <button
+                className="flex min-w-0 flex-1 items-center gap-2 self-stretch px-2 text-left outline-none"
+                disabled={busy !== null}
+                onClick={() =>
+                  row.kind === "entry" ? browse(row.path) : void add(row.path)
+                }
+                title={row.path}
+                type="button"
+              >
+                {busy === row.path ? (
+                  <Spinner className="size-3.5 shrink-0" />
+                ) : (
+                  <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[13px] leading-5">
+                    {row.name}
+                  </span>
+                  {row.kind === "known" ? (
+                    <span className="block truncate text-[11px] leading-4 text-muted-foreground">
+                      {tildify(row.path, home)} · {row.detail}
+                    </span>
+                  ) : null}
+                </span>
+                {row.kind === "entry" ? (
+                  <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground/60" />
+                ) : null}
+              </button>
+              {row.kind === "entry" ? (
+                <button
+                  className="me-1 hidden h-7 shrink-0 items-center rounded-md px-2 text-xs font-medium text-primary outline-none hover:bg-background focus-visible:ring-2 focus-visible:ring-ring group-aria-selected/pick:flex max-md:flex"
+                  disabled={busy !== null}
+                  onClick={() => void add(row.path)}
+                  type="button"
+                >
+                  Add
+                </button>
+              ) : null}
+            </div>
+          </li>
+        ))}
+        {pick && rows.length === 0 ? (
+          <li className="px-2 py-2 text-[11px] leading-4 text-muted-foreground">
+            {draft.trim() === ""
+              ? "Type ~/ to browse folders on this machine."
+              : "No matching folders. Press Enter to add this path."}
+          </li>
+        ) : null}
+      </ul>
+      {draft.trim() !== "" ? (
+        <button
+          className="mt-1 flex min-h-11 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[13px] font-medium text-primary-foreground outline-none transition active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60 md:min-h-8"
+          disabled={busy !== null}
+          type="submit"
+        >
+          {busy === draft.trim() ? (
+            <Spinner className="size-3.5" />
+          ) : (
+            <PlusIcon className="size-3.5" />
+          )}
+          <span className="truncate">
+            Add {draft.trim().replace(/\/+$/, "") || "/"}
+          </span>
+        </button>
       ) : null}
     </form>
+  );
+}
+
+function PickHeading({ children }: { children: string }) {
+  return (
+    <p className="px-2 pt-2 pb-1 text-[11px] font-medium text-muted-foreground">
+      {children}
+    </p>
   );
 }
